@@ -1,15 +1,240 @@
-import { describe, expect, test, beforeEach } from "bun:test";
-import { memoryEngine } from "../src/engines/memory";
+import { describe, expect, test, beforeEach, afterEach } from "bun:test";
+import { Database as BunDatabase } from "bun:sqlite";
+import type BetterSqlite3 from "better-sqlite3";
+import { sqliteEngine } from "../src/engines/sqlite";
 import type { QueryEngine } from "../src/engines/types";
 
 // ---------------------------------------------------------------------------
 // Setup
 // ---------------------------------------------------------------------------
 
+class BunBetterSqliteCompat {
+  private readonly db: BunDatabase;
+
+  constructor(filename: string = ":memory:") {
+    this.db = new BunDatabase(filename);
+  }
+
+  prepare(source: string) {
+    const stmt = this.db.prepare(source);
+
+    return {
+      run: (...params: unknown[]) => stmt.run(...(params as any[])),
+      get: (...params: unknown[]) => {
+        const row = stmt.get(...(params as any[]));
+        return row === null ? undefined : row;
+      },
+      all: (...params: unknown[]) => stmt.all(...(params as any[])),
+    };
+  }
+
+  transaction<F extends (...args: any[]) => any>(fn: F) {
+    const tx = this.db.transaction(fn);
+
+    const wrapped = ((...args: Parameters<F>): ReturnType<F> => tx(...args)) as F & {
+      default: F;
+      deferred: F;
+      immediate: F;
+      exclusive: F;
+    };
+
+    wrapped.default = ((...args: Parameters<F>): ReturnType<F> => tx(...args)) as F;
+    wrapped.deferred = ((...args: Parameters<F>): ReturnType<F> => tx.deferred(...args)) as F;
+    wrapped.immediate = ((...args: Parameters<F>): ReturnType<F> => tx.immediate(...args)) as F;
+    wrapped.exclusive = ((...args: Parameters<F>): ReturnType<F> => tx.exclusive(...args)) as F;
+
+    return wrapped;
+  }
+
+  exec(source: string) {
+    this.db.exec(source);
+    return this;
+  }
+
+  close() {
+    this.db.close();
+    return this;
+  }
+}
+
 let engine: QueryEngine<never>;
+let sqlite: ReturnType<typeof sqliteEngine>;
 
 beforeEach(() => {
-  engine = memoryEngine();
+  const database = new BunBetterSqliteCompat(":memory:");
+  sqlite = sqliteEngine({
+    database: database as unknown as BetterSqlite3.Database,
+  });
+  engine = sqlite;
+});
+
+afterEach(() => {
+  sqlite.close();
+});
+
+// ---------------------------------------------------------------------------
+// SQLite-specific setup behavior
+// ---------------------------------------------------------------------------
+
+describe("sqlite setup", () => {
+  test("creates required internal tables and sets schema version", () => {
+    const setupEngine = sqliteEngine({
+      database: new BunBetterSqliteCompat(":memory:") as unknown as BetterSqlite3.Database,
+    });
+
+    try {
+      const versionRow = setupEngine.db.prepare(`PRAGMA user_version`).get() as {
+        user_version?: unknown;
+      };
+      expect(Number(versionRow.user_version)).toBe(1);
+
+      const tables = new Set(
+        (
+          setupEngine.db
+            .prepare(
+              `
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table'
+              `,
+            )
+            .all() as { name: string }[]
+        ).map((table) => table.name),
+      );
+
+      expect(tables.has("documents")).toBe(true);
+      expect(tables.has("index_entries")).toBe(true);
+      expect(tables.has("migration_locks")).toBe(true);
+      expect(tables.has("migration_checkpoints")).toBe(true);
+    } finally {
+      setupEngine.close();
+    }
+  });
+
+  test("throws when schema version is newer than supported", () => {
+    const raw = new BunBetterSqliteCompat(":memory:");
+    raw.exec("PRAGMA user_version = 999");
+
+    expect(() =>
+      sqliteEngine({
+        database: raw as unknown as BetterSqlite3.Database,
+      }),
+    ).toThrow(/newer than supported/);
+
+    raw.close();
+  });
+
+  test("throws when schema version is invalid", () => {
+    const raw = new BunBetterSqliteCompat(":memory:");
+    raw.exec("PRAGMA user_version = -1");
+
+    expect(() =>
+      sqliteEngine({
+        database: raw as unknown as BetterSqlite3.Database,
+      }),
+    ).toThrow(/Invalid SQLite user_version/);
+
+    raw.close();
+  });
+
+  test("uses an already-migrated schema at current version", async () => {
+    const raw = new BunBetterSqliteCompat(":memory:");
+    raw.exec(`
+      CREATE TABLE IF NOT EXISTS documents (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        collection TEXT NOT NULL,
+        doc_key TEXT NOT NULL,
+        doc_json TEXT NOT NULL,
+        UNIQUE (collection, doc_key)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_documents_collection_id
+        ON documents (collection, id);
+
+      CREATE TABLE IF NOT EXISTS index_entries (
+        collection TEXT NOT NULL,
+        doc_key TEXT NOT NULL,
+        index_name TEXT NOT NULL,
+        index_value TEXT NOT NULL,
+        PRIMARY KEY (collection, doc_key, index_name),
+        FOREIGN KEY (collection, doc_key)
+          REFERENCES documents (collection, doc_key)
+          ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_index_entries_lookup
+        ON index_entries (collection, index_name, index_value, doc_key);
+
+      CREATE INDEX IF NOT EXISTS idx_index_entries_scan
+        ON index_entries (collection, index_name, doc_key);
+
+      CREATE TABLE IF NOT EXISTS migration_locks (
+        collection TEXT PRIMARY KEY,
+        lock_id TEXT NOT NULL,
+        acquired_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS migration_checkpoints (
+        collection TEXT PRIMARY KEY,
+        cursor TEXT NOT NULL
+      );
+
+      PRAGMA user_version = 1;
+    `);
+
+    const migratedEngine = sqliteEngine({
+      database: raw as unknown as BetterSqlite3.Database,
+    });
+
+    try {
+      await migratedEngine.put("users", "a", { id: "a" }, { primary: "a" });
+      expect(await migratedEngine.get("users", "a")).toEqual({ id: "a" });
+    } finally {
+      migratedEngine.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SQLite-specific runtime behavior
+// ---------------------------------------------------------------------------
+
+describe("sqlite runtime behavior", () => {
+  test("deleting a document cascades and removes index_entries rows", async () => {
+    await engine.put(
+      "users",
+      "abc",
+      { id: "abc", email: "sam@example.com" },
+      { byEmail: "sam@example.com" },
+    );
+
+    const before = sqlite.db
+      .prepare(`SELECT COUNT(*) AS count FROM index_entries WHERE collection = ? AND doc_key = ?`)
+      .get("users", "abc") as { count: number };
+
+    expect(Number(before.count)).toBe(1);
+
+    await engine.delete("users", "abc");
+
+    const after = sqlite.db
+      .prepare(`SELECT COUNT(*) AS count FROM index_entries WHERE collection = ? AND doc_key = ?`)
+      .get("users", "abc") as { count: number };
+
+    expect(Number(after.count)).toBe(0);
+  });
+
+  test("throws a clear error when stored JSON is invalid", async () => {
+    sqlite.db
+      .prepare(`INSERT INTO documents (collection, doc_key, doc_json) VALUES (?, ?, ?)`)
+      .run("users", "broken", "{");
+
+    try {
+      await engine.get("users", "broken");
+      throw new Error("expected get() to throw for invalid JSON");
+    } catch (error) {
+      expect(String(error)).toMatch(/invalid JSON/);
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------

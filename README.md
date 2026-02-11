@@ -10,12 +10,18 @@ A lightweight, schema-first ODM for NoSQL-style data stores.
 - Ignore-first migration behavior for non-migratable documents
 - Dynamic index names (multi-tenant style index partitions)
 - Explicit bulk operations (`batchGet`, `batchSet`, `batchDelete`)
-- Pluggable query engine interface (memory engine adapter included)
+- Pluggable query engine interface (memory and SQLite adapters included)
 
 ## Installation
 
 ```bash
 npm install nosql-odm zod
+```
+
+For SQLite support:
+
+```bash
+npm install better-sqlite3
 ```
 
 ## Quick Start
@@ -65,6 +71,22 @@ const User = model("user")
 
 const store = createStore(memoryEngine(), [User]);
 ```
+
+## SQLite Engine (`better-sqlite3`)
+
+```ts
+import Database from "better-sqlite3";
+import { sqliteEngine } from "nosql-odm/engines/sqlite";
+
+const db = new Database("./data/app.sqlite");
+const engine = sqliteEngine({ database: db });
+
+const store = createStore(engine, [User]);
+```
+
+The SQLite engine requires an explicit database instance (`{ database }`), runs required internal table migrations on startup, and uses normalized index tables for efficient filtered queries, sorting, and cursor pagination.
+
+Note: this adapter is typed against the `better-sqlite3` `Database` API. If you pass another compatible SQLite database object (for example via a cast), that path is currently untyped/untested.
 
 ## CRUD
 

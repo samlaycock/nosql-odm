@@ -132,6 +132,47 @@ function buildPost() {
     .build();
 }
 
+function buildBlobV1() {
+  return model("blob")
+    .schema(
+      1,
+      z.object({
+        id: z.string(),
+        payload: z.any(),
+      }),
+    )
+    .index({ name: "primary", value: "id" })
+    .build();
+}
+
+function buildBlobV2WithBigIntMigration() {
+  return model("blob")
+    .schema(
+      1,
+      z.object({
+        id: z.string(),
+        payload: z.any(),
+      }),
+    )
+    .schema(
+      2,
+      z.object({
+        id: z.string(),
+        payload: z.any(),
+      }),
+      {
+        migrate(old) {
+          return {
+            ...old,
+            payload: BigInt(1),
+          };
+        },
+      },
+    )
+    .index({ name: "primary", value: "id" })
+    .build();
+}
+
 let engine: MemoryQueryEngine;
 
 beforeEach(() => {
@@ -804,6 +845,118 @@ describe("store.batchSet()", () => {
 
     expect(store.thing.batchSet([{ data: { key: "a", value: "b" } } as any])).rejects.toThrow(
       "Invalid document key",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// JSON compatibility enforcement on writes
+// ---------------------------------------------------------------------------
+
+describe("JSON compatibility on engine writes", () => {
+  const expectReject = async (work: Promise<unknown>, pattern: RegExp) => {
+    try {
+      await work;
+      throw new Error("expected operation to fail");
+    } catch (error) {
+      expect(String(error)).toMatch(pattern);
+    }
+  };
+
+  test("create rejects non-JSON values before writing to engine", async () => {
+    const store = createStore(engine, [buildBlobV1()]);
+
+    await expectReject(
+      store.blob.create("b1", {
+        id: "b1",
+        payload: BigInt(1),
+      }),
+      /not JSON-compatible/,
+    );
+
+    expect(await store.blob.findByKey("b1")).toBeNull();
+  });
+
+  test("update rejects non-JSON values before writing to engine", async () => {
+    const store = createStore(engine, [buildBlobV1()]);
+
+    await store.blob.create("b1", {
+      id: "b1",
+      payload: { safe: "ok" },
+    });
+
+    await expectReject(
+      store.blob.update("b1", {
+        payload: undefined,
+      }),
+      /not JSON-compatible/,
+    );
+  });
+
+  test("batchSet fails atomically when any document is not JSON-compatible", async () => {
+    const store = createStore(engine, [buildBlobV1()]);
+
+    await expectReject(
+      store.blob.batchSet([
+        {
+          key: "b1",
+          data: {
+            id: "b1",
+            payload: { safe: true },
+          },
+        },
+        {
+          key: "b2",
+          data: {
+            id: "b2",
+            payload: BigInt(2),
+          },
+        },
+      ]),
+      /not JSON-compatible/,
+    );
+
+    expect(await store.blob.findByKey("b1")).toBeNull();
+    expect(await store.blob.findByKey("b2")).toBeNull();
+  });
+
+  test("lazy migration writeback rejects non-JSON migrated documents", async () => {
+    await engine.put(
+      "blob",
+      "b1",
+      { __v: 1, __indexes: ["primary"], id: "b1", payload: "old" },
+      { primary: "b1" },
+    );
+
+    const store = createStore(engine, [buildBlobV2WithBigIntMigration()]);
+
+    await expectReject(store.blob.findByKey("b1"), /not JSON-compatible/);
+  });
+
+  test("migrateAll rejects non-JSON migrated documents", async () => {
+    await engine.put(
+      "blob",
+      "b1",
+      { __v: 1, __indexes: ["primary"], id: "b1", payload: "old" },
+      { primary: "b1" },
+    );
+
+    const store = createStore(engine, [buildBlobV2WithBigIntMigration()]);
+
+    await expectReject(store.blob.migrateAll(), /not JSON-compatible/);
+  });
+
+  test("create rejects circular references", async () => {
+    const store = createStore(engine, [buildBlobV1()]);
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+
+    await expectReject(
+      store.blob.create("b1", {
+        id: "b1",
+        payload: circular,
+      }),
+      /circular references are not allowed/,
     );
   });
 });
