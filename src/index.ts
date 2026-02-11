@@ -7,6 +7,11 @@ export {
   type MigrationStrategy,
   type ModelOptions,
   type SchemaOptions,
+  type VersionValue,
+  type ParseVersion,
+  type CompareVersions,
+  type ProjectionSkipReason,
+  type ProjectionResult,
   type IndexValue,
   type IndexDefinition,
   type DynamicIndexDefinition,
@@ -22,11 +27,14 @@ export {
   type QueryResult,
   type BatchSetInputItem,
   type MigrationResult,
+  type MigrationSkipReasons,
+  type MigrationRunOptions,
   type BoundModel,
   type Store,
 } from "./store";
 
 export type {
+  ComparableVersion,
   ResolvedIndexKeys,
   BatchSetItem,
   FieldCondition,

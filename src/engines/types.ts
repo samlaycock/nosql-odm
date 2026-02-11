@@ -7,6 +7,7 @@
  * Passed to the engine on writes.
  */
 export type ResolvedIndexKeys = Record<string, string>;
+export type ComparableVersion = string | number;
 
 export interface BatchSetItem {
   key: string;
@@ -103,6 +104,10 @@ export interface MigrationCriteria {
   indexes: string[];
   /** The document field that stores the applied index names (e.g. "__indexes"). */
   indexesField: string;
+  /** Optional parser for raw document version values. */
+  parseVersion?: (raw: unknown) => ComparableVersion | null;
+  /** Optional comparator for parsed version values. */
+  compareVersions?: (a: ComparableVersion, b: ComparableVersion) => number;
 }
 
 export interface MigrationStatus {

@@ -1,12 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import * as z from "zod";
-import {
-  model,
-  ModelDefinition,
-  ValidationError,
-  VersionError,
-  MigrationError,
-} from "../src/model";
+import { model, ModelDefinition, ValidationError, VersionError } from "../src/model";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -931,23 +925,19 @@ describe("edge cases", () => {
     expect(m.latestVersion).toBe(2);
   });
 
-  test("migrate with version 0 in document treats as needing full migration", async () => {
+  test("migrate with version 0 throws VersionError (unknown source version)", async () => {
     const m = buildVersionedModel();
 
-    // __v: 0 is below version 1, so it should try to migrate from 0+1=1 to 2
-    // but version 0 doesn't exist, so it'll run migrations from v1 onward
-    // Actually, 0 < latest, so it runs migrate for v1 (which has no migrate fn)
-    // This should throw MigrationError
     const doc = { __v: 0, id: "abc", name: "Sam", email: "sam@example.com" };
 
-    expect(m.migrate(doc)).rejects.toThrow(MigrationError);
+    expect(m.migrate(doc)).rejects.toThrow(VersionError);
   });
 
-  test("migrate with negative version throws MigrationError", async () => {
+  test("migrate with negative version throws VersionError", async () => {
     const m = buildVersionedModel();
     const doc = { __v: -1, id: "abc", name: "Sam", email: "sam@example.com" };
 
-    expect(m.migrate(doc)).rejects.toThrow(MigrationError);
+    expect(m.migrate(doc)).rejects.toThrow(VersionError);
   });
 
   test("migrate with fractional version triggers migration (truncated by comparison)", async () => {
@@ -958,6 +948,60 @@ describe("edge cases", () => {
     const doc = { __v: 1.5, id: "abc", name: "Sam", email: "sam@example.com" };
 
     expect(m.migrate(doc)).rejects.toThrow();
+  });
+
+  test('migrate accepts string version "v1" with default parser', async () => {
+    const m = buildVersionedModel();
+    const doc = {
+      __v: "v1",
+      id: "abc",
+      name: "Sam Laycock",
+      email: "sam@example.com",
+    };
+
+    const result = await m.migrate(doc as Record<string, unknown>);
+
+    expect(result).toEqual({
+      id: "abc",
+      firstName: "Sam",
+      lastName: "Laycock",
+      email: "sam@example.com",
+    });
+  });
+
+  test("migrate supports custom parser/comparator", async () => {
+    const m = model("user", {
+      parseVersion(raw) {
+        if (typeof raw === "number" || typeof raw === "string") {
+          return raw;
+        }
+
+        return null;
+      },
+      compareVersions(a, b) {
+        const toNumber = (v: string | number) =>
+          typeof v === "number" ? v : Number(String(v).replace(/^release-/i, ""));
+
+        return toNumber(a) - toNumber(b);
+      },
+    })
+      .schema(1, z.object({ id: z.string(), name: z.string() }))
+      .schema(2, z.object({ id: z.string(), name: z.string(), active: z.boolean() }), {
+        migrate: (old) => ({ ...old, active: true }),
+      })
+      .build();
+
+    const result = await m.migrate({
+      __v: "release-1",
+      id: "abc",
+      name: "Sam",
+    });
+
+    expect(result).toEqual({
+      id: "abc",
+      name: "Sam",
+      active: true,
+    });
   });
 
   test("migration function that throws is propagated", async () => {

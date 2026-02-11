@@ -7,10 +7,16 @@ import type { ResolvedIndexKeys } from "./engines/types";
 
 export type MigrationStrategy = "lazy" | "readonly" | "eager";
 
+export type VersionValue = string | number;
+export type ParseVersion = (raw: unknown) => VersionValue | null;
+export type CompareVersions = (a: VersionValue, b: VersionValue) => number;
+
 export interface ModelOptions {
   migration?: MigrationStrategy;
   versionField?: string;
   indexesField?: string;
+  parseVersion?: ParseVersion;
+  compareVersions?: CompareVersions;
 }
 
 /**
@@ -27,8 +33,8 @@ export interface SchemaOptions<TShape, TPrev> {
  */
 export type IndexValue<T> = (keyof T & string) | ((data: T) => string);
 
-export interface IndexDefinition<T> {
-  name: string;
+export interface IndexDefinition<T, TName extends string = string> {
+  name: TName;
   value: IndexValue<T>;
   unique?: boolean;
 }
@@ -48,37 +54,64 @@ export interface DynamicIndexDefinition<T> {
  * A built model definition. Holds the schema version chain, index
  * definitions, and model-level options.
  */
-export interface Model<_T, _TOptions = Record<string, unknown>> {
-  readonly name: string;
+export interface Model<
+  _T,
+  _TOptions = Record<string, unknown>,
+  _TName extends string = string,
+  _TStaticIndexNames extends string = never,
+  _THasDynamicIndexes extends boolean = false,
+> {
+  readonly name: _TName;
   readonly options: ModelOptions;
   readonly latestVersion: number;
+  /** Type-only phantom fields used for inference in store generics. */
+  readonly __shape__?: _T;
+  readonly __options__?: _TOptions;
+  readonly __staticIndexNames__?: _TStaticIndexNames;
+  readonly __hasDynamicIndexes__?: _THasDynamicIndexes;
 }
 
 /**
  * The model builder. Schemas must be chained in version order.
  * Indexes reference the latest schema's shape.
  */
-export interface ModelBuilder<T, TOptions = Record<string, unknown>> {
+export interface ModelBuilder<
+  T,
+  TOptions = Record<string, unknown>,
+  TName extends string = string,
+  TStaticIndexNames extends string = never,
+  THasDynamicIndexes extends boolean = false,
+> {
   schema<TNext>(
     version: number,
     shape: StandardSchemaV1<TNext>,
     options: SchemaOptions<TNext, T>,
-  ): ModelBuilder<TNext, TOptions>;
+  ): ModelBuilder<TNext, TOptions, TName, never, false>;
 
   /** Add an index with a static name. The name serves as both query name and storage key. */
-  index(definition: IndexDefinition<T>): ModelBuilder<T, TOptions>;
+  index<TIndexName extends string>(
+    definition: IndexDefinition<T, TIndexName>,
+  ): ModelBuilder<T, TOptions, TName, TStaticIndexNames | TIndexName, THasDynamicIndexes>;
+  /** Runtime-validated dynamic form; throws if no definition is supplied. */
+  index(key: string): ModelBuilder<T, TOptions, TName, TStaticIndexNames, THasDynamicIndexes>;
   /** Add an index with a dynamic name. The key is the storage identity (tracked in __indexes). */
-  index(key: string, definition: DynamicIndexDefinition<T>): ModelBuilder<T, TOptions>;
+  index(
+    key: string,
+    definition: DynamicIndexDefinition<T>,
+  ): ModelBuilder<T, TOptions, TName, TStaticIndexNames, true>;
 
-  build(): Model<T, TOptions>;
+  build(): Model<T, TOptions, TName, TStaticIndexNames, THasDynamicIndexes>;
 }
 
 /**
  * Initial model builder returned by model(). Accepts the first schema
  * (version 1, no migrate function).
  */
-export interface InitialModelBuilder<TOptions = Record<string, unknown>> {
-  schema<T>(version: 1, shape: StandardSchemaV1<T>): ModelBuilder<T, TOptions>;
+export interface InitialModelBuilder<
+  TName extends string = string,
+  TOptions = Record<string, unknown>,
+> {
+  schema<T>(version: 1, shape: StandardSchemaV1<T>): ModelBuilder<T, TOptions, TName, never, false>;
 }
 
 // ---------------------------------------------------------------------------
@@ -90,6 +123,26 @@ interface StoredSchemaVersion {
   shape: StandardSchemaV1;
   migrate?: (old: unknown) => unknown;
 }
+
+export type ProjectionSkipReason =
+  | "invalid_version"
+  | "ahead_of_latest"
+  | "unknown_source_version"
+  | "version_compare_error"
+  | "migration_error"
+  | "validation_error";
+
+export type ProjectionResult<T> =
+  | {
+      ok: true;
+      value: T;
+      migrated: boolean;
+    }
+  | {
+      ok: false;
+      reason: ProjectionSkipReason;
+      error?: unknown;
+    };
 
 // ---------------------------------------------------------------------------
 // Internal index representation (always has key)
@@ -108,14 +161,20 @@ interface StoredIndex<T> {
 // ModelDefinition — the built model object
 // ---------------------------------------------------------------------------
 
-export class ModelDefinition<T = unknown> {
-  readonly name: string;
+export class ModelDefinition<
+  T = unknown,
+  TOptions = Record<string, unknown>,
+  TName extends string = string,
+  TStaticIndexNames extends string = never,
+  THasDynamicIndexes extends boolean = false,
+> implements Model<T, TOptions, TName, TStaticIndexNames, THasDynamicIndexes> {
+  readonly name: TName;
   readonly options: Required<ModelOptions>;
   readonly versions: StoredSchemaVersion[];
   readonly indexes: StoredIndex<T>[];
 
   constructor(
-    name: string,
+    name: TName,
     options: Required<ModelOptions>,
     versions: StoredSchemaVersion[],
     indexes: StoredIndex<T>[],
@@ -151,38 +210,157 @@ export class ModelDefinition<T = unknown> {
     return (result as { value: unknown }).value as T;
   }
 
-  // Runs the forward-only migration chain from the document's version to the latest.
-  // Documents without a version field are assumed to be version 1 (the first schema).
-  async migrate(doc: Record<string, unknown>): Promise<T> {
-    const versionField = this.options.versionField;
-    const docVersion = (doc[versionField] as number | undefined) ?? 1;
-    const latest = this.latestVersion;
+  get latestVersionValue(): VersionValue {
+    return this.latestVersion;
+  }
 
-    if (docVersion > latest) {
-      throw new VersionError(this.name, docVersion, latest);
+  /**
+   * Projects an arbitrary stored document to the latest schema shape.
+   * Returns a skip result instead of throwing when migration/validation
+   * cannot be safely completed.
+   */
+  async projectToLatest(doc: Record<string, unknown>): Promise<ProjectionResult<T>> {
+    const versionField = this.options.versionField;
+    const parsedVersion = this.options.parseVersion(doc[versionField]);
+
+    if (parsedVersion === null) {
+      return { ok: false, reason: "invalid_version" };
     }
 
-    if (docVersion === latest) {
-      return await this.validate(doc);
+    const latest = this.latestVersionValue;
+    const latestCmp = this.safeCompareVersions(parsedVersion, latest);
+
+    if (!latestCmp.ok) {
+      return { ok: false, reason: "version_compare_error", error: latestCmp.error };
+    }
+
+    if (latestCmp.value > 0) {
+      return { ok: false, reason: "ahead_of_latest" };
+    }
+
+    if (latestCmp.value === 0) {
+      try {
+        const validated = await this.validate(doc);
+        return { ok: true, value: validated, migrated: false };
+      } catch (error) {
+        return { ok: false, reason: "validation_error", error };
+      }
+    }
+
+    // Find the schema version that matches the document's declared version.
+    let sourceIndex = -1;
+    for (let i = 0; i < this.versions.length; i++) {
+      const version = this.versions[i]!;
+      const cmp = this.safeCompareVersions(parsedVersion, version.version);
+
+      if (!cmp.ok) {
+        return { ok: false, reason: "version_compare_error", error: cmp.error };
+      }
+
+      if (cmp.value === 0) {
+        sourceIndex = i;
+        break;
+      }
+    }
+
+    if (sourceIndex === -1) {
+      return { ok: false, reason: "unknown_source_version" };
     }
 
     // Walk through each version step sequentially — v2's migrate receives v1 data,
     // v3's migrate receives the output of v2's migrate, and so on.
     let current: unknown = doc;
 
-    for (let v = docVersion + 1; v <= latest; v++) {
-      const version = this.versions[v - 1];
+    for (let i = sourceIndex + 1; i < this.versions.length; i++) {
+      const version = this.versions[i];
 
       if (!version?.migrate) {
-        throw new MigrationError(this.name, v);
+        return {
+          ok: false,
+          reason: "migration_error",
+          error: new MigrationError(this.name, version?.version ?? i + 1),
+        };
       }
 
-      current = version.migrate(current);
+      try {
+        current = version.migrate(current);
+      } catch (error) {
+        return { ok: false, reason: "migration_error", error };
+      }
     }
 
-    const validated = await this.validate(current);
+    try {
+      const validated = await this.validate(current);
+      return { ok: true, value: validated, migrated: true };
+    } catch (error) {
+      return { ok: false, reason: "validation_error", error };
+    }
+  }
 
-    return validated;
+  // Runs the forward-only migration chain from the document's version to the latest.
+  // Documents without a version field are assumed to be version 1 (the first schema).
+  async migrate(doc: Record<string, unknown>): Promise<T> {
+    const projected = await this.projectToLatest(doc);
+
+    if (projected.ok) {
+      return projected.value;
+    }
+
+    if (projected.reason === "ahead_of_latest") {
+      const rawVersion = doc[this.options.versionField];
+      throw new VersionError(this.name, String(rawVersion), this.latestVersionValue);
+    }
+
+    if (projected.reason === "migration_error" && projected.error) {
+      throw projected.error;
+    }
+
+    if (projected.reason === "validation_error" && projected.error) {
+      throw projected.error;
+    }
+
+    if (projected.reason === "unknown_source_version") {
+      const rawVersion = doc[this.options.versionField];
+      throw new VersionError(this.name, String(rawVersion), this.latestVersionValue);
+    }
+
+    if (projected.reason === "invalid_version") {
+      throw new Error(`Document version for model "${this.name}" is invalid and cannot be parsed`);
+    }
+
+    if (projected.reason === "version_compare_error") {
+      throw projected.error ?? new Error(`Version comparison failed for model "${this.name}"`);
+    }
+
+    throw new Error(`Migration failed for model "${this.name}"`);
+  }
+
+  private safeCompareVersions(
+    a: VersionValue,
+    b: VersionValue,
+  ): { ok: true; value: -1 | 0 | 1 } | { ok: false; error: unknown } {
+    try {
+      const raw = this.options.compareVersions(a, b);
+
+      if (!Number.isFinite(raw)) {
+        return {
+          ok: false,
+          error: new Error(`compareVersions must return a finite number`),
+        };
+      }
+
+      if (raw < 0) {
+        return { ok: true, value: -1 };
+      }
+
+      if (raw > 0) {
+        return { ok: true, value: 1 };
+      }
+
+      return { ok: true, value: 0 };
+    } catch (error) {
+      return { ok: false, error };
+    }
   }
 
   /** Sorted array of current index keys for this model. */
@@ -213,14 +391,20 @@ export class ModelDefinition<T = unknown> {
 // then returns a ModelBuilderImpl which accepts subsequent versioned schemas (with migrate).
 // This enforces at the type level that the first schema cannot have a migration function.
 
-class ModelBuilderImpl<T> {
-  private name: string;
+class ModelBuilderImpl<
+  T,
+  TOptions = Record<string, unknown>,
+  TName extends string = string,
+  TStaticIndexNames extends string = never,
+  THasDynamicIndexes extends boolean = false,
+> implements ModelBuilder<T, TOptions, TName, TStaticIndexNames, THasDynamicIndexes> {
+  private name: TName;
   private options: Required<ModelOptions>;
   private versions: StoredSchemaVersion[];
   private indexes: StoredIndex<T>[];
 
   constructor(
-    name: string,
+    name: TName,
     options: Required<ModelOptions>,
     versions: StoredSchemaVersion[],
     indexes: StoredIndex<T>[],
@@ -237,7 +421,7 @@ class ModelBuilderImpl<T> {
     version: number,
     shape: StandardSchemaV1<TNext>,
     options: SchemaOptions<TNext, T>,
-  ): ModelBuilderImpl<TNext> {
+  ): ModelBuilderImpl<TNext, TOptions, TName, never, false> {
     const expectedVersion = this.versions.length + 1;
 
     if (version !== expectedVersion) {
@@ -257,18 +441,26 @@ class ModelBuilderImpl<T> {
       },
     ];
 
-    return new ModelBuilderImpl<TNext>(
+    return new ModelBuilderImpl<TNext, TOptions, TName, never, false>(
       this.name,
       this.options,
       versions,
-      [] as unknown as StoredIndex<TNext>[],
+      [],
     );
   }
 
+  index<TIndexName extends string>(
+    definition: IndexDefinition<T, TIndexName>,
+  ): ModelBuilderImpl<T, TOptions, TName, TStaticIndexNames | TIndexName, THasDynamicIndexes>;
+  index(key: string): ModelBuilderImpl<T, TOptions, TName, TStaticIndexNames, THasDynamicIndexes>;
   index(
-    keyOrDefinition: string | IndexDefinition<T>,
+    key: string,
+    definition: DynamicIndexDefinition<T>,
+  ): ModelBuilderImpl<T, TOptions, TName, TStaticIndexNames, true>;
+  index(
+    keyOrDefinition: string | IndexDefinition<T, string>,
     definition?: DynamicIndexDefinition<T>,
-  ): ModelBuilderImpl<T> {
+  ): ModelBuilderImpl<T, TOptions, TName, TStaticIndexNames | string, boolean> {
     let stored: StoredIndex<T>;
 
     if (typeof keyOrDefinition === "string") {
@@ -299,18 +491,25 @@ class ModelBuilderImpl<T> {
       };
     }
 
-    return new ModelBuilderImpl<T>(this.name, this.options, this.versions, [
-      ...this.indexes,
-      stored,
-    ]);
+    return new ModelBuilderImpl<T, TOptions, TName, TStaticIndexNames | string, boolean>(
+      this.name,
+      this.options,
+      this.versions,
+      [...this.indexes, stored],
+    );
   }
 
-  build(): ModelDefinition<T> {
+  build(): ModelDefinition<T, TOptions, TName, TStaticIndexNames, THasDynamicIndexes> {
     if (this.versions.length === 0) {
       throw new Error(`Model "${this.name}" must have at least one schema version`);
     }
 
-    return new ModelDefinition<T>(this.name, this.options, this.versions, this.indexes);
+    return new ModelDefinition<T, TOptions, TName, TStaticIndexNames, THasDynamicIndexes>(
+      this.name,
+      this.options,
+      this.versions,
+      this.indexes,
+    );
   }
 }
 
@@ -322,27 +521,37 @@ const DEFAULT_OPTIONS: Required<ModelOptions> = {
   migration: "lazy",
   versionField: "__v",
   indexesField: "__indexes",
+  parseVersion: defaultParseVersion,
+  compareVersions: defaultCompareVersions,
 };
 
-export function model(name: string, options?: ModelOptions): InitialModelBuilderImpl {
+export function model<TName extends string>(
+  name: TName,
+  options?: ModelOptions,
+): InitialModelBuilderImpl<TName> {
   const resolved: Required<ModelOptions> = {
     ...DEFAULT_OPTIONS,
     ...options,
   };
 
-  return new InitialModelBuilderImpl(name, resolved);
+  return new InitialModelBuilderImpl<TName>(name, resolved);
 }
 
-export class InitialModelBuilderImpl {
-  private name: string;
+export class InitialModelBuilderImpl<
+  TName extends string = string,
+> implements InitialModelBuilder<TName> {
+  private name: TName;
   private options: Required<ModelOptions>;
 
-  constructor(name: string, options: Required<ModelOptions>) {
+  constructor(name: TName, options: Required<ModelOptions>) {
     this.name = name;
     this.options = options;
   }
 
-  schema<T>(version: 1, shape: StandardSchemaV1<T>): ModelBuilderImpl<T> {
+  schema<T>(
+    version: 1,
+    shape: StandardSchemaV1<T>,
+  ): ModelBuilderImpl<T, Record<string, unknown>, TName, never, false> {
     if (version !== 1) {
       throw new Error(`First schema version must be 1, got ${String(version)}`);
     }
@@ -354,7 +563,12 @@ export class InitialModelBuilderImpl {
       },
     ];
 
-    return new ModelBuilderImpl<T>(this.name, this.options, versions, []);
+    return new ModelBuilderImpl<T, Record<string, unknown>, TName, never, false>(
+      this.name,
+      this.options,
+      versions,
+      [],
+    );
   }
 }
 
@@ -368,6 +582,65 @@ function resolveIndexValue<T>(value: IndexValue<T>, data: T): string {
   }
 
   return String((data as Record<string, unknown>)[value]);
+}
+
+function defaultParseVersion(raw: unknown): VersionValue | null {
+  if (raw === undefined || raw === null) {
+    return 1;
+  }
+
+  if (typeof raw === "number") {
+    return Number.isFinite(raw) ? raw : null;
+  }
+
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+
+    if (trimmed.length === 0) {
+      return null;
+    }
+
+    const normalizedNumeric = normalizeNumericVersion(trimmed);
+
+    if (normalizedNumeric !== null) {
+      return normalizedNumeric;
+    }
+
+    return trimmed;
+  }
+
+  return null;
+}
+
+function defaultCompareVersions(a: VersionValue, b: VersionValue): number {
+  if (typeof a === "number" && typeof b === "number") {
+    return a - b;
+  }
+
+  const numericA = normalizeNumericVersion(String(a));
+  const numericB = normalizeNumericVersion(String(b));
+
+  if (numericA !== null && numericB !== null) {
+    return numericA - numericB;
+  }
+
+  return String(a).localeCompare(String(b), undefined, {
+    numeric: true,
+    sensitivity: "base",
+  });
+}
+
+function normalizeNumericVersion(value: string): number | null {
+  const trimmed = value.trim();
+  const match = /^v?(-?\d+)$/i.exec(trimmed);
+
+  if (!match) {
+    return null;
+  }
+
+  const parsed = Number(match[1]);
+
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -385,7 +658,7 @@ export class ValidationError extends Error {
 }
 
 export class VersionError extends Error {
-  constructor(modelName: string, docVersion: number, latestVersion: number) {
+  constructor(modelName: string, docVersion: VersionValue, latestVersion: VersionValue) {
     super(
       `Document version ${docVersion} for model "${modelName}" exceeds latest schema version ${latestVersion}`,
     );

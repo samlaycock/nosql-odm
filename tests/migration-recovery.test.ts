@@ -822,6 +822,28 @@ describe("lock TTL — stale lock recovery", () => {
     await engine.migration.releaseLock(stolen!);
   });
 
+  test("stale lock holder cannot overwrite checkpoint after lock is stolen", async () => {
+    const oldLock = await engine.migration.acquireLock("user");
+    expect(oldLock).not.toBeNull();
+    await engine.migration.saveCheckpoint!(oldLock!, "u0050");
+
+    // Replace the old lock via TTL steal.
+    const newLock = await engine.migration.acquireLock("user", { ttl: 0 });
+    expect(newLock).not.toBeNull();
+    expect(newLock!.id).not.toBe(oldLock!.id);
+
+    // Current lock writes a new checkpoint.
+    await engine.migration.saveCheckpoint!(newLock!, "u0100");
+    // Stale lock write should be ignored.
+    await engine.migration.saveCheckpoint!(oldLock!, "u9999");
+
+    const checkpoint = await engine.migration.loadCheckpoint!("user");
+    expect(checkpoint).toBe("u0100");
+
+    await engine.migration.releaseLock(newLock!);
+    await engine.migration.clearCheckpoint!("user");
+  });
+
   test("migrateAll can recover from a permanently stuck lock via TTL", async () => {
     await seedV1Users(engine, 5);
 
@@ -833,14 +855,9 @@ describe("lock TTL — stale lock recovery", () => {
     const store1 = createStore(engine, [buildUserV2()]);
     expect(store1.user.migrateAll()).rejects.toThrow("already running");
 
-    // Steal the lock with TTL=0 (treat any lock as stale)
-    const newLock = await engine.migration.acquireLock("user", { ttl: 0 });
-    expect(newLock).not.toBeNull();
-    await engine.migration.releaseLock(newLock!);
-
-    // Now migrateAll works
+    // With lockTtlMs=0, store-level migrateAll can steal the stale lock.
     const store2 = createStore(engine, [buildUserV2()]);
-    const result = await store2.user.migrateAll();
+    const result = await store2.user.migrateAll({ lockTtlMs: 0 });
     expect(result.status).toBe("completed");
     expect(result.migrated).toBe(5);
   });

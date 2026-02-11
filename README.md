@@ -7,6 +7,7 @@ A lightweight, schema-first ODM for NoSQL-style data stores.
 - Versioned schemas with forward migrations
 - Index-based queries, `where` queries, and cursor pagination
 - Lazy migration on reads
+- Ignore-first migration behavior for non-migratable documents
 - Dynamic index names (multi-tenant style index partitions)
 - Explicit bulk operations (`batchGet`, `batchSet`, `batchDelete`)
 - Pluggable query engine interface (memory engine adapter included)
@@ -202,13 +203,40 @@ Run explicit full migrations:
 ```ts
 await store.user.migrateAll(); // one model
 await store.migrateAll(); // every model in the store
+
+// Optional: lock TTL in ms for stale-lock recovery
+await store.user.migrateAll({ lockTtlMs: 30_000 });
+await store.migrateAll({ lockTtlMs: 30_000 });
 ```
+
+`migrateAll()` returns a summary including:
+
+- `migrated`: documents migrated to newer schema versions
+- `skipped`: documents ignored because they could not be safely projected to the latest schema
+- `skipReasons`: per-reason skip counts (for documents the engine returned to the migrator)
+
+Typical `skipReasons` keys:
+
+- `unknown_source_version`
+- `migration_error`
+- `validation_error`
+- `invalid_version`
+- `ahead_of_latest`
+- `version_compare_error`
 
 Migration modes:
 
 - `lazy`: read paths (`findByKey`, `query`, `batchGet`) migrate stale docs and write back.
 - `readonly`: read paths migrate in memory but do not write back.
 - `eager`: same read behavior as `readonly`; use `migrateAll()` for persisted upgrades.
+
+Ignore-first policy:
+
+- Documents with versions ahead of the latest schema are ignored.
+- Documents with invalid/unrecognized versions are ignored.
+- Migration function errors and post-migration validation failures are ignored per-document.
+- `findByKey` returns `null` for ignored documents.
+- `query` and `batchGet` omit ignored documents from results.
 
 You can inspect migration lock/checkpoint state per model:
 
@@ -228,6 +256,22 @@ const User = model("user", {
   .build();
 ```
 
+You can also customize version parsing/comparison (version values may be `string` or `number`):
+
+```ts
+const User = model("user", {
+  parseVersion(raw) {
+    if (typeof raw === "string" || typeof raw === "number") return raw;
+    return null;
+  },
+  compareVersions(a, b) {
+    const toNum = (v: string | number) =>
+      typeof v === "number" ? v : Number(String(v).replace(/^release-/i, ""));
+    return toNum(a) - toNum(b);
+  },
+});
+```
+
 ## Engine Contract (Adapter Authors)
 
 Required methods:
@@ -240,6 +284,7 @@ Optional methods:
 - `batchGet`, `batchSet`, `batchDelete`
 - Migration checkpoints: `saveCheckpoint`, `loadCheckpoint`, `clearCheckpoint`
 - Migration status: `getStatus`
+- `getOutdated` criteria can receive custom `parseVersion` / `compareVersions` callbacks.
 
 See `dist/index.d.ts` and `dist/engines/memory.d.ts` for full signatures.
 

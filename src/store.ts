@@ -6,7 +6,7 @@ import type {
   MigrationCriteria,
   MigrationStatus,
 } from "./engines/types";
-import type { Model } from "./model";
+import type { ProjectionSkipReason } from "./model";
 import { ModelDefinition } from "./model";
 
 // ---------------------------------------------------------------------------
@@ -29,20 +29,53 @@ export interface MigrationResult {
   reason?: string;
   error?: unknown;
   migrated?: number;
+  skipped?: number;
+  skipReasons?: MigrationSkipReasons;
 }
+
+export type MigrationSkipReasons = Partial<Record<ProjectionSkipReason, number>>;
+
+export interface MigrationRunOptions {
+  /** Lock TTL in milliseconds. If provided, stale locks can be replaced by the engine. */
+  lockTtlMs?: number;
+}
+
+type AnyString = string & {};
+
+type ModelDataInputForUpdate<T> = T extends object ? Partial<T> : T;
+
+type IndexNameInput<
+  TStaticIndexNames extends string,
+  THasDynamicIndexes extends boolean,
+> = THasDynamicIndexes extends true ? TStaticIndexNames | AnyString : TStaticIndexNames;
+
+type ModelQueryParams<TStaticIndexNames extends string, THasDynamicIndexes extends boolean> = Omit<
+  QueryParams,
+  "index"
+> & {
+  index?: IndexNameInput<TStaticIndexNames, THasDynamicIndexes>;
+};
 
 /**
  * A model bound to a store. Provides the query/mutation API for a single
  * model, with engine options threaded through for passthrough to the engine.
  */
-export interface BoundModel<T, TOptions = Record<string, unknown>> {
+export interface BoundModel<
+  T,
+  TOptions = Record<string, unknown>,
+  TStaticIndexNames extends string = string,
+  THasDynamicIndexes extends boolean = false,
+> {
   findByKey(key: string, options?: TOptions): Promise<T | null>;
 
-  query(params: QueryParams, options?: TOptions): Promise<QueryResult<T>>;
+  query(
+    params: ModelQueryParams<TStaticIndexNames, THasDynamicIndexes>,
+    options?: TOptions,
+  ): Promise<QueryResult<T>>;
 
   create(key: string, data: T, options?: TOptions): Promise<T>;
 
-  update(key: string, data: Partial<T>, options?: TOptions): Promise<T>;
+  update(key: string, data: ModelDataInputForUpdate<T>, options?: TOptions): Promise<T>;
 
   delete(key: string, options?: TOptions): Promise<void>;
 
@@ -50,20 +83,33 @@ export interface BoundModel<T, TOptions = Record<string, unknown>> {
   batchSet(items: BatchSetInputItem<T>[], options?: TOptions): Promise<T[]>;
   batchDelete(keys: string[], options?: TOptions): Promise<void>;
 
-  migrateAll(): Promise<MigrationResult>;
+  migrateAll(options?: MigrationRunOptions): Promise<MigrationResult>;
   getMigrationStatus(): Promise<MigrationStatus | null>;
 }
 
 /**
  * The store. Models are accessible as properties keyed by model name.
  */
-export type Store<TModels extends Model<any, any>[], TOptions = Record<string, unknown>> = {
+type ModelData<M> = M extends ModelDefinition<infer T, any, any, any, any> ? T : never;
+type ModelStaticIndexNames<M> =
+  M extends ModelDefinition<any, any, any, infer TStaticIndexes, any> ? TStaticIndexes : never;
+type ModelHasDynamicIndexes<M> =
+  M extends ModelDefinition<any, any, any, any, infer THasDynamicIndexes>
+    ? THasDynamicIndexes
+    : false;
+
+export type Store<
+  TModels extends readonly ModelDefinition<any, any, string, any, any>[],
+  TOptions = Record<string, unknown>,
+> = {
   [M in TModels[number] as M["name"]]: BoundModel<
-    M extends Model<infer T, any> ? T : never,
-    TOptions
+    ModelData<M>,
+    TOptions,
+    ModelStaticIndexNames<M>,
+    ModelHasDynamicIndexes<M>
   >;
 } & {
-  migrateAll(): Promise<MigrationResult[]>;
+  migrateAll(options?: MigrationRunOptions): Promise<MigrationResult[]>;
 };
 
 // ---------------------------------------------------------------------------
@@ -88,60 +134,69 @@ export class MigrationAlreadyRunningError extends Error {
 // BoundModel — a model bound to an engine
 // ---------------------------------------------------------------------------
 
-class BoundModelImpl<T> {
-  private model: ModelDefinition<T>;
-  private engine: QueryEngine<any>;
+class BoundModelImpl<
+  T,
+  TOptions = Record<string, unknown>,
+  TStaticIndexNames extends string = string,
+  THasDynamicIndexes extends boolean = false,
+> {
+  private model: ModelDefinition<T, any, string, TStaticIndexNames, THasDynamicIndexes>;
+  private engine: QueryEngine<TOptions>;
 
-  constructor(model: ModelDefinition<T>, engine: QueryEngine<any>) {
+  constructor(
+    model: ModelDefinition<T, any, string, TStaticIndexNames, THasDynamicIndexes>,
+    engine: QueryEngine<TOptions>,
+  ) {
     this.model = model;
     this.engine = engine;
   }
 
-  async findByKey(key: string, options?: unknown): Promise<T | null> {
+  async findByKey(key: string, options?: TOptions): Promise<T | null> {
     const raw = await this.engine.get(this.model.name, key, options);
 
     if (raw === null || raw === undefined) {
       return null;
     }
 
-    const doc = raw as Record<string, unknown>;
-    const versionField = this.model.options.versionField;
-    const docVersion = (doc[versionField] as number | undefined) ?? 1;
+    const projected = await this.model.projectToLatest(raw as Record<string, unknown>);
 
-    // Lazy migration: if the document is on an older schema version, migrate it
-    // forward and write the updated document back to the engine before returning.
-    if (docVersion < this.model.latestVersion) {
-      const migrated = await this.model.migrate(doc);
-      await this.writeback(key, migrated, options);
-      return migrated;
+    if (!projected.ok) {
+      return null;
     }
 
-    return await this.model.validate(raw);
+    if (projected.migrated) {
+      await this.writeback(key, projected.value, options);
+    }
+
+    return projected.value;
   }
 
-  async query(params: QueryParams, options?: unknown): Promise<QueryResult<T>> {
+  async query(
+    params: ModelQueryParams<TStaticIndexNames, THasDynamicIndexes>,
+    options?: TOptions,
+  ): Promise<QueryResult<T>> {
     const resolved = this.resolveQuery(params);
     const raw = await this.engine.query(this.model.name, resolved, options);
     const documents: T[] = [];
 
     for (const { key, doc: rawDoc } of raw.documents) {
-      const doc = rawDoc as Record<string, unknown>;
-      const versionField = this.model.options.versionField;
-      const docVersion = (doc[versionField] as number | undefined) ?? 1;
+      const projected = await this.model.projectToLatest(rawDoc as Record<string, unknown>);
 
-      if (docVersion < this.model.latestVersion) {
-        const migrated = await this.model.migrate(doc);
-        await this.writeback(key, migrated, options);
-        documents.push(migrated);
-      } else {
-        documents.push(await this.model.validate(rawDoc));
+      if (!projected.ok) {
+        continue;
       }
+
+      if (projected.migrated) {
+        await this.writeback(key, projected.value, options);
+      }
+
+      documents.push(projected.value);
     }
 
     return { documents, cursor: raw.cursor };
   }
 
-  async create(key: string, data: T, options?: unknown): Promise<T> {
+  async create(key: string, data: T, options?: TOptions): Promise<T> {
     const existing = await this.engine.get(this.model.name, key, options);
 
     if (existing !== null && existing !== undefined) {
@@ -157,7 +212,7 @@ class BoundModelImpl<T> {
     return validated;
   }
 
-  async update(key: string, data: Partial<T>, options?: unknown): Promise<T> {
+  async update(key: string, data: ModelDataInputForUpdate<T>, options?: TOptions): Promise<T> {
     const existing = await this.engine.get(this.model.name, key, options);
 
     if (existing === null || existing === undefined) {
@@ -165,15 +220,14 @@ class BoundModelImpl<T> {
     }
 
     const existingDoc = existing as Record<string, unknown>;
-    const versionField = this.model.options.versionField;
-    const docVersion = (existingDoc[versionField] as number | undefined) ?? 1;
-
-    // Migrate the existing document first so the partial update merges against
-    // the latest schema shape, not a potentially outdated one.
     let current: Record<string, unknown>;
-    if (docVersion < this.model.latestVersion) {
-      current = (await this.model.migrate(existingDoc)) as Record<string, unknown>;
+    const projected = await this.model.projectToLatest(existingDoc);
+
+    if (projected.ok) {
+      current = projected.value as Record<string, unknown>;
     } else {
+      // Ignore migration failures on read/merge path and attempt to apply the
+      // update against the stored document as-is.
       current = existingDoc;
     }
 
@@ -187,11 +241,11 @@ class BoundModelImpl<T> {
     return validated;
   }
 
-  async delete(key: string, options?: unknown): Promise<void> {
+  async delete(key: string, options?: TOptions): Promise<void> {
     await this.engine.delete(this.model.name, key, options);
   }
 
-  async batchGet(keys: string[], options?: unknown): Promise<T[]> {
+  async batchGet(keys: string[], options?: TOptions): Promise<T[]> {
     if (!this.engine.batchGet) {
       throw new Error(`Engine does not support batchGet`);
     }
@@ -200,23 +254,23 @@ class BoundModelImpl<T> {
     const results: T[] = [];
 
     for (const { key, doc: rawDoc } of rawDocs) {
-      const doc = rawDoc as Record<string, unknown>;
-      const versionField = this.model.options.versionField;
-      const docVersion = (doc[versionField] as number | undefined) ?? 1;
+      const projected = await this.model.projectToLatest(rawDoc as Record<string, unknown>);
 
-      if (docVersion < this.model.latestVersion) {
-        const migrated = await this.model.migrate(doc);
-        await this.writeback(key, migrated, options);
-        results.push(migrated);
-      } else {
-        results.push(await this.model.validate(rawDoc));
+      if (!projected.ok) {
+        continue;
       }
+
+      if (projected.migrated) {
+        await this.writeback(key, projected.value, options);
+      }
+
+      results.push(projected.value);
     }
 
     return results;
   }
 
-  async batchSet(items: BatchSetInputItem<T>[], options?: unknown): Promise<T[]> {
+  async batchSet(items: BatchSetInputItem<T>[], options?: TOptions): Promise<T[]> {
     const prepared: {
       key: string;
       validated: T;
@@ -258,7 +312,7 @@ class BoundModelImpl<T> {
     return prepared.map((item) => item.validated);
   }
 
-  async batchDelete(keys: string[], options?: unknown): Promise<void> {
+  async batchDelete(keys: string[], options?: TOptions): Promise<void> {
     if (this.engine.batchDelete) {
       await this.engine.batchDelete(this.model.name, keys, options);
       return;
@@ -269,15 +323,20 @@ class BoundModelImpl<T> {
     }
   }
 
-  async migrateAll(): Promise<MigrationResult> {
+  async migrateAll(options?: MigrationRunOptions): Promise<MigrationResult> {
     const collection = this.model.name;
-    const lock = await this.engine.migration.acquireLock(collection);
+    const lock = await this.engine.migration.acquireLock(
+      collection,
+      options?.lockTtlMs !== undefined ? { ttl: options.lockTtlMs } : undefined,
+    );
 
     if (!lock) {
       throw new MigrationAlreadyRunningError(collection);
     }
 
     let migrated = 0;
+    let skipped = 0;
+    const skipReasons: MigrationSkipReasons = {};
 
     try {
       // Build criteria so the engine can efficiently find outdated documents.
@@ -286,6 +345,8 @@ class BoundModelImpl<T> {
         versionField: this.model.options.versionField,
         indexes: this.model.indexNames,
         indexesField: this.model.options.indexesField,
+        parseVersion: this.model.options.parseVersion,
+        compareVersions: this.model.options.compareVersions,
       };
 
       // Resume from the last saved checkpoint if a previous run was interrupted.
@@ -296,23 +357,20 @@ class BoundModelImpl<T> {
         const page = await this.engine.migration.getOutdated(collection, criteria, cursor);
 
         for (const { key, doc: rawDoc } of page.documents) {
-          const doc = rawDoc as Record<string, unknown>;
-          const versionField = this.model.options.versionField;
-          const docVersion = (doc[versionField] as number | undefined) ?? 1;
+          const projected = await this.model.projectToLatest(rawDoc as Record<string, unknown>);
 
-          if (docVersion < this.model.latestVersion) {
-            // Migrate stale documents forward, stamp metadata, recompute indexes.
-            const migratedDoc = await this.model.migrate(doc);
-            const stamped = this.stamp(migratedDoc as object);
-            const indexes = this.model.resolveIndexKeys(migratedDoc);
-            await this.engine.put(collection, key, stamped, indexes);
+          if (!projected.ok) {
+            skipped++;
+            skipReasons[projected.reason] = (skipReasons[projected.reason] ?? 0) + 1;
+            continue;
+          }
+
+          const stamped = this.stamp(projected.value as object);
+          const indexes = this.model.resolveIndexKeys(projected.value);
+          await this.engine.put(collection, key, stamped, indexes);
+
+          if (projected.migrated) {
             migrated++;
-          } else {
-            // Current version but indexes are outdated — recompute and stamp.
-            const validated = await this.model.validate(rawDoc);
-            const stamped = this.stamp(validated as object);
-            const indexes = this.model.resolveIndexKeys(validated);
-            await this.engine.put(collection, key, stamped, indexes);
           }
         }
 
@@ -327,7 +385,13 @@ class BoundModelImpl<T> {
       // from the beginning and cannot skip older stale documents.
       await this.engine.migration.clearCheckpoint?.(collection);
 
-      return { model: collection, status: "completed", migrated };
+      return {
+        model: collection,
+        status: "completed",
+        migrated,
+        skipped,
+        skipReasons: skipped > 0 ? skipReasons : undefined,
+      };
     } finally {
       await this.engine.migration.releaseLock(lock);
     }
@@ -358,7 +422,7 @@ class BoundModelImpl<T> {
   // to re-migrate. Skipped in "readonly" and "eager" modes — readonly because
   // writes are not permitted, eager because migration is expected to happen
   // via migrateAll() rather than on individual reads.
-  private async writeback(key: string, data: T, options?: unknown): Promise<void> {
+  private async writeback(key: string, data: T, options?: TOptions): Promise<void> {
     if (this.model.options.migration !== "lazy") {
       return;
     }
@@ -373,7 +437,9 @@ class BoundModelImpl<T> {
   // `index`/`filter`, or no filter at all (scan all documents).
   // The user-facing `index` param uses the query name; this resolves it to the
   // storage key that the engine understands.
-  private resolveQuery(params: QueryParams): QueryParams {
+  private resolveQuery(
+    params: ModelQueryParams<TStaticIndexNames, THasDynamicIndexes>,
+  ): QueryParams {
     const hasIndex = params.index !== undefined;
     const hasWhere = params.where !== undefined;
 
@@ -474,11 +540,11 @@ class BoundModelImpl<T> {
 // createStore()
 // ---------------------------------------------------------------------------
 
-export function createStore(
-  engine: QueryEngine<any>,
-  models: ModelDefinition<any>[],
-): Record<string, any> {
-  const boundModels = new Map<string, BoundModelImpl<any>>();
+export function createStore<
+  const TModels extends readonly ModelDefinition<any, any, string, any, any>[],
+  TOptions = Record<string, unknown>,
+>(engine: QueryEngine<TOptions>, models: TModels): Store<TModels, TOptions> {
+  const boundModels = new Map<string, BoundModelImpl<any, TOptions, any, any>>();
 
   for (const modelDef of models) {
     if (boundModels.has(modelDef.name)) {
@@ -488,15 +554,15 @@ export function createStore(
     boundModels.set(modelDef.name, new BoundModelImpl(modelDef, engine));
   }
 
-  const store: Record<string, any> = {
+  const store = {
     // Migrates all models sequentially. Errors are caught per-model so one
     // model's failure doesn't prevent the others from being migrated.
-    async migrateAll(): Promise<MigrationResult[]> {
+    async migrateAll(options?: MigrationRunOptions): Promise<MigrationResult[]> {
       const results: MigrationResult[] = [];
 
       for (const [name, boundModel] of boundModels) {
         try {
-          const result = await boundModel.migrateAll();
+          const result = await boundModel.migrateAll(options);
           results.push(result);
         } catch (err) {
           if (err instanceof MigrationAlreadyRunningError) {
@@ -513,10 +579,12 @@ export function createStore(
 
       return results;
     },
-  };
+  } as Store<TModels, TOptions>;
+
+  const storeRecord = store as unknown as Record<string, unknown>;
 
   for (const [name, boundModel] of boundModels) {
-    store[name] = {
+    storeRecord[name] = {
       findByKey: boundModel.findByKey.bind(boundModel),
       query: boundModel.query.bind(boundModel),
       create: boundModel.create.bind(boundModel),
@@ -527,7 +595,7 @@ export function createStore(
       batchDelete: boundModel.batchDelete.bind(boundModel),
       migrateAll: boundModel.migrateAll.bind(boundModel),
       getMigrationStatus: boundModel.getMigrationStatus.bind(boundModel),
-    };
+    } satisfies BoundModel<any, TOptions, any, any>;
   }
 
   return store;

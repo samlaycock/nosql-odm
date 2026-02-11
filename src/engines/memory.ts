@@ -158,19 +158,31 @@ export function memoryEngine(options?: MemoryEngineOptions): MemoryQueryEngine {
       async getOutdated(collection, criteria, cursor?) {
         const col = getCollection(collection);
         const outdated: KeyedStoredDocument[] = [];
+        const parseVersion = criteria.parseVersion ?? defaultParseVersion;
+        const compareVersions = criteria.compareVersions ?? defaultCompareVersions;
 
         for (const [key, stored] of col) {
           const doc = stored.doc;
-          const docVersion = (doc[criteria.versionField] as number | undefined) ?? 1;
+          const parsedVersion = parseVersion(doc[criteria.versionField]);
           const storedIndexes = doc[criteria.indexesField] as string[] | undefined;
+          const versionState = classifyVersionState(
+            parsedVersion,
+            criteria.version,
+            compareVersions,
+          );
 
-          // Document is outdated if version is stale
-          if (docVersion < criteria.version) {
+          // Stale versions are outdated and should be migrated.
+          if (versionState === "stale") {
             outdated.push({ key, stored });
             continue;
           }
 
-          // Or if stored indexes don't match expected indexes
+          // Versions that cannot be safely compared/migrated are ignored.
+          if (versionState !== "current") {
+            continue;
+          }
+
+          // Current version but stored indexes don't match expected indexes.
           if (
             !storedIndexes ||
             storedIndexes.length !== criteria.indexes.length ||
@@ -185,6 +197,14 @@ export function memoryEngine(options?: MemoryEngineOptions): MemoryQueryEngine {
       },
 
       async saveCheckpoint(lock, cursor) {
+        const existing = locks.get(lock.collection);
+
+        // Ignore stale lock holders so they cannot overwrite checkpoint
+        // state after a lock has been replaced (e.g. via TTL-based steal).
+        if (existing?.id !== lock.id) {
+          return;
+        }
+
         checkpoints.set(lock.collection, cursor);
       },
 
@@ -310,6 +330,120 @@ function matchesCondition(value: string, condition: FieldCondition): boolean {
   }
 
   return true;
+}
+
+type ComparableVersion = string | number;
+type VersionState = "current" | "stale" | "ahead" | "unknown";
+
+function classifyVersionState(
+  parsedVersion: ComparableVersion | null,
+  latest: number,
+  compareVersions: (a: ComparableVersion, b: ComparableVersion) => number,
+): VersionState {
+  if (parsedVersion === null) {
+    return "unknown";
+  }
+
+  const cmp = safeCompare(parsedVersion, latest, compareVersions);
+
+  if (cmp === null) {
+    return "unknown";
+  }
+
+  if (cmp < 0) {
+    return "stale";
+  }
+
+  if (cmp > 0) {
+    return "ahead";
+  }
+
+  return "current";
+}
+
+function safeCompare(
+  a: ComparableVersion,
+  b: ComparableVersion,
+  compareVersions: (a: ComparableVersion, b: ComparableVersion) => number,
+): -1 | 0 | 1 | null {
+  try {
+    const raw = compareVersions(a, b);
+
+    if (!Number.isFinite(raw)) {
+      return null;
+    }
+
+    if (raw < 0) {
+      return -1;
+    }
+
+    if (raw > 0) {
+      return 1;
+    }
+
+    return 0;
+  } catch {
+    return null;
+  }
+}
+
+function defaultParseVersion(raw: unknown): ComparableVersion | null {
+  if (raw === undefined || raw === null) {
+    return 1;
+  }
+
+  if (typeof raw === "number") {
+    return Number.isFinite(raw) ? raw : null;
+  }
+
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+
+    if (trimmed.length === 0) {
+      return null;
+    }
+
+    const numeric = normalizeNumericVersion(trimmed);
+
+    if (numeric !== null) {
+      return numeric;
+    }
+
+    return trimmed;
+  }
+
+  return null;
+}
+
+function defaultCompareVersions(a: ComparableVersion, b: ComparableVersion): number {
+  if (typeof a === "number" && typeof b === "number") {
+    return a - b;
+  }
+
+  const numericA = normalizeNumericVersion(String(a));
+  const numericB = normalizeNumericVersion(String(b));
+
+  if (numericA !== null && numericB !== null) {
+    return numericA - numericB;
+  }
+
+  return String(a).localeCompare(String(b), undefined, {
+    numeric: true,
+    sensitivity: "base",
+  });
+}
+
+function normalizeNumericVersion(value: string): number | null {
+  const trimmed = value.trim();
+  const match = /^v?(-?\d+)$/i.exec(trimmed);
+
+  if (!match) {
+    return null;
+  }
+
+  const parsed = Number(match[1]);
+
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 // ---------------------------------------------------------------------------

@@ -148,7 +148,7 @@ describe("createStore()", () => {
 
     expect(store.user).toBeDefined();
     expect(store.post).toBeDefined();
-    expect(store.migrateAll).toBeDefined();
+    expect(typeof store.migrateAll).toBe("function");
   });
 
   test("throws on duplicate model names", () => {
@@ -458,7 +458,7 @@ describe("store.query() with where", () => {
     });
 
     expect(results.documents).toHaveLength(1);
-    expect(results.documents[0].email).toBe("a@example.com");
+    expect(results.documents[0]!.email).toBe("a@example.com");
   });
 
   test("supports limit, cursor, and sort", async () => {
@@ -1610,8 +1610,8 @@ describe("migrateAll() concurrent locking", () => {
     expect(result.migrated).toBe(0); // already migrated
   });
 
-  test("lock is released even if migration fails", async () => {
-    // Create a model with a migration that will fail validation
+  test("lock is released even when invalid documents are skipped", async () => {
+    // Create a model where migration produces invalid data for this document.
     const brokenModel = model("broken")
       .schema(1, z.object({ id: z.string(), value: z.string() }))
       .schema(
@@ -1629,11 +1629,22 @@ describe("migrateAll() concurrent locking", () => {
 
     const store = createStore(engine, [brokenModel]);
 
-    // First migration fails
-    expect(store.broken.migrateAll()).rejects.toThrow();
+    const first = await store.broken.migrateAll();
+    expect(first.status).toBe("completed");
+    expect(first.migrated).toBe(0);
+    expect(first.skipped).toBe(1);
+    expect(first.skipReasons).toEqual({
+      validation_error: 1,
+    });
 
-    // Lock should be released — second attempt should also fail (not MigrationAlreadyRunningError)
-    expect(store.broken.migrateAll()).rejects.not.toBeInstanceOf(MigrationAlreadyRunningError);
+    // Lock should be released — rerun still completes (doc remains skipped).
+    const second = await store.broken.migrateAll();
+    expect(second.status).toBe("completed");
+    expect(second.migrated).toBe(0);
+    expect(second.skipped).toBe(1);
+    expect(second.skipReasons).toEqual({
+      validation_error: 1,
+    });
   });
 
   test("different models can migrate concurrently", async () => {
@@ -1738,7 +1749,23 @@ describe("store.migrateAll()", () => {
     expect(postResult?.status).toBe("completed");
   });
 
-  test("continues migrating other models when one fails", async () => {
+  test("uses lockTtlMs to recover from stale locks", async () => {
+    await engine.put("user", "u1", { __v: 1, id: "u1", name: "Sam", email: "sam@example.com" }, {});
+
+    // Simulate a stuck lock.
+    await engine.migration.acquireLock("user");
+
+    const store = createStore(engine, [buildUserV2()]);
+
+    const first = await store.migrateAll();
+    expect(first[0]?.status).toBe("skipped");
+
+    const second = await store.migrateAll({ lockTtlMs: 0 });
+    expect(second[0]?.status).toBe("completed");
+    expect(second[0]?.migrated).toBe(1);
+  });
+
+  test("continues migrating other models when one has skipped documents", async () => {
     const brokenModel = model("broken")
       .schema(1, z.object({ id: z.string(), value: z.string() }))
       .schema(
@@ -1761,8 +1788,12 @@ describe("store.migrateAll()", () => {
     const brokenResult = results.find((r: any) => r.model === "broken");
     const postResult = results.find((r: any) => r.model === "post");
 
-    expect(brokenResult?.status).toBe("failed");
-    expect(brokenResult?.error).toBeDefined();
+    expect(brokenResult?.status).toBe("completed");
+    expect(brokenResult?.migrated).toBe(0);
+    expect(brokenResult?.skipped).toBe(1);
+    expect(brokenResult?.skipReasons).toEqual({
+      validation_error: 1,
+    });
     expect(postResult?.status).toBe("completed");
   });
 
@@ -2039,15 +2070,16 @@ describe("lazy migration error handling", () => {
       .build();
   }
 
-  test("findByKey throws when lazy migration produces invalid data", async () => {
+  test("findByKey returns null when lazy migration produces invalid data", async () => {
     await engine.put("broken", "b1", { __v: 1, id: "b1", value: "test" }, { primary: "b1" });
 
     const store = createStore(engine, [buildBrokenMigrationModel()]);
 
-    expect(store.broken.findByKey("b1")).rejects.toThrow(ValidationError);
+    const result = await store.broken.findByKey("b1");
+    expect(result).toBeNull();
   });
 
-  test("query throws when lazy migration produces invalid data", async () => {
+  test("query skips documents when lazy migration produces invalid data", async () => {
     await engine.put(
       "broken",
       "b1",
@@ -2057,17 +2089,17 @@ describe("lazy migration error handling", () => {
 
     const store = createStore(engine, [buildBrokenMigrationModel()]);
 
-    expect(store.broken.query({ index: "all", filter: { value: "yes" } })).rejects.toThrow(
-      ValidationError,
-    );
+    const result = await store.broken.query({ index: "all", filter: { value: "yes" } });
+    expect(result.documents).toEqual([]);
   });
 
-  test("batchGet throws when lazy migration produces invalid data", async () => {
+  test("batchGet skips documents when lazy migration produces invalid data", async () => {
     await engine.put("broken", "b1", { __v: 1, id: "b1", value: "test" }, {});
 
     const store = createStore(engine, [buildBrokenMigrationModel()]);
 
-    expect(store.broken.batchGet(["b1"])).rejects.toThrow(ValidationError);
+    const result = await store.broken.batchGet(["b1"]);
+    expect(result).toEqual([]);
   });
 
   test("update throws when existing doc migration produces invalid data", async () => {
@@ -2078,16 +2110,13 @@ describe("lazy migration error handling", () => {
     expect(store.broken.update("b1", { value: "new" })).rejects.toThrow(ValidationError);
   });
 
-  test("findByKey does not write back if migration fails", async () => {
+  test("findByKey does not write back if migration is skipped", async () => {
     await engine.put("broken", "b1", { __v: 1, id: "b1", value: "test" }, { primary: "b1" });
 
     const store = createStore(engine, [buildBrokenMigrationModel()]);
 
-    try {
-      await store.broken.findByKey("b1");
-    } catch {
-      // expected
-    }
+    const result = await store.broken.findByKey("b1");
+    expect(result).toBeNull();
 
     // Engine should still have v1 document (writeback never reached)
     const raw = (await engine.get("broken", "b1")) as Record<string, unknown>;
@@ -2101,7 +2130,7 @@ describe("lazy migration error handling", () => {
 // ---------------------------------------------------------------------------
 
 describe("migration chain errors", () => {
-  test("findByKey throws when migration function itself throws", async () => {
+  test("findByKey returns null when migration function throws", async () => {
     const badModel = model("user")
       .schema(1, z.object({ id: z.string(), name: z.string() }))
       .schema(2, z.object({ id: z.string(), name: z.string(), email: z.string() }), {
@@ -2116,10 +2145,11 @@ describe("migration chain errors", () => {
 
     const store = createStore(engine, [badModel]);
 
-    expect(store.user.findByKey("u1")).rejects.toThrow("migration exploded");
+    const result = await store.user.findByKey("u1");
+    expect(result).toBeNull();
   });
 
-  test("migrateAll throws when migration function itself throws", async () => {
+  test("migrateAll skips document when migration function throws", async () => {
     const badModel = model("user")
       .schema(1, z.object({ id: z.string(), name: z.string() }))
       .schema(2, z.object({ id: z.string(), name: z.string(), email: z.string() }), {
@@ -2133,14 +2163,20 @@ describe("migration chain errors", () => {
 
     const store = createStore(engine, [badModel]);
 
-    expect(store.user.migrateAll()).rejects.toThrow("migration exploded");
+    const result = await store.user.migrateAll();
+    expect(result.status).toBe("completed");
+    expect(result.migrated).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(result.skipReasons).toEqual({
+      migration_error: 1,
+    });
 
     // Lock should still be released
     const lock = await engine.migration.acquireLock("user");
     expect(lock).not.toBeNull();
   });
 
-  test("v1→v2 succeeds but v2→v3 throws mid-chain", async () => {
+  test("v1→v2 succeeds but v2→v3 throw is skipped", async () => {
     const badV3Model = model("user")
       .schema(1, z.object({ id: z.string(), name: z.string() }))
       .schema(
@@ -2181,7 +2217,8 @@ describe("migration chain errors", () => {
 
     const store = createStore(engine, [badV3Model]);
 
-    expect(store.user.findByKey("u1")).rejects.toThrow("v3 migration failed");
+    const result = await store.user.findByKey("u1");
+    expect(result).toBeNull();
   });
 });
 
@@ -2441,7 +2478,7 @@ describe("documents without id or _id field", () => {
 // ---------------------------------------------------------------------------
 
 describe("edge case version values in store", () => {
-  test("document with version higher than latest is still validated", async () => {
+  test("document with version higher than latest is ignored", async () => {
     // Seed a doc claiming to be v5, but model only has v1
     await engine.put(
       "user",
@@ -2452,15 +2489,11 @@ describe("edge case version values in store", () => {
 
     const store = createStore(engine, [buildUserV1()]);
 
-    // Version 5 >= latest (1), so no migration needed, but validate still runs
     const result = await store.user.findByKey("u1");
-    expect(result).toEqual({ id: "u1", name: "Sam", email: "sam@example.com" });
+    expect(result).toBeNull();
   });
 
-  test("document with non-numeric version string is not migrated (NaN comparison)", async () => {
-    // When __v is a string, the cast `as number | undefined` yields NaN.
-    // NaN < latestVersion is false, so no migration is triggered.
-    // The document is validated against the latest schema directly.
+  test("document with unrecognized version string is ignored", async () => {
     await engine.put(
       "user",
       "u1",
@@ -2474,8 +2507,58 @@ describe("edge case version values in store", () => {
     );
 
     const store = createStore(engine, [buildUserV2()]);
-    // v2 schema expects firstName/lastName, so v1-shaped data fails validation
-    expect(store.user.findByKey("u1")).rejects.toThrow(ValidationError);
+    const result = await store.user.findByKey("u1");
+    expect(result).toBeNull();
+  });
+
+  test('default parser migrates string versions like "v1"', async () => {
+    await engine.put(
+      "user",
+      "u1",
+      { __v: "v1", id: "u1", name: "Sam Laycock", email: "sam@example.com" },
+      { primary: "u1", byEmail: "sam@example.com" },
+    );
+
+    const store = createStore(engine, [buildUserV2()]);
+    const result = await store.user.findByKey("u1");
+
+    expect(result).toEqual({
+      id: "u1",
+      firstName: "Sam",
+      lastName: "Laycock",
+      email: "sam@example.com",
+    });
+  });
+
+  test("custom version parser/comparator are used for migration", async () => {
+    const customVersionModel = model("user", {
+      parseVersion(raw) {
+        if (typeof raw === "string" || typeof raw === "number") {
+          return raw;
+        }
+
+        return null;
+      },
+      compareVersions(a, b) {
+        const toNumber = (v: string | number) =>
+          typeof v === "number" ? v : Number(String(v).replace(/^release-/i, ""));
+
+        return toNumber(a) - toNumber(b);
+      },
+    })
+      .schema(1, z.object({ id: z.string(), name: z.string() }))
+      .schema(2, z.object({ id: z.string(), name: z.string(), active: z.boolean() }), {
+        migrate: (old) => ({ ...old, active: true }),
+      })
+      .index({ name: "primary", value: "id" })
+      .build();
+
+    await engine.put("user", "u1", { __v: "release-1", id: "u1", name: "Sam" }, { primary: "u1" });
+
+    const store = createStore(engine, [customVersionModel]);
+    const result = await store.user.findByKey("u1");
+
+    expect(result).toEqual({ id: "u1", name: "Sam", active: true });
   });
 
   test("document with null version is treated as v1", async () => {
@@ -2494,6 +2577,25 @@ describe("edge case version values in store", () => {
       firstName: "Sam",
       lastName: "Laycock",
       email: "sam@example.com",
+    });
+  });
+
+  test("migrateAll tracks unknown_source_version skips", async () => {
+    await engine.put(
+      "user",
+      "u1",
+      { __v: 0, id: "u1", name: "Sam Laycock", email: "sam@example.com" },
+      { primary: "u1", byEmail: "sam@example.com" },
+    );
+
+    const store = createStore(engine, [buildUserV2()]);
+    const result = await store.user.migrateAll();
+
+    expect(result.status).toBe("completed");
+    expect(result.migrated).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(result.skipReasons).toEqual({
+      unknown_source_version: 1,
     });
   });
 });
@@ -3061,9 +3163,9 @@ describe("dynamic index names", () => {
     const store = createStore(engine, [staticOnly]);
     await store.item.create("i1", { id: "i1" });
 
-    expect(store.item.query({ index: "nonexistent", filter: { value: "x" } })).rejects.toThrow(
-      'No index named "nonexistent"',
-    );
+    expect(
+      store.item.query({ index: "nonexistent" as any, filter: { value: "x" } }),
+    ).rejects.toThrow('No index named "nonexistent"');
   });
 
   test("findByKey lazy-migrates and recomputes dynamic index on writeback", async () => {

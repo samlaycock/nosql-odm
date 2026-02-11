@@ -1045,6 +1045,27 @@ describe("migration checkpoints", () => {
     expect(checkpoint).toBe("cursor-2");
   });
 
+  test("stale lock holder cannot overwrite checkpoint after TTL lock steal", async () => {
+    const lock1 = await engine.migration.acquireLock("users");
+    expect(lock1).not.toBeNull();
+
+    await engine.migration.saveCheckpoint!(lock1!, "cursor-1");
+
+    // Steal/replace the lock.
+    const lock2 = await engine.migration.acquireLock("users", { ttl: 0 });
+    expect(lock2).not.toBeNull();
+    expect(lock2!.id).not.toBe(lock1!.id);
+
+    // Current lock updates checkpoint.
+    await engine.migration.saveCheckpoint!(lock2!, "cursor-2");
+
+    // Old lock must not be able to overwrite.
+    await engine.migration.saveCheckpoint!(lock1!, "stale-overwrite");
+
+    const checkpoint = await engine.migration.loadCheckpoint!("users");
+    expect(checkpoint).toBe("cursor-2");
+  });
+
   test("checkpoints are scoped to collections", async () => {
     const lock1 = await engine.migration.acquireLock("users");
     const lock2 = await engine.migration.acquireLock("posts");
