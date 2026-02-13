@@ -442,6 +442,8 @@ await store.user.batchDelete(["u2", "u3"]);
 
 ## Querying
 
+The query API is explicit by design: choose an index, provide a filter, then paginate with cursors.
+
 ```ts
 const page1 = await store.user.query({
   index: "byRole",
@@ -457,11 +459,21 @@ const page2 = await store.user.query({
 });
 ```
 
+`query()` returns:
+
+- `documents`: typed model documents
+- `cursor`: `string | null` for keyset pagination
+
 Field-based `where` shorthand is also supported (requires an index on that field):
 
 ```ts
-const results = await store.user.query({
+const exact = await store.user.query({
   where: { email: "sam@example.com" },
+});
+
+const range = await store.user.query({
+  where: { id: { $gte: "u1000" } },
+  limit: 50,
 });
 ```
 
@@ -484,9 +496,67 @@ Supported filter operators:
 - Prefix: `$begins`
 - Range: `$between: [low, high]`
 
-## Dynamic Index Names
+## Indexing Guide
 
-Use the overload `index(key, definition)` when the index name is computed per document:
+Indexes are precomputed string keys. Good index design is the difference between simple queries and painful query logic.
+
+### Static and composite indexes
+
+```ts
+const User = model("user")
+  .schema(
+    1,
+    z.object({
+      id: z.string(),
+      email: z.email(),
+      role: z.enum(["admin", "member", "guest"]),
+      lastName: z.string(),
+      createdAt: z.string(), // ISO-8601 timestamp
+    }),
+  )
+  .index({ name: "primary", value: "id" })
+  .index({ name: "byEmail", value: "email" })
+  .index({ name: "byCreatedAt", value: "createdAt" })
+  .index({ name: "byRoleLastName", value: (u) => `${u.role}#${u.lastName.toLowerCase()}` })
+  .build();
+```
+
+Composite indexes are ideal when your common queries include both partitioning and ordering:
+
+```ts
+const members = await store.user.query({
+  index: "byRoleLastName",
+  filter: { value: { $begins: "member#" } },
+  sort: "asc",
+  limit: 25,
+});
+```
+
+### Lexicographic ordering rules
+
+All index values are strings. Sort/range comparisons are lexicographic.
+
+If you need numeric ordering, encode numeric values so lexicographic order matches numeric order:
+
+```ts
+const Product = model("product")
+  .schema(
+    1,
+    z.object({
+      id: z.string(),
+      priceCents: z.number().int(),
+    }),
+  )
+  .index({ name: "primary", value: "id" })
+  .index({ name: "byPrice", value: (p) => String(p.priceCents).padStart(12, "0") })
+  .build();
+```
+
+For dates/times, prefer sortable ISO-8601 strings (`2026-02-13T19:00:00.000Z`).
+
+### Dynamic index names
+
+Use the overload `index(key, definition)` when the index name itself is data-driven (for example tenant partitions):
 
 ```ts
 const Resource = model("resource")
@@ -506,7 +576,7 @@ const Resource = model("resource")
   .build();
 ```
 
-Query dynamic indexes using the resolved name:
+Query dynamic indexes by resolved name:
 
 ```ts
 await store.resource.query({
@@ -515,9 +585,96 @@ await store.resource.query({
 });
 ```
 
+Notes:
+
+- Dynamic-name indexes are queried with `index` + `filter` (not `where`).
+- Use a stable naming convention (`<partition>#<kind>`) so callers can derive names safely.
+
+### Index evolution across schema versions
+
+Indexes are attached to the latest schema shape. When adding a schema version, re-declare indexes:
+
+```ts
+const User = model("user")
+  .schema(1, z.object({ id: z.string(), email: z.email() }))
+  .index({ name: "primary", value: "id" })
+  .index({ name: "byEmail", value: "email" })
+  .schema(
+    2,
+    z.object({
+      id: z.string(),
+      email: z.email(),
+      role: z.enum(["admin", "member", "guest"]),
+    }),
+    {
+      migrate(old) {
+        return { ...old, role: "member" as const };
+      },
+    },
+  )
+  .index({ name: "primary", value: "id" })
+  .index({ name: "byEmail", value: "email" })
+  .index({ name: "byRole", value: "role" })
+  .build();
+```
+
 ## Migrations
 
-Default migration mode is `lazy` (migrate stale docs on read and write them back).
+### Defining version chains
+
+```ts
+const User = model("user")
+  .schema(
+    1,
+    z.object({
+      id: z.string(),
+      name: z.string(),
+      email: z.email(),
+    }),
+  )
+  .schema(
+    2,
+    z.object({
+      id: z.string(),
+      firstName: z.string(),
+      lastName: z.string(),
+      email: z.email(),
+    }),
+    {
+      migrate(old) {
+        const [firstName, ...rest] = old.name.split(" ");
+        return {
+          id: old.id,
+          firstName: firstName ?? "",
+          lastName: rest.join(" ") || "",
+          email: old.email,
+        };
+      },
+    },
+  )
+  .schema(
+    3,
+    z.object({
+      id: z.string(),
+      firstName: z.string(),
+      lastName: z.string(),
+      email: z.email(),
+      role: z.enum(["admin", "member", "guest"]),
+    }),
+    {
+      migrate(old) {
+        return { ...old, role: "member" as const };
+      },
+    },
+  )
+  .build();
+```
+
+Migrations run stepwise (`v1 -> v2 -> v3`), not as one jump.
+
+### Migration modes
+
+Default mode is `lazy`:
 
 ```ts
 const User = model("user", { migration: "lazy" }) // default
@@ -525,13 +682,42 @@ const User = model("user", { migration: "lazy" }) // default
   .build();
 ```
 
-Run explicit full migrations:
+Modes:
+
+- `lazy`: read paths (`findByKey`, `query`, `batchGet`) migrate stale docs and write back.
+- `readonly`: read paths migrate in memory but do not write back.
+- `eager`: same read behavior as `readonly`; use `migrateAll()` for persisted upgrades.
+
+### Running migrations explicitly
+
+One model:
 
 ```ts
-await store.user.migrateAll(); // one model
-await store.migrateAll(); // every model in the store
+const result = await store.user.migrateAll();
 
-// Optional: lock TTL in ms for stale-lock recovery
+if (result.status === "completed") {
+  console.log(result.migrated, result.skipped, result.skipReasons);
+}
+```
+
+All models in a store:
+
+```ts
+const results = await store.migrateAll();
+
+for (const result of results) {
+  if (result.status === "completed") {
+    console.log(result.model, result.migrated, result.skipped);
+  } else {
+    // typically already running for a locked model
+    console.log(result.model, result.status, result.reason);
+  }
+}
+```
+
+Optional lock TTL in ms for stale-lock recovery:
+
+```ts
 await store.user.migrateAll({ lockTtlMs: 30_000 });
 await store.migrateAll({ lockTtlMs: 30_000 });
 ```
@@ -551,13 +737,7 @@ Typical `skipReasons` keys:
 - `ahead_of_latest`
 - `version_compare_error`
 
-Migration modes:
-
-- `lazy`: read paths (`findByKey`, `query`, `batchGet`) migrate stale docs and write back.
-- `readonly`: read paths migrate in memory but do not write back.
-- `eager`: same read behavior as `readonly`; use `migrateAll()` for persisted upgrades.
-
-Ignore-first policy:
+### Ignore-first policy
 
 - Documents with versions ahead of the latest schema are ignored.
 - Documents with invalid/unrecognized versions are ignored.
@@ -565,11 +745,26 @@ Ignore-first policy:
 - `findByKey` returns `null` for ignored documents.
 - `query` and `batchGet` omit ignored documents from results.
 
-You can inspect migration lock/checkpoint state per model:
+### Migration observability
+
+Inspect migration lock/checkpoint state per model:
 
 ```ts
 const status = await store.user.getMigrationStatus();
+
+if (status) {
+  console.log(status.lock.id, status.lock.acquiredAt, status.cursor);
+}
 ```
+
+### Recommended migration rollout patterns
+
+1. `lazy` first, `migrateAll` later:
+   Deploy code with new schemas in `lazy` mode, let hot data self-heal on reads, then run `migrateAll()` to backfill.
+2. `readonly` for safety checks:
+   Use `readonly` if you want migrated reads without persistence while validating new schema behavior.
+3. `eager` for controlled maintenance windows:
+   Use `eager` + scheduled `migrateAll()` when writes during read paths should stay minimal/predictable.
 
 ## Custom Metadata Fields
 
@@ -583,13 +778,29 @@ const User = model("user", {
   .build();
 ```
 
-You can also customize version parsing/comparison (version values may be `string` or `number`):
+You can also customize version parsing/comparison (version values may be `string` or `number`). This directly affects outdated detection and migration comparisons:
 
 ```ts
 const User = model("user", {
   parseVersion(raw) {
     if (typeof raw === "string" || typeof raw === "number") return raw;
     return null;
+  },
+  compareVersions(a, b) {
+    const toNum = (v: string | number) =>
+      typeof v === "number" ? v : Number(String(v).replace(/^release-/i, ""));
+    return toNum(a) - toNum(b);
+  },
+});
+```
+
+Example for release tags:
+
+```ts
+const User = model("user", {
+  versionField: "release",
+  parseVersion(raw) {
+    return typeof raw === "string" ? raw : null;
   },
   compareVersions(a, b) {
     const toNum = (v: string | number) =>
