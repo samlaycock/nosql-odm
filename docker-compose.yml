@@ -28,3 +28,12 @@ services:
     profiles: ["firestore"]
     ports:
       - "8080:8080"
+
+  mysql:
+    image: mysql:8.4
+    profiles: ["mysql"]
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: mysql
+    ports:
+      - "3306:3306"
