@@ -8,7 +8,7 @@ const Users = model("users")
     z.object({
       id: z.string(),
       name: z.string(),
-      email: z.string().email(),
+      email: z.email(),
     }),
   )
   .schema(
@@ -17,7 +17,7 @@ const Users = model("users")
       id: z.string(),
       firstName: z.string(),
       lastName: z.string(),
-      email: z.string().email(),
+      email: z.email(),
       active: z.boolean(),
     }),
     {
@@ -68,17 +68,27 @@ void store.users.create("u1", {
 });
 void store.users.update("u1", { active: false });
 
-// @ts-expect-error - "name" is not in the latest schema.
-void store.users.create("u1", { id: "u1", name: "Sam", email: "sam@example.com" });
+void store.users.create("u1", {
+  id: "u1",
+  // @ts-expect-error - "name" is not in the latest schema.
+  name: "Sam",
+  email: "sam@example.com",
+});
 // @ts-expect-error - update is Partial<latest shape>, so value types must still match.
 void store.users.update("u1", { active: "yes" });
 
 // Static indexes are inferred as a literal union.
 void store.users.query({ index: "primary", filter: { value: "u1" } });
-void store.users.query({ index: "byEmail", filter: { value: "sam@example.com" } });
+void store.users.query({
+  index: "byEmail",
+  filter: { value: "sam@example.com" },
+});
 // @ts-expect-error - not a declared static index.
 void store.users.query({ index: "byTenant", filter: { value: "acme" } });
 
 // Dynamic-index models accept static names and arbitrary resolved names.
 void store.resources.query({ index: "primary", filter: { value: "r1" } });
-void store.resources.query({ index: "acme#user", filter: { value: { $begins: "acme#" } } });
+void store.resources.query({
+  index: "acme#user",
+  filter: { value: { $begins: "acme#" } },
+});
