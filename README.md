@@ -10,7 +10,7 @@ A lightweight, schema-first ODM for NoSQL-style data stores.
 - Ignore-first migration behavior for non-migratable documents
 - Dynamic index names (multi-tenant style index partitions)
 - Explicit bulk operations (`batchGet`, `batchSet`, `batchDelete`)
-- Pluggable query engine interface (memory, SQLite, IndexedDB, DynamoDB, Cassandra, Redis, and MongoDB adapters included)
+- Pluggable query engine interface (memory, SQLite, IndexedDB, DynamoDB, Cassandra, Redis, MongoDB, and Firestore adapters included)
 
 ## Package Intent
 
@@ -55,6 +55,12 @@ For MongoDB support:
 
 ```bash
 npm install mongodb
+```
+
+For Firestore support:
+
+```bash
+npm install @google-cloud/firestore
 ```
 
 ## Quick Start
@@ -251,6 +257,32 @@ The MongoDB adapter stores model documents and migration metadata in two collect
 
 You can override collection names with `documentsCollection` / `metadataCollection`.
 
+## Firestore Engine (`@google-cloud/firestore`)
+
+```ts
+import { Firestore } from "@google-cloud/firestore";
+import { firestoreEngine } from "nosql-odm/engines/firestore";
+
+process.env.FIRESTORE_EMULATOR_HOST = "127.0.0.1:8080"; // for local emulator usage
+
+const database = new Firestore({
+  projectId: "app-local",
+});
+
+const engine = firestoreEngine({
+  database,
+});
+
+const store = createStore(engine, [User]);
+```
+
+The Firestore adapter stores model documents and migration metadata in two collections:
+
+- `nosql_odm_documents`
+- `nosql_odm_metadata`
+
+You can override collection names with `documentsCollection` / `metadataCollection`.
+
 ## Local Engine Services (Docker Compose)
 
 For engine test suites with runtime dependencies, this repo uses named Docker Compose services.
@@ -328,6 +360,24 @@ The MongoDB engine integration suite uses this service directly:
 bun run test:integration:mongodb
 ```
 
+Start Firestore emulator:
+
+```bash
+bun run services:up:firestore
+```
+
+Stop it:
+
+```bash
+bun run services:down:firestore
+```
+
+The Firestore engine integration suite uses this service directly:
+
+```bash
+bun run test:integration:firestore
+```
+
 Test runner modes:
 
 ```bash
@@ -337,6 +387,7 @@ bun run test:integration:dynamodb            # only DynamoDB integration
 bun run test:integration:cassandra           # only Cassandra integration
 bun run test:integration:redis               # only Redis integration
 bun run test:integration:mongodb             # only MongoDB integration
+bun run test:integration:firestore           # only Firestore integration
 ```
 
 The DynamoDB integration suite creates and deletes its own test table automatically.

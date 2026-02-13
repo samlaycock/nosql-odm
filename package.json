@@ -57,6 +57,11 @@
       "types": "./dist/engines/mongodb.d.ts",
       "import": "./dist/engines/mongodb.mjs",
       "require": "./dist/engines/mongodb.js"
+    },
+    "./engines/firestore": {
+      "types": "./dist/engines/firestore.d.ts",
+      "import": "./dist/engines/firestore.mjs",
+      "require": "./dist/engines/firestore.js"
     }
   },
   "scripts": {
@@ -68,6 +73,7 @@
     "test:integration:cassandra": "bun test ./tests/integration/cassandra-engine.test.ts",
     "test:integration:redis": "bun test ./tests/integration/redis-engine.test.ts",
     "test:integration:mongodb": "bun test ./tests/integration/mongodb-engine.test.ts",
+    "test:integration:firestore": "bun test ./tests/integration/firestore-engine.test.ts",
     "services:up:dynamodb": "docker compose up -d dynamodb",
     "services:down:dynamodb": "docker compose rm -sf dynamodb",
     "services:up:cassandra": "docker compose up -d cassandra",
@@ -76,6 +82,8 @@
     "services:down:redis": "docker compose rm -sf redis",
     "services:up:mongodb": "docker compose up -d mongodb",
     "services:down:mongodb": "docker compose rm -sf mongodb",
+    "services:up:firestore": "docker compose up -d firestore",
+    "services:down:firestore": "docker compose rm -sf firestore",
     "lint": "oxlint . --type-aware",
     "lint:fix": "oxlint . --type-aware --fix",
     "fmt": "oxfmt .",
@@ -91,6 +99,7 @@
     "@aws-sdk/client-dynamodb": "3.989.0",
     "@aws-sdk/lib-dynamodb": "3.989.0",
     "@changesets/cli": "2.29.8",
+    "@google-cloud/firestore": "8.3.0",
     "@types/better-sqlite3": "7.6.13",
     "@types/bun": "latest",
     "better-sqlite3": "12.6.2",
@@ -106,6 +115,7 @@
   },
   "peerDependencies": {
     "@aws-sdk/lib-dynamodb": "^3.989.0",
+    "@google-cloud/firestore": "^8.3.0",
     "better-sqlite3": "^12",
     "cassandra-driver": "^4.8.0",
     "mongodb": "^7.1.0",

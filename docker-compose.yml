@@ -22,3 +22,9 @@ services:
     profiles: ["mongodb"]
     ports:
       - "27017:27017"
+
+  firestore:
+    image: mtlynch/firestore-emulator:latest
+    profiles: ["firestore"]
+    ports:
+      - "8080:8080"
