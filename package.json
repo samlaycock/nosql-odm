@@ -32,6 +32,11 @@
       "types": "./dist/engines/sqlite.d.ts",
       "import": "./dist/engines/sqlite.mjs",
       "require": "./dist/engines/sqlite.js"
+    },
+    "./engines/indexeddb": {
+      "types": "./dist/engines/indexeddb.d.ts",
+      "import": "./dist/engines/indexeddb.mjs",
+      "require": "./dist/engines/indexeddb.js"
     }
   },
   "scripts": {
@@ -53,6 +58,7 @@
     "@types/better-sqlite3": "7.6.13",
     "@types/bun": "latest",
     "better-sqlite3": "12.6.2",
+    "fake-indexeddb": "6.2.5",
     "oxfmt": "0.28.0",
     "oxlint": "1.43.0",
     "oxlint-tsgolint": "0.11.5",

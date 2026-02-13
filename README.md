@@ -10,7 +10,7 @@ A lightweight, schema-first ODM for NoSQL-style data stores.
 - Ignore-first migration behavior for non-migratable documents
 - Dynamic index names (multi-tenant style index partitions)
 - Explicit bulk operations (`batchGet`, `batchSet`, `batchDelete`)
-- Pluggable query engine interface (memory and SQLite adapters included)
+- Pluggable query engine interface (memory, SQLite, and IndexedDB adapters included)
 
 ## Package Intent
 
@@ -106,6 +106,27 @@ const store = createStore(engine, [User]);
 The SQLite engine requires an explicit database instance (`{ database }`), runs required internal table migrations on startup, and uses normalized index tables for efficient filtered queries, sorting, and cursor pagination.
 
 Note: this adapter is typed against the `better-sqlite3` `Database` API. If you pass another compatible SQLite database object (for example via a cast), that path is currently untyped/untested.
+
+## IndexedDB Engine (Browser / Worker)
+
+```ts
+import { indexedDbEngine } from "nosql-odm/engines/indexeddb";
+
+const engine = indexedDbEngine({ databaseName: "my-app-db" });
+const store = createStore(engine, [User]);
+```
+
+In non-browser environments (for example tests), pass a factory explicitly:
+
+```ts
+import { indexedDB as fakeIndexedDB } from "fake-indexeddb";
+import { indexedDbEngine } from "nosql-odm/engines/indexeddb";
+
+const engine = indexedDbEngine({
+  databaseName: "test-db",
+  factory: fakeIndexedDB as any,
+});
+```
 
 ## CRUD
 
