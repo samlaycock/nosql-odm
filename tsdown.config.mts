@@ -9,6 +9,7 @@ export default defineConfig({
     "./src/engines/dynamodb.ts",
     "./src/engines/cassandra.ts",
     "./src/engines/redis.ts",
+    "./src/engines/mongodb.ts",
   ],
   format: ["cjs", "esm"],
   platform: "neutral",

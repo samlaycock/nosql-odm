@@ -52,6 +52,11 @@
       "types": "./dist/engines/redis.d.ts",
       "import": "./dist/engines/redis.mjs",
       "require": "./dist/engines/redis.js"
+    },
+    "./engines/mongodb": {
+      "types": "./dist/engines/mongodb.d.ts",
+      "import": "./dist/engines/mongodb.mjs",
+      "require": "./dist/engines/mongodb.js"
     }
   },
   "scripts": {
@@ -62,6 +67,15 @@
     "test:integration:dynamodb": "bun test ./tests/integration/dynamodb-engine.test.ts",
     "test:integration:cassandra": "bun test ./tests/integration/cassandra-engine.test.ts",
     "test:integration:redis": "bun test ./tests/integration/redis-engine.test.ts",
+    "test:integration:mongodb": "bun test ./tests/integration/mongodb-engine.test.ts",
+    "services:up:dynamodb": "docker compose up -d dynamodb",
+    "services:down:dynamodb": "docker compose rm -sf dynamodb",
+    "services:up:cassandra": "docker compose up -d cassandra",
+    "services:down:cassandra": "docker compose rm -sf cassandra",
+    "services:up:redis": "docker compose up -d redis",
+    "services:down:redis": "docker compose rm -sf redis",
+    "services:up:mongodb": "docker compose up -d mongodb",
+    "services:down:mongodb": "docker compose rm -sf mongodb",
     "lint": "oxlint . --type-aware",
     "lint:fix": "oxlint . --type-aware --fix",
     "fmt": "oxfmt .",
@@ -82,6 +96,7 @@
     "better-sqlite3": "12.6.2",
     "cassandra-driver": "4.8.0",
     "fake-indexeddb": "6.2.5",
+    "mongodb": "7.1.0",
     "oxfmt": "0.28.0",
     "oxlint": "1.43.0",
     "oxlint-tsgolint": "0.11.5",
@@ -93,6 +108,7 @@
     "@aws-sdk/lib-dynamodb": "^3.989.0",
     "better-sqlite3": "^12",
     "cassandra-driver": "^4.8.0",
+    "mongodb": "^7.1.0",
     "redis": "^5.10.0",
     "typescript": "^5"
   }

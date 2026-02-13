@@ -10,7 +10,7 @@ A lightweight, schema-first ODM for NoSQL-style data stores.
 - Ignore-first migration behavior for non-migratable documents
 - Dynamic index names (multi-tenant style index partitions)
 - Explicit bulk operations (`batchGet`, `batchSet`, `batchDelete`)
-- Pluggable query engine interface (memory, SQLite, IndexedDB, DynamoDB, Cassandra, and Redis adapters included)
+- Pluggable query engine interface (memory, SQLite, IndexedDB, DynamoDB, Cassandra, Redis, and MongoDB adapters included)
 
 ## Package Intent
 
@@ -49,6 +49,12 @@ For Redis support:
 
 ```bash
 npm install redis
+```
+
+For MongoDB support:
+
+```bash
+npm install mongodb
 ```
 
 ## Quick Start
@@ -222,6 +228,29 @@ The Redis adapter stores document/index state in per-document hashes and keeps
 collection ordering in Redis sorted sets. Migration lock/checkpoint state is
 stored under dedicated metadata keys in the same prefix namespace.
 
+## MongoDB Engine (`mongodb`)
+
+```ts
+import { MongoClient } from "mongodb";
+import { mongoDbEngine } from "nosql-odm/engines/mongodb";
+
+const client = new MongoClient("mongodb://127.0.0.1:27017");
+await client.connect();
+
+const engine = mongoDbEngine({
+  database: client.db("app"),
+});
+
+const store = createStore(engine, [User]);
+```
+
+The MongoDB adapter stores model documents and migration metadata in two collections:
+
+- `nosql_odm_documents`
+- `nosql_odm_metadata`
+
+You can override collection names with `documentsCollection` / `metadataCollection`.
+
 ## Local Engine Services (Docker Compose)
 
 For engine test suites with runtime dependencies, this repo uses named Docker Compose services.
@@ -281,6 +310,24 @@ The Redis engine integration suite uses this service directly:
 bun run test:integration:redis
 ```
 
+Start MongoDB:
+
+```bash
+bun run services:up:mongodb
+```
+
+Stop it:
+
+```bash
+bun run services:down:mongodb
+```
+
+The MongoDB engine integration suite uses this service directly:
+
+```bash
+bun run test:integration:mongodb
+```
+
 Test runner modes:
 
 ```bash
@@ -289,6 +336,7 @@ bun run test:integration                     # all integration suites
 bun run test:integration:dynamodb            # only DynamoDB integration
 bun run test:integration:cassandra           # only Cassandra integration
 bun run test:integration:redis               # only Redis integration
+bun run test:integration:mongodb             # only MongoDB integration
 ```
 
 The DynamoDB integration suite creates and deletes its own test table automatically.

@@ -7,8 +7,8 @@ import {
   setDefaultTimeout,
   test,
 } from "bun:test";
-import { Client } from "cassandra-driver";
-import { cassandraEngine, type CassandraQueryEngine } from "../../src/engines/cassandra";
+import { MongoClient, type Db } from "mongodb";
+import { mongoDbEngine, type MongoDbQueryEngine } from "../../src/engines/mongodb";
 import {
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
@@ -16,26 +16,29 @@ import {
 } from "../../src/engines/types";
 import { createCollectionNameFactory, createTestResourceName, expectReject } from "./helpers";
 
-const contactPoints = (process.env.CASSANDRA_CONTACT_POINTS ?? "127.0.0.1")
-  .split(",")
-  .map((item) => item.trim())
-  .filter((item) => item.length > 0);
-const port = Number(process.env.CASSANDRA_PORT ?? "9042");
-const localDataCenter = process.env.CASSANDRA_LOCAL_DATACENTER ?? "datacenter1";
-const connectAttemptsRaw = Number(process.env.CASSANDRA_CONNECT_ATTEMPTS ?? "90");
-const connectDelayMsRaw = Number(process.env.CASSANDRA_CONNECT_DELAY_MS ?? "2000");
-const keyspace = process.env.CASSANDRA_TEST_KEYSPACE ?? createTestResourceName("nosql_odm_test");
+const mongoUrl = process.env.MONGODB_URL ?? "mongodb://127.0.0.1:27017";
+const connectAttemptsRaw = Number(process.env.MONGODB_CONNECT_ATTEMPTS ?? "60");
+const connectDelayMsRaw = Number(process.env.MONGODB_CONNECT_DELAY_MS ?? "1000");
+const databaseName = process.env.MONGODB_TEST_DATABASE ?? createTestResourceName("nosql_odm_test");
 
-const documentsTable = `${keyspace}.nosql_odm_documents`;
-const metadataTable = `${keyspace}.nosql_odm_metadata`;
+const documentsCollectionName = "nosql_odm_documents";
+const metadataCollectionName = "nosql_odm_metadata";
 
-let client: Client;
-let engine: CassandraQueryEngine;
+let client: MongoClient | null = null;
+let database: Db | null = null;
+let engine: MongoDbQueryEngine;
 let collection = "";
-let keyspaceCreated = false;
 const nextCollection = createCollectionNameFactory();
 
 setDefaultTimeout(120_000);
+
+function normalizePositiveInteger(value: number, fallback: number): number {
+  if (!Number.isFinite(value) || value <= 0) {
+    return fallback;
+  }
+
+  return Math.floor(value);
+}
 
 async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => {
@@ -43,27 +46,47 @@ async function sleep(ms: number): Promise<void> {
   });
 }
 
-async function connectWithRetry(instance: Client): Promise<void> {
-  const attempts =
-    Number.isFinite(connectAttemptsRaw) && connectAttemptsRaw > 0
-      ? Math.floor(connectAttemptsRaw)
-      : 90;
-  const delayMs =
-    Number.isFinite(connectDelayMsRaw) && connectDelayMsRaw > 0
-      ? Math.floor(connectDelayMsRaw)
-      : 2000;
+function documentsCollection() {
+  return requireDatabase().collection(documentsCollectionName);
+}
+
+function metadataCollection() {
+  return requireDatabase().collection(metadataCollectionName);
+}
+
+function requireDatabase(): Db {
+  if (!database) {
+    throw new Error("MongoDB test database is not initialized");
+  }
+
+  return database;
+}
+
+async function connectWithRetry(): Promise<MongoClient> {
+  const attempts = normalizePositiveInteger(connectAttemptsRaw, 60);
+  const delayMs = normalizePositiveInteger(connectDelayMsRaw, 1000);
 
   for (let i = 0; i < attempts; i++) {
+    const candidate = new MongoClient(mongoUrl, {
+      serverSelectionTimeoutMS: delayMs,
+      connectTimeoutMS: delayMs,
+    });
+
     try {
-      await instance.connect();
-      return;
+      await candidate.connect();
+      await candidate.db("admin").command({ ping: 1 });
+      return candidate;
     } catch (error) {
+      try {
+        await candidate.close();
+      } catch {}
+
       if (i === attempts - 1) {
         const msg = String(error);
 
         throw new Error(
-          `Unable to connect to Cassandra at ${contactPoints.join(",")}:${String(port)}. ` +
-            `Start it with \`bun run services:up:cassandra\`. ` +
+          `Unable to connect to MongoDB at ${mongoUrl}. ` +
+            `Start it with \`bun run services:up:mongodb\`. ` +
             `Retry config: attempts=${String(attempts)}, delayMs=${String(delayMs)}. ` +
             `Root error: ${msg}`,
         );
@@ -72,42 +95,34 @@ async function connectWithRetry(instance: Client): Promise<void> {
       await sleep(delayMs);
     }
   }
+
+  throw new Error("Unable to connect to MongoDB");
 }
 
-describe("cassandraEngine integration", () => {
+describe("mongoDbEngine integration", () => {
   beforeAll(async () => {
-    client = new Client({
-      contactPoints,
-      localDataCenter,
-      protocolOptions: {
-        port,
-      },
-    });
-
-    await connectWithRetry(client);
-
-    await client.execute(
-      `CREATE KEYSPACE IF NOT EXISTS ${keyspace} WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'}`,
-    );
-
-    keyspaceCreated = true;
+    client = await connectWithRetry();
+    database = client.db(databaseName);
   });
 
   beforeEach(() => {
     collection = nextCollection("users");
-    engine = cassandraEngine({
-      client,
-      keyspace,
+    engine = mongoDbEngine({
+      database: requireDatabase(),
     });
   });
 
   afterAll(async () => {
+    if (!client) {
+      return;
+    }
+
     try {
-      if (keyspaceCreated) {
-        await client.execute(`DROP KEYSPACE IF EXISTS ${keyspace}`);
+      if (database) {
+        await database.dropDatabase();
       }
     } finally {
-      await client.shutdown();
+      await client.close();
     }
   });
 
@@ -119,6 +134,45 @@ describe("cassandraEngine integration", () => {
     await engine.create(collection, "u1", { id: "u1", name: "Sam" }, { primary: "u1" });
 
     expect(await engine.get(collection, "u1")).toEqual({ id: "u1", name: "Sam" });
+  });
+
+  test("supports custom document and metadata collection names", async () => {
+    const db = requireDatabase();
+    const customEngine = mongoDbEngine({
+      database: db,
+      documentsCollection: "custom_documents",
+      metadataCollection: "custom_metadata",
+    });
+    const customCollection = nextCollection("custom");
+
+    await customEngine.put(customCollection, "u1", { id: "u1" }, { primary: "u1" });
+
+    const rawDoc = await db.collection("custom_documents").findOne({
+      collection: customCollection,
+      key: "u1",
+    });
+    const rawSeq = await db.collection("custom_metadata").findOne({
+      collection: customCollection,
+      kind: "sequence",
+    });
+
+    expect(rawDoc).not.toBeNull();
+    expect(rawSeq).not.toBeNull();
+  });
+
+  test("get returns deep clones", async () => {
+    await engine.put(collection, "u1", { id: "u1", nested: { value: 1 } }, { primary: "u1" });
+
+    const doc1 = (await engine.get(collection, "u1")) as {
+      nested: { value: number };
+    };
+    const doc2 = (await engine.get(collection, "u1")) as {
+      nested: { value: number };
+    };
+
+    expect(doc1).toEqual(doc2);
+    expect(doc1).not.toBe(doc2);
+    expect(doc1.nested).not.toBe(doc2.nested);
   });
 
   test("create throws duplicate-key error when key already exists", async () => {
@@ -229,24 +283,16 @@ describe("cassandraEngine integration", () => {
     expect(docs[0]?.doc).not.toBe(docs[1]?.doc);
   });
 
-  test("batchGet supports large key sets (chunking path)", async () => {
-    const items = Array.from({ length: 130 }, (_, i) => {
-      const key = `u${String(i).padStart(3, "0")}`;
+  test("batchGet returns deep clones per returned item", async () => {
+    await engine.put(collection, "u1", { id: "u1", nested: { value: 1 } }, { primary: "u1" });
 
-      return {
-        key,
-        doc: { id: key },
-        indexes: { primary: key },
-      };
-    });
+    const docs = await engine.batchGet(collection, ["u1", "u1"]);
+    const first = docs[0]?.doc as { nested: { value: number } };
+    const second = docs[1]?.doc as { nested: { value: number } };
 
-    await engine.batchSet(collection, items);
-    const keys = items.map((item) => item.key);
-    const docs = await engine.batchGet(collection, keys);
-
-    expect(docs).toHaveLength(130);
-    expect(docs[0]?.key).toBe("u000");
-    expect(docs[129]?.key).toBe("u129");
+    expect(first).toEqual(second);
+    expect(first).not.toBe(second);
+    expect(first.nested).not.toBe(second.nested);
   });
 
   test("query supports equality, sorting, and cursor pagination", async () => {
@@ -381,7 +427,7 @@ describe("cassandraEngine integration", () => {
     expect(await engine.migration.acquireLock(collection)).not.toBeNull();
   });
 
-  test("migration lock semantics: invalid ttl does not steal and collection scope is isolated", async () => {
+  test("migration lock semantics: invalid ttl does not steal, wrong id cannot release, and collection scope", async () => {
     const lock = await engine.migration.acquireLock(collection);
     const otherCollection = nextCollection("orders");
     const otherLock = await engine.migration.acquireLock(otherCollection);
@@ -396,6 +442,12 @@ describe("cassandraEngine integration", () => {
         }),
       ).toBeNull();
     }
+
+    await engine.migration.releaseLock({
+      id: "wrong-id",
+      collection,
+      acquiredAt: Date.now(),
+    });
 
     expect(await engine.migration.acquireLock(collection)).toBeNull();
     expect(await engine.migration.acquireLock(otherCollection)).toBeNull();
@@ -546,51 +598,97 @@ describe("cassandraEngine integration", () => {
     expect(page.documents.map((item) => item.key)).toEqual(["old"]);
   });
 
-  test("get throws for invalid stored document row", async () => {
-    await client.execute(
-      `INSERT INTO ${documentsTable} (collection, doc_key, created_at, doc, indexes) VALUES (?, ?, ?, ?, ?)`,
-      [collection, "bad", 1, '"not-an-object"', { primary: "bad" }],
-      { prepare: true },
-    );
+  test("get throws for invalid stored document record", async () => {
+    await documentsCollection().insertOne({
+      collection,
+      key: "bad",
+      createdAt: 1,
+      doc: "not-an-object",
+      indexes: { primary: "bad" },
+    });
 
-    await expectReject(engine.get(collection, "bad"), /invalid document row/);
+    await expectReject(engine.get(collection, "bad"), /invalid document record/);
   });
 
-  test("loadCheckpoint throws for invalid checkpoint row", async () => {
-    await client.execute(
-      `INSERT INTO ${metadataTable} (collection, kind) VALUES (?, 'checkpoint')`,
-      [collection],
-      { prepare: true },
-    );
+  test("get throws for invalid stored indexes value", async () => {
+    await documentsCollection().insertOne({
+      collection,
+      key: "bad",
+      createdAt: 1,
+      doc: { id: "bad" },
+      indexes: "not-an-object",
+    });
+
+    await expectReject(engine.get(collection, "bad"), /invalid document record/);
+  });
+
+  test("get throws for non-string stored index values", async () => {
+    await documentsCollection().insertOne({
+      collection,
+      key: "bad",
+      createdAt: 1,
+      doc: { id: "bad" },
+      indexes: { primary: 1 },
+    });
+
+    await expectReject(engine.get(collection, "bad"), /invalid document record/);
+  });
+
+  test("loadCheckpoint throws for invalid checkpoint record", async () => {
+    await metadataCollection().insertOne({
+      collection,
+      kind: "checkpoint",
+      cursor: 123,
+    });
 
     await expectReject(
       engine.migration.loadCheckpoint!(collection),
-      /invalid migration checkpoint row/,
+      /invalid migration checkpoint record/,
     );
   });
 
-  test("getStatus throws for invalid lock row", async () => {
-    await client.execute(
-      `INSERT INTO ${metadataTable} (collection, kind, lock_id) VALUES (?, 'lock', ?)`,
-      [collection, "bad-lock"],
-      { prepare: true },
-    );
+  test("getStatus throws for invalid lock record", async () => {
+    await metadataCollection().insertOne({
+      collection,
+      kind: "lock",
+      lockId: "bad-lock",
+    });
 
-    await expectReject(engine.migration.getStatus!(collection), /invalid migration lock row/);
+    await expectReject(engine.migration.getStatus!(collection), /invalid migration lock record/);
   });
 
-  test("getStatus throws for invalid checkpoint row", async () => {
-    await client.execute(
-      `INSERT INTO ${metadataTable} (collection, kind, lock_id, acquired_at) VALUES (?, 'lock', ?, ?)`,
-      [collection, "ok-lock", Date.now()],
-      { prepare: true },
-    );
-    await client.execute(
-      `INSERT INTO ${metadataTable} (collection, kind) VALUES (?, 'checkpoint')`,
-      [collection],
-      { prepare: true },
-    );
+  test("getStatus throws for invalid checkpoint record", async () => {
+    await metadataCollection().insertOne({
+      collection,
+      kind: "lock",
+      lockId: "ok-lock",
+      acquiredAt: Date.now(),
+    });
+    await metadataCollection().insertOne({
+      collection,
+      kind: "checkpoint",
+      cursor: 123,
+    });
 
-    await expectReject(engine.migration.getStatus!(collection), /invalid migration checkpoint row/);
+    await expectReject(
+      engine.migration.getStatus!(collection),
+      /invalid migration checkpoint record/,
+    );
+  });
+
+  test("acquireLock throws for invalid existing lock record", async () => {
+    await metadataCollection().insertOne({
+      collection,
+      kind: "lock",
+      lockId: "bad-lock",
+      acquiredAt: "invalid",
+    });
+
+    await expectReject(
+      engine.migration.acquireLock(collection, {
+        ttl: 0,
+      }),
+      /invalid migration lock record/,
+    );
   });
 });

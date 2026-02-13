@@ -272,6 +272,59 @@ describe("dynamoDbEngine integration", () => {
     expect(scan.documents.map((item) => item.key)).toEqual(["a", "b", "c"]);
   });
 
+  test("query pagination edge cases", async () => {
+    await engine.put(collection, "u1", { id: "u1" }, { byRole: "member#a" });
+    await engine.put(collection, "u2", { id: "u2" }, { byRole: "member#b" });
+    await engine.put(collection, "u3", { id: "u3" }, { byRole: "member#c" });
+
+    const limitZero = await engine.query(collection, {
+      index: "byRole",
+      filter: { value: { $begins: "member#" } },
+      sort: "asc",
+      limit: 0,
+    });
+
+    const noLimit = await engine.query(collection, {
+      index: "byRole",
+      filter: { value: { $begins: "member#" } },
+      sort: "asc",
+      limit: Number.POSITIVE_INFINITY,
+    });
+
+    const fractional = await engine.query(collection, {
+      index: "byRole",
+      filter: { value: { $begins: "member#" } },
+      sort: "asc",
+      limit: 1.9,
+    });
+
+    const unknownCursor = await engine.query(collection, {
+      index: "byRole",
+      filter: { value: { $begins: "member#" } },
+      sort: "asc",
+      cursor: "unknown",
+      limit: 2,
+    });
+
+    const lastCursor = await engine.query(collection, {
+      index: "byRole",
+      filter: { value: { $begins: "member#" } },
+      sort: "asc",
+      cursor: "u3",
+      limit: 2,
+    });
+
+    expect(limitZero.documents).toHaveLength(0);
+    expect(limitZero.cursor).toBeNull();
+    expect(noLimit.documents).toHaveLength(3);
+    expect(noLimit.cursor).toBeNull();
+    expect(fractional.documents).toHaveLength(1);
+    expect(fractional.cursor).toBe("u1");
+    expect(unknownCursor.documents.map((item) => item.key)).toEqual(["u1", "u2"]);
+    expect(lastCursor.documents).toHaveLength(0);
+    expect(lastCursor.cursor).toBeNull();
+  });
+
   test("migration lock/checkpoint/status semantics", async () => {
     const lock = await engine.migration.acquireLock(collection);
 
@@ -303,6 +356,65 @@ describe("dynamoDbEngine integration", () => {
 
     await engine.migration.releaseLock(stolen!);
     expect(await engine.migration.acquireLock(collection)).not.toBeNull();
+  });
+
+  test("migration lock semantics: invalid ttl does not steal and collection scope is isolated", async () => {
+    const lock = await engine.migration.acquireLock(collection);
+    const otherCollection = nextCollection("orders");
+    const otherLock = await engine.migration.acquireLock(otherCollection);
+
+    expect(lock).not.toBeNull();
+    expect(otherLock).not.toBeNull();
+
+    for (const ttl of [Number.NaN, Number.POSITIVE_INFINITY, -1]) {
+      expect(
+        await engine.migration.acquireLock(collection, {
+          ttl,
+        }),
+      ).toBeNull();
+    }
+
+    expect(await engine.migration.acquireLock(collection)).toBeNull();
+    expect(await engine.migration.acquireLock(otherCollection)).toBeNull();
+  });
+
+  test("migration checkpoint lifecycle and collection scope", async () => {
+    const otherCollection = nextCollection("orders");
+    const lock = await engine.migration.acquireLock(collection);
+    const otherLock = await engine.migration.acquireLock(otherCollection);
+
+    expect(lock).not.toBeNull();
+    expect(otherLock).not.toBeNull();
+    expect(await engine.migration.loadCheckpoint!(collection)).toBeNull();
+
+    await engine.migration.saveCheckpoint!(lock!, "cursor-a");
+    expect(await engine.migration.loadCheckpoint!(collection)).toBe("cursor-a");
+
+    await engine.migration.saveCheckpoint!(lock!, "cursor-b");
+    expect(await engine.migration.loadCheckpoint!(collection)).toBe("cursor-b");
+
+    await engine.migration.saveCheckpoint!(otherLock!, "cursor-other");
+    expect(await engine.migration.loadCheckpoint!(otherCollection)).toBe("cursor-other");
+
+    await engine.migration.clearCheckpoint!(collection);
+    expect(await engine.migration.loadCheckpoint!(collection)).toBeNull();
+    expect(await engine.migration.loadCheckpoint!(otherCollection)).toBe("cursor-other");
+  });
+
+  test("migration getStatus shape variants", async () => {
+    expect(await engine.migration.getStatus!(collection)).toBeNull();
+
+    const lock = await engine.migration.acquireLock(collection);
+    expect(lock).not.toBeNull();
+
+    const withoutCursor = await engine.migration.getStatus!(collection);
+    expect(withoutCursor?.lock.id).toBe(lock?.id);
+    expect(withoutCursor?.cursor).toBeNull();
+
+    await engine.migration.saveCheckpoint!(lock!, "cursor-a");
+    const withCursor = await engine.migration.getStatus!(collection);
+    expect(withCursor?.lock.id).toBe(lock?.id);
+    expect(withCursor?.cursor).toBe("cursor-a");
   });
 
   test("migration getOutdated returns stale and reindex-needed docs", async () => {
@@ -465,5 +577,36 @@ describe("dynamoDbEngine integration", () => {
     );
 
     await expectReject(engine.migration.getStatus!(collection), /invalid migration lock item/);
+  });
+
+  test("getStatus throws for invalid checkpoint item", async () => {
+    await documentClient.send(
+      new PutCommand({
+        TableName: tableName,
+        Item: {
+          pk: "META",
+          sk: `LOCK#${collection}`,
+          itemType: "lock",
+          lockId: "ok-lock",
+          acquiredAt: Date.now(),
+        },
+      }),
+    );
+    await documentClient.send(
+      new PutCommand({
+        TableName: tableName,
+        Item: {
+          pk: "META",
+          sk: `CHECKPOINT#${collection}`,
+          itemType: "checkpoint",
+          cursor: 123,
+        },
+      }),
+    );
+
+    await expectReject(
+      engine.migration.getStatus!(collection),
+      /invalid migration checkpoint item/,
+    );
   });
 });

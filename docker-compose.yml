@@ -16,3 +16,9 @@ services:
     profiles: ["redis"]
     ports:
       - "6379:6379"
+
+  mongodb:
+    image: mongo:latest
+    profiles: ["mongodb"]
+    ports:
+      - "27017:27017"
