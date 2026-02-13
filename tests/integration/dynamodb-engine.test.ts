@@ -13,40 +13,18 @@ import {
   EngineDocumentNotFoundError,
   type ComparableVersion,
 } from "../../src/engines/types";
+import { createCollectionNameFactory, createTestResourceName, expectReject } from "./helpers";
 
 const endpoint = process.env.DYNAMODB_ENDPOINT ?? "http://127.0.0.1:8000";
 const region = process.env.AWS_REGION ?? "us-east-1";
-const tableName =
-  process.env.DYNAMODB_TEST_TABLE ??
-  `nosql_odm_test_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
+const tableName = process.env.DYNAMODB_TEST_TABLE ?? createTestResourceName("nosql_odm_test");
 
 let baseClient: DynamoDBClient;
 let documentClient: DynamoDBDocumentClient;
 let engine: DynamoDbQueryEngine;
 let collection = "";
-let collectionCounter = 0;
 let createdTable = false;
-
-function nextCollection(prefix: string): string {
-  collectionCounter += 1;
-  return `${prefix}_${Date.now()}_${String(collectionCounter)}`;
-}
-
-async function expectReject(work: Promise<unknown>, pattern: RegExp | string): Promise<void> {
-  try {
-    await work;
-    throw new Error("expected operation to fail");
-  } catch (error) {
-    const message = String(error);
-
-    if (pattern instanceof RegExp) {
-      expect(message).toMatch(pattern);
-      return;
-    }
-
-    expect(message).toContain(pattern);
-  }
-}
+const nextCollection = createCollectionNameFactory();
 
 async function createTableForTests(): Promise<void> {
   try {

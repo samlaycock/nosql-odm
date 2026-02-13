@@ -14,6 +14,7 @@ import {
   EngineDocumentNotFoundError,
   type ComparableVersion,
 } from "../../src/engines/types";
+import { createCollectionNameFactory, createTestResourceName, expectReject } from "./helpers";
 
 const contactPoints = (process.env.CASSANDRA_CONTACT_POINTS ?? "127.0.0.1")
   .split(",")
@@ -23,9 +24,7 @@ const port = Number(process.env.CASSANDRA_PORT ?? "9042");
 const localDataCenter = process.env.CASSANDRA_LOCAL_DATACENTER ?? "datacenter1";
 const connectAttemptsRaw = Number(process.env.CASSANDRA_CONNECT_ATTEMPTS ?? "90");
 const connectDelayMsRaw = Number(process.env.CASSANDRA_CONNECT_DELAY_MS ?? "2000");
-const keyspace =
-  process.env.CASSANDRA_TEST_KEYSPACE ??
-  `nosql_odm_test_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
+const keyspace = process.env.CASSANDRA_TEST_KEYSPACE ?? createTestResourceName("nosql_odm_test");
 
 const documentsTable = `${keyspace}.nosql_odm_documents`;
 const metadataTable = `${keyspace}.nosql_odm_metadata`;
@@ -33,15 +32,10 @@ const metadataTable = `${keyspace}.nosql_odm_metadata`;
 let client: Client;
 let engine: CassandraQueryEngine;
 let collection = "";
-let collectionCounter = 0;
 let keyspaceCreated = false;
+const nextCollection = createCollectionNameFactory();
 
 setDefaultTimeout(120_000);
-
-function nextCollection(prefix: string): string {
-  collectionCounter += 1;
-  return `${prefix}_${Date.now()}_${String(collectionCounter)}`;
-}
 
 async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => {
@@ -77,22 +71,6 @@ async function connectWithRetry(instance: Client): Promise<void> {
 
       await sleep(delayMs);
     }
-  }
-}
-
-async function expectReject(work: Promise<unknown>, pattern: RegExp | string): Promise<void> {
-  try {
-    await work;
-    throw new Error("expected operation to fail");
-  } catch (error) {
-    const message = String(error);
-
-    if (pattern instanceof RegExp) {
-      expect(message).toMatch(pattern);
-      return;
-    }
-
-    expect(message).toContain(pattern);
   }
 }
 

@@ -6,10 +6,12 @@ import {
   EngineDocumentNotFoundError,
   type ComparableVersion,
 } from "../../src/engines/types";
+import { createTestResourceName, expectReject } from "./helpers";
 
 let engine: IndexedDbQueryEngine;
 let databaseNameCounter = 0;
 let currentDatabaseName = "";
+const databaseNameBase = createTestResourceName("nosql_odm_indexeddb_test");
 type IndexedDbFactory = NonNullable<NonNullable<Parameters<typeof indexedDbEngine>[0]>["factory"]>;
 type RawHandler = ((event: unknown) => void) | null;
 
@@ -48,7 +50,7 @@ const RAW_STORE_MIGRATION_CHECKPOINTS = "migration_checkpoints";
 
 function createEngine(): IndexedDbQueryEngine {
   databaseNameCounter += 1;
-  currentDatabaseName = `nosql-odm-indexeddb-test-${Date.now()}-${String(databaseNameCounter)}`;
+  currentDatabaseName = `${databaseNameBase}_${String(databaseNameCounter)}`;
 
   return indexedDbEngine({
     databaseName: currentDatabaseName,
@@ -94,22 +96,6 @@ async function putRawRecord(storeName: string, value: unknown): Promise<void> {
     });
   } finally {
     db.close();
-  }
-}
-
-async function expectReject(work: Promise<unknown>, pattern: RegExp | string): Promise<void> {
-  try {
-    await work;
-    throw new Error("expected operation to fail");
-  } catch (error) {
-    const message = String(error);
-
-    if (pattern instanceof RegExp) {
-      expect(message).toMatch(pattern);
-      return;
-    }
-
-    expect(message).toContain(pattern);
   }
 }
 
