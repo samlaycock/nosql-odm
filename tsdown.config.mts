@@ -12,6 +12,7 @@ export default defineConfig({
     "./src/engines/mongodb.ts",
     "./src/engines/firestore.ts",
     "./src/engines/mysql.ts",
+    "./src/engines/postgres.ts",
   ],
   format: ["cjs", "esm"],
   platform: "neutral",

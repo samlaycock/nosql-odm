@@ -67,6 +67,11 @@
       "types": "./dist/engines/mysql.d.ts",
       "import": "./dist/engines/mysql.mjs",
       "require": "./dist/engines/mysql.js"
+    },
+    "./engines/postgres": {
+      "types": "./dist/engines/postgres.d.ts",
+      "import": "./dist/engines/postgres.mjs",
+      "require": "./dist/engines/postgres.js"
     }
   },
   "scripts": {
@@ -80,6 +85,7 @@
     "test:integration:mongodb": "bun test ./tests/integration/mongodb-engine.test.ts",
     "test:integration:firestore": "bun test ./tests/integration/firestore-engine.test.ts",
     "test:integration:mysql": "bun test ./tests/integration/mysql-engine.test.ts",
+    "test:integration:postgres": "bun test ./tests/integration/postgres-engine.test.ts",
     "services:up:dynamodb": "docker compose up -d dynamodb",
     "services:down:dynamodb": "docker compose rm -sf dynamodb",
     "services:up:cassandra": "docker compose up -d cassandra",
@@ -92,6 +98,8 @@
     "services:down:firestore": "docker compose rm -sf firestore",
     "services:up:mysql": "docker compose up -d mysql",
     "services:down:mysql": "docker compose rm -sf mysql",
+    "services:up:postgres": "docker compose up -d postgres",
+    "services:down:postgres": "docker compose rm -sf postgres",
     "lint": "oxlint . --type-aware",
     "lint:fix": "oxlint . --type-aware --fix",
     "fmt": "oxfmt .",
@@ -110,6 +118,7 @@
     "@google-cloud/firestore": "8.3.0",
     "@types/better-sqlite3": "7.6.13",
     "@types/bun": "latest",
+    "@types/pg": "8.15.6",
     "better-sqlite3": "12.6.2",
     "cassandra-driver": "4.8.0",
     "fake-indexeddb": "6.2.5",
@@ -118,6 +127,7 @@
     "oxfmt": "0.28.0",
     "oxlint": "1.43.0",
     "oxlint-tsgolint": "0.11.5",
+    "pg": "8.16.3",
     "redis": "5.10.0",
     "tsdown": "0.20.3",
     "zod": "4.3.6"
@@ -129,6 +139,7 @@
     "cassandra-driver": "^4.8.0",
     "mongodb": "^7.1.0",
     "mysql2": "^3.15.3",
+    "pg": "^8.16.3",
     "redis": "^5.10.0",
     "typescript": "^5"
   }

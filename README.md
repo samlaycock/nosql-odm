@@ -137,6 +137,38 @@ The SQLite engine requires an explicit database instance (`{ database }`), runs 
 
 Note: this adapter is typed against the `better-sqlite3` `Database` API. If you pass another compatible SQLite database object (for example via a cast), that path is currently untyped/untested.
 
+## Postgres Engine (`pg`)
+
+```ts
+import { Pool } from "pg";
+import { postgresEngine } from "nosql-odm/engines/postgres";
+
+const pool = new Pool({
+  host: "127.0.0.1",
+  port: 5432,
+  user: "postgres",
+  password: "postgres",
+  database: "app",
+});
+
+const engine = postgresEngine({
+  client: pool,
+  schema: "public",
+});
+
+const store = createStore(engine, [User]);
+```
+
+The Postgres adapter creates internal tables on first use:
+
+- `<schema>.nosql_odm_documents`
+- `<schema>.nosql_odm_index_entries`
+- `<schema>.nosql_odm_migration_locks`
+- `<schema>.nosql_odm_migration_checkpoints`
+
+You can override table names with:
+`documentsTable`, `indexesTable`, `migrationLocksTable`, and `migrationCheckpointsTable`.
+
 ## IndexedDB Engine (Browser / Worker)
 
 ```ts
@@ -414,6 +446,10 @@ Start MySQL:
 
 ```bash
 bun run services:up:mysql
+Start Postgres:
+
+```bash
+bun run services:up:postgres
 ```
 
 Stop it:
@@ -426,6 +462,13 @@ The MySQL engine integration suite uses this service directly:
 
 ```bash
 bun run test:integration:mysql
+bun run services:down:postgres
+```
+
+The Postgres engine integration suite uses this service directly:
+
+```bash
+bun run test:integration:postgres
 ```
 
 Test runner modes:
@@ -439,6 +482,7 @@ bun run test:integration:redis               # only Redis integration
 bun run test:integration:mongodb             # only MongoDB integration
 bun run test:integration:firestore           # only Firestore integration
 bun run test:integration:mysql               # only MySQL integration
+bun run test:integration:postgres            # only Postgres integration
 ```
 
 The DynamoDB integration suite creates and deletes its own test table automatically.
