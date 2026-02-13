@@ -28,6 +28,7 @@
         "@aws-sdk/lib-dynamodb": "^3.989.0",
         "better-sqlite3": "^12",
         "cassandra-driver": "^4.8.0",
+        "mongodb": "^7.1.0",
         "redis": "^5.10.0",
         "typescript": "^5",
       },
