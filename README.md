@@ -10,7 +10,7 @@ A lightweight, schema-first ODM for NoSQL-style data stores.
 - Ignore-first migration behavior for non-migratable documents
 - Dynamic index names (multi-tenant style index partitions)
 - Explicit bulk operations (`batchGet`, `batchSet`, `batchDelete`)
-- Pluggable query engine interface (memory, SQLite, IndexedDB, DynamoDB, and Cassandra adapters included)
+- Pluggable query engine interface (memory, SQLite, IndexedDB, DynamoDB, Cassandra, and Redis adapters included)
 
 ## Package Intent
 
@@ -43,6 +43,12 @@ For Cassandra support:
 
 ```bash
 npm install cassandra-driver
+```
+
+For Redis support:
+
+```bash
+npm install redis
 ```
 
 ## Quick Start
@@ -192,6 +198,30 @@ The Cassandra adapter creates its internal tables on first use:
 
 You can override table names with `documentsTable` / `metadataTable`.
 
+## Redis Engine (`redis`)
+
+```ts
+import { createClient } from "redis";
+import { redisEngine } from "nosql-odm/engines/redis";
+
+const client = createClient({
+  url: "redis://127.0.0.1:6379",
+});
+
+await client.connect();
+
+const engine = redisEngine({
+  client,
+  keyPrefix: "nosql_odm",
+});
+
+const store = createStore(engine, [User]);
+```
+
+The Redis adapter stores document/index state in per-document hashes and keeps
+collection ordering in Redis sorted sets. Migration lock/checkpoint state is
+stored under dedicated metadata keys in the same prefix namespace.
+
 ## Local Engine Services (Docker Compose)
 
 For engine test suites with runtime dependencies, this repo uses named Docker Compose services.
@@ -233,6 +263,24 @@ The Cassandra engine integration suite uses this service directly:
 bun run test:integration:cassandra
 ```
 
+Start Redis:
+
+```bash
+bun run services:up:redis
+```
+
+Stop it:
+
+```bash
+bun run services:down:redis
+```
+
+The Redis engine integration suite uses this service directly:
+
+```bash
+bun run test:integration:redis
+```
+
 Test runner modes:
 
 ```bash
@@ -240,6 +288,7 @@ bun run test                                 # unit tests only (./tests/unit/*.t
 bun run test:integration                     # all integration suites
 bun run test:integration:dynamodb            # only DynamoDB integration
 bun run test:integration:cassandra           # only Cassandra integration
+bun run test:integration:redis               # only Redis integration
 ```
 
 The DynamoDB integration suite creates and deletes its own test table automatically.

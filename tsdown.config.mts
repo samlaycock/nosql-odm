@@ -8,6 +8,7 @@ export default defineConfig({
     "./src/engines/indexeddb.ts",
     "./src/engines/dynamodb.ts",
     "./src/engines/cassandra.ts",
+    "./src/engines/redis.ts",
   ],
   format: ["cjs", "esm"],
   platform: "neutral",

@@ -47,6 +47,11 @@
       "types": "./dist/engines/cassandra.d.ts",
       "import": "./dist/engines/cassandra.mjs",
       "require": "./dist/engines/cassandra.js"
+    },
+    "./engines/redis": {
+      "types": "./dist/engines/redis.d.ts",
+      "import": "./dist/engines/redis.mjs",
+      "require": "./dist/engines/redis.js"
     }
   },
   "scripts": {
@@ -56,6 +61,7 @@
     "test:integration:indexeddb": "bun test ./tests/integration/indexeddb-engine.test.ts",
     "test:integration:dynamodb": "bun test ./tests/integration/dynamodb-engine.test.ts",
     "test:integration:cassandra": "bun test ./tests/integration/cassandra-engine.test.ts",
+    "test:integration:redis": "bun test ./tests/integration/redis-engine.test.ts",
     "lint": "oxlint . --type-aware",
     "lint:fix": "oxlint . --type-aware --fix",
     "fmt": "oxfmt .",
@@ -79,6 +85,7 @@
     "oxfmt": "0.28.0",
     "oxlint": "1.43.0",
     "oxlint-tsgolint": "0.11.5",
+    "redis": "5.10.0",
     "tsdown": "0.20.3",
     "zod": "4.3.6"
   },
@@ -86,6 +93,7 @@
     "@aws-sdk/lib-dynamodb": "^3.989.0",
     "better-sqlite3": "^12",
     "cassandra-driver": "^4.8.0",
+    "redis": "^5.10.0",
     "typescript": "^5"
   }
 }

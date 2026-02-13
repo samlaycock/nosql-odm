@@ -10,3 +10,9 @@ services:
     profiles: ["cassandra"]
     ports:
       - "9042:9042"
+
+  redis:
+    image: redis:alpine
+    profiles: ["redis"]
+    ports:
+      - "6379:6379"
