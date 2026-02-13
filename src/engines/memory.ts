@@ -126,10 +126,15 @@ export function memoryEngine(options?: MemoryEngineOptions): MemoryQueryEngine {
         const existing = locks.get(collection);
 
         if (existing) {
-          // If TTL is provided and the existing lock is stale, replace it.
-          if (options?.ttl !== undefined && Date.now() - existing.acquiredAt >= options.ttl) {
-            // Stale lock — fall through to create a new one
-          } else {
+          // If TTL is provided and valid and the existing lock is stale, replace it.
+          const ttl = options?.ttl;
+          const canSteal =
+            ttl !== undefined &&
+            Number.isFinite(ttl) &&
+            ttl >= 0 &&
+            Date.now() - existing.acquiredAt >= ttl;
+
+          if (!canSteal) {
             return null;
           }
         }
@@ -463,7 +468,9 @@ function paginate(results: KeyedStoredDocument[], params: QueryParams): EngineQu
     }
   }
 
-  const limit = params.limit ?? results.length;
+  const normalizedLimit = normalizeLimit(params.limit);
+  const limit = normalizedLimit ?? results.length;
+  const hasLimit = normalizedLimit !== null;
 
   if (limit <= 0) {
     return {
@@ -474,7 +481,9 @@ function paginate(results: KeyedStoredDocument[], params: QueryParams): EngineQu
 
   const page = results.slice(startIndex, startIndex + limit);
   const cursor =
-    page.length > 0 && startIndex + limit < results.length ? page[page.length - 1]!.key : null;
+    page.length > 0 && hasLimit && startIndex + limit < results.length
+      ? page[page.length - 1]!.key
+      : null;
 
   return {
     documents: page.map(({ key, stored }) => ({
@@ -483,4 +492,16 @@ function paginate(results: KeyedStoredDocument[], params: QueryParams): EngineQu
     })),
     cursor,
   };
+}
+
+function normalizeLimit(limit: number | undefined): number | null {
+  if (limit === undefined || !Number.isFinite(limit)) {
+    return null;
+  }
+
+  if (limit <= 0) {
+    return 0;
+  }
+
+  return Math.floor(limit);
 }

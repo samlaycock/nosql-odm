@@ -959,6 +959,45 @@ describe("JSON compatibility on engine writes", () => {
       /circular references are not allowed/,
     );
   });
+
+  test("create rejects unsupported nested value types", async () => {
+    const store = createStore(engine, [buildBlobV1()]);
+
+    class CustomPayload {}
+
+    const cases: Array<{ payload: unknown; pattern: RegExp }> = [
+      { payload: { v: Symbol("x") }, pattern: /symbol is not allowed/ },
+      { payload: { v: () => "x" }, pattern: /function is not allowed/ },
+      { payload: { v: new Date() }, pattern: /unsupported object type "Date"/ },
+      { payload: { v: new Map([["a", 1]]) }, pattern: /unsupported object type "Map"/ },
+      { payload: { v: new Set([1, 2]) }, pattern: /unsupported object type "Set"/ },
+      { payload: { v: new CustomPayload() }, pattern: /unsupported object type "CustomPayload"/ },
+    ];
+
+    for (let i = 0; i < cases.length; i++) {
+      await expectReject(
+        store.blob.create(`type-${String(i)}`, {
+          id: `type-${String(i)}`,
+          payload: cases[i]!.payload,
+        }),
+        cases[i]!.pattern,
+      );
+    }
+  });
+
+  test("error includes the precise nested JSON path", async () => {
+    const store = createStore(engine, [buildBlobV1()]);
+
+    await expectReject(
+      store.blob.create("path-test", {
+        id: "path-test",
+        payload: {
+          deep: [{ ok: true }, { bad: BigInt(1) }],
+        },
+      }),
+      /\$\.payload\.deep\[1\]\.bad/,
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------

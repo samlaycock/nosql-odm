@@ -929,6 +929,17 @@ describe("migration locking", () => {
     expect(second).toBeNull();
   });
 
+  test("invalid ttl values do not steal an existing lock", async () => {
+    const first = await engine.migration.acquireLock("users");
+    expect(first).not.toBeNull();
+
+    expect(await engine.migration.acquireLock("users", { ttl: Number.NaN })).toBeNull();
+    expect(await engine.migration.acquireLock("users", { ttl: -1 })).toBeNull();
+    expect(
+      await engine.migration.acquireLock("users", { ttl: Number.POSITIVE_INFINITY }),
+    ).toBeNull();
+  });
+
   test("different collections can be locked independently", async () => {
     const lock1 = await engine.migration.acquireLock("users");
     const lock2 = await engine.migration.acquireLock("posts");
@@ -1604,6 +1615,35 @@ describe("query() pagination edge cases", () => {
 
     expect(page2.documents).toHaveLength(0);
     expect(page2.cursor).toBeNull();
+  });
+
+  test("non-finite limits are treated as no limit", async () => {
+    const nanLimit = await engine.query("items", {
+      index: "all",
+      filter: { value: "yes" },
+      limit: Number.NaN,
+    });
+    const infinityLimit = await engine.query("items", {
+      index: "all",
+      filter: { value: "yes" },
+      limit: Number.POSITIVE_INFINITY,
+    });
+
+    expect(nanLimit.documents).toHaveLength(5);
+    expect(nanLimit.cursor).toBeNull();
+    expect(infinityLimit.documents).toHaveLength(5);
+    expect(infinityLimit.cursor).toBeNull();
+  });
+
+  test("fractional limits are floored", async () => {
+    const page = await engine.query("items", {
+      index: "all",
+      filter: { value: "yes" },
+      limit: 2.9,
+    });
+
+    expect(page.documents).toHaveLength(2);
+    expect(page.cursor).not.toBeNull();
   });
 
   test("cursor of last item returns empty page", async () => {

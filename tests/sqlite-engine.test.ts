@@ -235,6 +235,15 @@ describe("sqlite runtime behavior", () => {
       expect(String(error)).toMatch(/invalid JSON/);
     }
   });
+
+  test("throws when putting a non-serializable top-level value", async () => {
+    try {
+      await engine.put("users", "bad", undefined as unknown, {});
+      throw new Error("expected put() to throw for non-serializable value");
+    } catch (error) {
+      expect(String(error)).toMatch(/cannot be serialized to JSON/);
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1154,6 +1163,39 @@ describe("migration locking", () => {
     expect(second).toBeNull();
   });
 
+  test("invalid ttl values do not steal an existing lock", async () => {
+    const first = await engine.migration.acquireLock("users");
+    expect(first).not.toBeNull();
+
+    expect(await engine.migration.acquireLock("users", { ttl: Number.NaN })).toBeNull();
+    expect(await engine.migration.acquireLock("users", { ttl: -1 })).toBeNull();
+    expect(
+      await engine.migration.acquireLock("users", { ttl: Number.POSITIVE_INFINITY }),
+    ).toBeNull();
+  });
+
+  test("falls back to non-crypto lock ids when crypto.randomUUID is unavailable", async () => {
+    const originalCrypto = Object.getOwnPropertyDescriptor(globalThis, "crypto");
+
+    Object.defineProperty(globalThis, "crypto", {
+      value: {},
+      configurable: true,
+      writable: true,
+    });
+
+    try {
+      const lock = await engine.migration.acquireLock("users");
+      expect(lock).not.toBeNull();
+      expect(lock!.id).toMatch(/^[0-9a-f]+-[0-9a-f]+$/);
+    } finally {
+      if (originalCrypto) {
+        Object.defineProperty(globalThis, "crypto", originalCrypto);
+      } else {
+        delete (globalThis as { crypto?: unknown }).crypto;
+      }
+    }
+  });
+
   test("different collections can be locked independently", async () => {
     const lock1 = await engine.migration.acquireLock("users");
     const lock2 = await engine.migration.acquireLock("posts");
@@ -1456,6 +1498,49 @@ describe("migration getOutdated()", () => {
 
     expect(page2.documents).toHaveLength(50);
     expect(page2.cursor).toBeNull();
+  });
+
+  test("returns null cursor when exactly 100 outdated docs exist and no additional rows remain", async () => {
+    for (let i = 0; i < 100; i++) {
+      const id = `u${String(i).padStart(4, "0")}`;
+      await engine.put("users", id, { __v: 1, id }, {});
+    }
+
+    const page = await engine.migration.getOutdated("users", criteria);
+
+    expect(page.documents).toHaveLength(100);
+    expect(page.cursor).toBeNull();
+  });
+
+  test("throws when malformed JSON is encountered during the first outdated scan", async () => {
+    sqlite.db
+      .prepare(`INSERT INTO documents (collection, doc_key, doc_json) VALUES (?, ?, ?)`)
+      .run("users", "broken-first", "{");
+
+    try {
+      await engine.migration.getOutdated("users", criteria);
+      throw new Error("expected getOutdated() to throw for malformed JSON");
+    } catch (error) {
+      expect(String(error)).toMatch(/invalid JSON|JSON/);
+    }
+  });
+
+  test("throws when malformed JSON is encountered during lookahead scan", async () => {
+    for (let i = 0; i < 100; i++) {
+      const id = `u${String(i).padStart(4, "0")}`;
+      await engine.put("users", id, { __v: 1, id }, {});
+    }
+
+    sqlite.db
+      .prepare(`INSERT INTO documents (collection, doc_key, doc_json) VALUES (?, ?, ?)`)
+      .run("users", "broken-lookahead", "{");
+
+    try {
+      await engine.migration.getOutdated("users", criteria);
+      throw new Error("expected getOutdated() to throw for malformed lookahead JSON");
+    } catch (error) {
+      expect(String(error)).toMatch(/JSON|parse|Unexpected|invalid/i);
+    }
   });
 
   test("returns mix of stale-version and wrong-indexes documents", async () => {
@@ -1829,6 +1914,35 @@ describe("query() pagination edge cases", () => {
 
     expect(page2.documents).toHaveLength(0);
     expect(page2.cursor).toBeNull();
+  });
+
+  test("non-finite limits are treated as no limit", async () => {
+    const nanLimit = await engine.query("items", {
+      index: "all",
+      filter: { value: "yes" },
+      limit: Number.NaN,
+    });
+    const infinityLimit = await engine.query("items", {
+      index: "all",
+      filter: { value: "yes" },
+      limit: Number.POSITIVE_INFINITY,
+    });
+
+    expect(nanLimit.documents).toHaveLength(5);
+    expect(nanLimit.cursor).toBeNull();
+    expect(infinityLimit.documents).toHaveLength(5);
+    expect(infinityLimit.cursor).toBeNull();
+  });
+
+  test("fractional limits are floored", async () => {
+    const page = await engine.query("items", {
+      index: "all",
+      filter: { value: "yes" },
+      limit: 2.9,
+    });
+
+    expect(page.documents).toHaveLength(2);
+    expect(page.cursor).not.toBeNull();
   });
 
   test("cursor of last item returns empty page", async () => {

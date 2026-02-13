@@ -194,9 +194,9 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
       const existing = selectLockStmt.get(collection);
 
       if (existing) {
-        const ttl = options?.ttl;
+        const ttl = normalizeTtl(options?.ttl);
 
-        if (ttl === undefined || now - existing.acquired_at < ttl) {
+        if (ttl === null || now - existing.acquired_at < ttl) {
           return null;
         }
 
@@ -585,7 +585,7 @@ function resolveCursorId(
 }
 
 function normalizeLimit(limit: number | undefined): number | null {
-  if (limit === undefined) {
+  if (limit === undefined || !Number.isFinite(limit)) {
     return null;
   }
 
@@ -594,6 +594,14 @@ function normalizeLimit(limit: number | undefined): number | null {
   }
 
   return Math.floor(limit);
+}
+
+function normalizeTtl(ttl: number | undefined): number | null {
+  if (ttl === undefined || !Number.isFinite(ttl) || ttl < 0) {
+    return null;
+  }
+
+  return ttl;
 }
 
 interface SqlFilter {
