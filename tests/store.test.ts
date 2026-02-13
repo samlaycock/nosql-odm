@@ -24,7 +24,7 @@ function buildUserV1() {
       z.object({
         id: z.string(),
         name: z.string(),
-        email: z.string().email(),
+        email: z.email(),
       }),
     )
     .index({ name: "primary", value: "id" })
@@ -39,7 +39,7 @@ function buildUserV2() {
       z.object({
         id: z.string(),
         name: z.string(),
-        email: z.string().email(),
+        email: z.email(),
       }),
     )
     .schema(
@@ -48,7 +48,7 @@ function buildUserV2() {
         id: z.string(),
         firstName: z.string(),
         lastName: z.string(),
-        email: z.string().email(),
+        email: z.email(),
       }),
       {
         migrate(old) {
@@ -74,7 +74,7 @@ function buildUserV3() {
       z.object({
         id: z.string(),
         name: z.string(),
-        email: z.string().email(),
+        email: z.email(),
       }),
     )
     .schema(
@@ -83,7 +83,7 @@ function buildUserV3() {
         id: z.string(),
         firstName: z.string(),
         lastName: z.string(),
-        email: z.string().email(),
+        email: z.email(),
       }),
       {
         migrate(old) {
@@ -103,7 +103,7 @@ function buildUserV3() {
         id: z.string(),
         firstName: z.string(),
         lastName: z.string(),
-        email: z.string().email(),
+        email: z.email(),
         role: z.enum(["admin", "member", "guest"]),
       }),
       {
@@ -337,7 +337,11 @@ describe("store.create()", () => {
     const store = createStore(duplicateEngine, [buildUserV1()]);
 
     try {
-      await store.user.create("u1", { id: "u1", name: "Sam", email: "sam@example.com" });
+      await store.user.create("u1", {
+        id: "u1",
+        name: "Sam",
+        email: "sam@example.com",
+      });
       throw new Error("expected create to fail with duplicate error");
     } catch (error) {
       expect(error).toBeInstanceOf(DocumentAlreadyExistsError);
@@ -377,7 +381,11 @@ describe("store.create()", () => {
     const store = createStore(failingEngine, [buildUserV1()]);
 
     try {
-      await store.user.create("u1", { id: "u1", name: "Sam", email: "sam@example.com" });
+      await store.user.create("u1", {
+        id: "u1",
+        name: "Sam",
+        email: "sam@example.com",
+      });
       throw new Error("expected create to fail");
     } catch (error) {
       expect(String(error)).toContain("write timeout");
@@ -1284,9 +1292,18 @@ describe("JSON compatibility on engine writes", () => {
       { payload: { v: Symbol("x") }, pattern: /symbol is not allowed/ },
       { payload: { v: () => "x" }, pattern: /function is not allowed/ },
       { payload: { v: new Date() }, pattern: /unsupported object type "Date"/ },
-      { payload: { v: new Map([["a", 1]]) }, pattern: /unsupported object type "Map"/ },
-      { payload: { v: new Set([1, 2]) }, pattern: /unsupported object type "Set"/ },
-      { payload: { v: new CustomPayload() }, pattern: /unsupported object type "CustomPayload"/ },
+      {
+        payload: { v: new Map([["a", 1]]) },
+        pattern: /unsupported object type "Map"/,
+      },
+      {
+        payload: { v: new Set([1, 2]) },
+        pattern: /unsupported object type "Set"/,
+      },
+      {
+        payload: { v: new CustomPayload() },
+        pattern: /unsupported object type "CustomPayload"/,
+      },
     ];
 
     for (let i = 0; i < cases.length; i++) {
@@ -1447,7 +1464,12 @@ describe("lazy migration on findByKey", () => {
     const calls: { collection: string; items: unknown[] }[] = [];
     const trackingEngine: QueryEngine<never> = {
       async get() {
-        return { __v: 1, id: "u1", name: "Sam Laycock", email: "sam@example.com" };
+        return {
+          __v: 1,
+          id: "u1",
+          name: "Sam Laycock",
+          email: "sam@example.com",
+        };
       },
       async create() {},
       async put() {},
@@ -1679,7 +1701,12 @@ describe("lazy migration on query", () => {
           documents: [
             {
               key: "u1",
-              doc: { __v: 1, id: "u1", name: "Sam Laycock", email: "sam@example.com" },
+              doc: {
+                __v: 1,
+                id: "u1",
+                name: "Sam Laycock",
+                email: "sam@example.com",
+              },
             },
           ],
           cursor: null,
@@ -1775,7 +1802,12 @@ describe("lazy migration on batchGet", () => {
         return [
           {
             key: "u1",
-            doc: { __v: 1, id: "u1", name: "Sam Laycock", email: "sam@example.com" },
+            doc: {
+              __v: 1,
+              id: "u1",
+              name: "Sam Laycock",
+              email: "sam@example.com",
+            },
           },
         ];
       },
@@ -1845,7 +1877,7 @@ describe("readonly migration mode", () => {
         z.object({
           id: z.string(),
           name: z.string(),
-          email: z.string().email(),
+          email: z.email(),
         }),
       )
       .schema(
@@ -1854,7 +1886,7 @@ describe("readonly migration mode", () => {
           id: z.string(),
           firstName: z.string(),
           lastName: z.string(),
-          email: z.string().email(),
+          email: z.email(),
         }),
         {
           migrate(old) {
@@ -1908,7 +1940,7 @@ describe("eager migration mode", () => {
         z.object({
           id: z.string(),
           name: z.string(),
-          email: z.string().email(),
+          email: z.email(),
         }),
       )
       .schema(
@@ -1917,7 +1949,7 @@ describe("eager migration mode", () => {
           id: z.string(),
           firstName: z.string(),
           lastName: z.string(),
-          email: z.string().email(),
+          email: z.email(),
         }),
         {
           migrate(old) {
@@ -1965,7 +1997,7 @@ describe("eager migration mode", () => {
         z.object({
           id: z.string(),
           name: z.string(),
-          email: z.string().email(),
+          email: z.email(),
         }),
       )
       .schema(
@@ -1974,7 +2006,7 @@ describe("eager migration mode", () => {
           id: z.string(),
           firstName: z.string(),
           lastName: z.string(),
-          email: z.string().email(),
+          email: z.email(),
         }),
         {
           migrate(old) {
@@ -2081,7 +2113,12 @@ describe("store.model.migrateAll()", () => {
             documents: [
               {
                 key: "u1",
-                doc: { __v: 1, id: "u1", name: "Sam Laycock", email: "sam@example.com" },
+                doc: {
+                  __v: 1,
+                  id: "u1",
+                  name: "Sam Laycock",
+                  email: "sam@example.com",
+                },
               },
             ],
             cursor: null,
@@ -2676,7 +2713,7 @@ describe("readonly migration mode — all read paths", () => {
         z.object({
           id: z.string(),
           name: z.string(),
-          email: z.string().email(),
+          email: z.email(),
         }),
       )
       .schema(
@@ -2685,7 +2722,7 @@ describe("readonly migration mode — all read paths", () => {
           id: z.string(),
           firstName: z.string(),
           lastName: z.string(),
-          email: z.string().email(),
+          email: z.email(),
         }),
         {
           migrate(old) {
@@ -2823,7 +2860,10 @@ describe("lazy migration error handling", () => {
 
     const store = createStore(engine, [buildBrokenMigrationModel()]);
 
-    const result = await store.broken.query({ index: "all", filter: { value: "yes" } });
+    const result = await store.broken.query({
+      index: "all",
+      filter: { value: "yes" },
+    });
     expect(result.documents).toEqual([]);
   });
 
@@ -3523,8 +3563,12 @@ describe("engine options passthrough", () => {
     await store.user.findByKey("u1", { trace: "lazy-writeback-trace" });
 
     expect(calls).toHaveLength(2);
-    expect((calls[0] as any).options).toEqual({ trace: "lazy-writeback-trace" });
-    expect((calls[1] as any).options).toEqual({ trace: "lazy-writeback-trace" });
+    expect((calls[0] as any).options).toEqual({
+      trace: "lazy-writeback-trace",
+    });
+    expect((calls[1] as any).options).toEqual({
+      trace: "lazy-writeback-trace",
+    });
     expect((calls[1] as any).items).toBe(1);
   });
 
@@ -3823,8 +3867,14 @@ describe("dynamic index names", () => {
     const store = createStore(engine, [buildTenantResource()]);
 
     await store.resource.batchSet([
-      { key: "r1", data: { id: "r1", tenant: "acme", userId: "u1", data: "a" } },
-      { key: "r2", data: { id: "r2", tenant: "globex", userId: "u2", data: "b" } },
+      {
+        key: "r1",
+        data: { id: "r1", tenant: "acme", userId: "u1", data: "a" },
+      },
+      {
+        key: "r2",
+        data: { id: "r2", tenant: "globex", userId: "u2", data: "b" },
+      },
     ]);
 
     const acmeResults = await engine.query("resource", {
@@ -3952,8 +4002,18 @@ describe("dynamic index names", () => {
     const store = createStore(engine, [buildTenantResource()]);
 
     // Create documents through the store so indexes are properly set
-    await store.resource.create("r1", { id: "r1", tenant: "acme", userId: "u1", data: "a" });
-    await store.resource.create("r2", { id: "r2", tenant: "globex", userId: "u2", data: "b" });
+    await store.resource.create("r1", {
+      id: "r1",
+      tenant: "acme",
+      userId: "u1",
+      data: "a",
+    });
+    await store.resource.create("r2", {
+      id: "r2",
+      tenant: "globex",
+      userId: "u2",
+      data: "b",
+    });
 
     const results = await store.resource.batchGet(["r1", "r2"]);
 
@@ -3975,7 +4035,12 @@ describe("dynamic index names", () => {
     const resourceV2 = model("resource")
       .schema(
         1,
-        z.object({ id: z.string(), tenant: z.string(), userId: z.string(), data: z.string() }),
+        z.object({
+          id: z.string(),
+          tenant: z.string(),
+          userId: z.string(),
+          data: z.string(),
+        }),
       )
       .schema(
         2,
@@ -4012,9 +4077,24 @@ describe("dynamic index names", () => {
   test("query with filter operators on dynamic index", async () => {
     const store = createStore(engine, [buildTenantResource()]);
 
-    await store.resource.create("r1", { id: "r1", tenant: "acme", userId: "u1", data: "a" });
-    await store.resource.create("r2", { id: "r2", tenant: "acme", userId: "u2", data: "b" });
-    await store.resource.create("r3", { id: "r3", tenant: "acme", userId: "u3", data: "c" });
+    await store.resource.create("r1", {
+      id: "r1",
+      tenant: "acme",
+      userId: "u1",
+      data: "a",
+    });
+    await store.resource.create("r2", {
+      id: "r2",
+      tenant: "acme",
+      userId: "u2",
+      data: "b",
+    });
+    await store.resource.create("r3", {
+      id: "r3",
+      tenant: "acme",
+      userId: "u3",
+      data: "c",
+    });
 
     // $begins on the dynamic index value
     const results = await store.resource.query({
@@ -4092,8 +4172,16 @@ describe("dynamic index names", () => {
 
     const store = createStore(engine, [dynamicOnly]);
 
-    await store.resource.create("r1", { id: "r1", tenant: "acme", type: "user" });
-    await store.resource.create("r2", { id: "r2", tenant: "acme", type: "order" });
+    await store.resource.create("r1", {
+      id: "r1",
+      tenant: "acme",
+      type: "user",
+    });
+    await store.resource.create("r2", {
+      id: "r2",
+      tenant: "acme",
+      type: "order",
+    });
 
     const userResults = await store.resource.query({
       index: "acme#user",
@@ -4231,8 +4319,18 @@ describe("dynamic index names", () => {
   test("scan query returns all docs regardless of dynamic indexes", async () => {
     const store = createStore(engine, [buildTenantResource()]);
 
-    await store.resource.create("r1", { id: "r1", tenant: "acme", userId: "u1", data: "a" });
-    await store.resource.create("r2", { id: "r2", tenant: "globex", userId: "u2", data: "b" });
+    await store.resource.create("r1", {
+      id: "r1",
+      tenant: "acme",
+      userId: "u1",
+      data: "a",
+    });
+    await store.resource.create("r2", {
+      id: "r2",
+      tenant: "globex",
+      userId: "u2",
+      data: "b",
+    });
 
     // Scan (no index/filter) returns all docs
     const results = await store.resource.query({});
@@ -4300,8 +4398,18 @@ describe("dynamic index names", () => {
   test("where query works for static field indexes alongside dynamic indexes", async () => {
     const store = createStore(engine, [buildTenantResource()]);
 
-    await store.resource.create("r1", { id: "r1", tenant: "acme", userId: "u1", data: "a" });
-    await store.resource.create("r2", { id: "r2", tenant: "globex", userId: "u2", data: "b" });
+    await store.resource.create("r1", {
+      id: "r1",
+      tenant: "acme",
+      userId: "u1",
+      data: "a",
+    });
+    await store.resource.create("r2", {
+      id: "r2",
+      tenant: "globex",
+      userId: "u2",
+      data: "b",
+    });
 
     // `where` on the static "id" field should still work
     const results = await store.resource.query({ where: { id: "r1" } });
@@ -4312,7 +4420,12 @@ describe("dynamic index names", () => {
   test("delete removes doc including dynamic index entries", async () => {
     const store = createStore(engine, [buildTenantResource()]);
 
-    await store.resource.create("r1", { id: "r1", tenant: "acme", userId: "u1", data: "hello" });
+    await store.resource.create("r1", {
+      id: "r1",
+      tenant: "acme",
+      userId: "u1",
+      data: "hello",
+    });
 
     // Verify it's queryable
     const before = await engine.query("resource", {
@@ -4334,8 +4447,18 @@ describe("dynamic index names", () => {
   test("batchDelete removes docs with dynamic indexes", async () => {
     const store = createStore(engine, [buildTenantResource()]);
 
-    await store.resource.create("r1", { id: "r1", tenant: "acme", userId: "u1", data: "a" });
-    await store.resource.create("r2", { id: "r2", tenant: "acme", userId: "u2", data: "b" });
+    await store.resource.create("r1", {
+      id: "r1",
+      tenant: "acme",
+      userId: "u1",
+      data: "a",
+    });
+    await store.resource.create("r2", {
+      id: "r2",
+      tenant: "acme",
+      userId: "u2",
+      data: "b",
+    });
 
     await store.resource.batchDelete(["r1", "r2"]);
 

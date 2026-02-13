@@ -15,7 +15,7 @@ function buildUserV2() {
       z.object({
         id: z.string(),
         name: z.string(),
-        email: z.string().email(),
+        email: z.email(),
       }),
     )
     .schema(
@@ -24,7 +24,7 @@ function buildUserV2() {
         id: z.string(),
         firstName: z.string(),
         lastName: z.string(),
-        email: z.string().email(),
+        email: z.email(),
       }),
       {
         migrate(old) {
@@ -542,7 +542,7 @@ describe("migration crash recovery — multi-version chain", () => {
         z.object({
           id: z.string(),
           name: z.string(),
-          email: z.string().email(),
+          email: z.email(),
         }),
       )
       .schema(
@@ -551,7 +551,7 @@ describe("migration crash recovery — multi-version chain", () => {
           id: z.string(),
           firstName: z.string(),
           lastName: z.string(),
-          email: z.string().email(),
+          email: z.email(),
         }),
         {
           migrate(old) {
@@ -571,7 +571,7 @@ describe("migration crash recovery — multi-version chain", () => {
           id: z.string(),
           firstName: z.string(),
           lastName: z.string(),
-          email: z.string().email(),
+          email: z.email(),
           role: z.enum(["admin", "member", "guest"]),
         }),
         {
@@ -811,7 +811,9 @@ describe("lock TTL — stale lock recovery", () => {
     // TTL of 1ms — but lock was JUST acquired so it's not stale yet
     // We need to actually make it stale. Manually poke the engine's internal state.
     // Instead, just verify that a non-stale lock is NOT stolen.
-    const notStolen = await engine.migration.acquireLock("user", { ttl: 60_000 });
+    const notStolen = await engine.migration.acquireLock("user", {
+      ttl: 60_000,
+    });
     expect(notStolen).toBeNull();
 
     // With a very short TTL (0ms), any existing lock is stale

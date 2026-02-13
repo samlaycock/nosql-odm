@@ -12,6 +12,15 @@ A lightweight, schema-first ODM for NoSQL-style data stores.
 - Explicit bulk operations (`batchGet`, `batchSet`, `batchDelete`)
 - Pluggable query engine interface (memory and SQLite adapters included)
 
+## Package Intent
+
+`nosql-odm` is built around one core split:
+
+- `Model`/`Store` layer: schema validation, type safety, and user-facing API ergonomics.
+- `QueryEngine` layer: low-level storage behavior (atomicity, race handling, batching, locking, and performance details).
+
+In other words, the ODM acts as a type-safe proxy over the engine contract. Adapter authors implement correctness/performance details at the engine boundary.
+
 ## Installation
 
 ```bash
@@ -39,7 +48,7 @@ const User = model("user")
     z.object({
       id: z.string(),
       name: z.string(),
-      email: z.string().email(),
+      email: z.email(),
     }),
   )
   .schema(
@@ -48,12 +57,13 @@ const User = model("user")
       id: z.string(),
       firstName: z.string(),
       lastName: z.string(),
-      email: z.string().email(),
+      email: z.email(),
       role: z.enum(["admin", "member", "guest"]),
     }),
     {
       migrate(old) {
         const [firstName, ...rest] = old.name.split(" ");
+
         return {
           id: old.id,
           firstName: firstName ?? "",
@@ -71,6 +81,15 @@ const User = model("user")
 
 const store = createStore(memoryEngine(), [User]);
 ```
+
+## Typical Usage Flow
+
+Most projects follow this sequence:
+
+1. Define model schema versions and indexes.
+2. Create a store with one engine and one or more models.
+3. Use model APIs (`create`, `findByKey`, `query`, `update`, `delete`, `batch*`) in app code.
+4. Let lazy migration handle stale docs on reads, or run `migrateAll()` for explicit upgrades.
 
 ## SQLite Engine (`better-sqlite3`)
 
@@ -102,6 +121,7 @@ await store.user.create("u1", {
 });
 
 const user = await store.user.findByKey("u1");
+
 await store.user.update("u1", { role: "admin" });
 await store.user.delete("u1");
 ```
@@ -296,6 +316,18 @@ const User = model("user", {
 
 ## Engine Contract (Adapter Authors)
 
+Responsibility boundary:
+
+- The ODM (`Model`/`Store`) handles:
+  - Schema validation and migration projection
+  - Query ergonomics (`where` shorthand, index-name resolution)
+  - Error translation for user-facing API errors
+- The `QueryEngine` handles:
+  - Atomic write behavior (`create`/`update` existence semantics)
+  - Concurrency/race correctness
+  - Batch operation behavior/performance
+  - Locking/checkpoint persistence for migrations
+
 Required methods:
 
 - `get`, `create`, `put`, `update`, `delete`, `query`
@@ -309,9 +341,13 @@ Optional methods:
 
 - Migration checkpoints: `saveCheckpoint`, `loadCheckpoint`, `clearCheckpoint`
 - Migration status: `getStatus`
+
+Behavioral requirements:
+
+- `create` must be atomic and throw `EngineDocumentAlreadyExistsError` when the key already exists.
+- `update` must throw `EngineDocumentNotFoundError` when the key does not exist.
+- `batchGet`, `batchSet`, and `batchDelete` are required (the ODM does not fall back to per-item `get`/`put`/`delete`).
 - `getOutdated` criteria can receive custom `parseVersion` / `compareVersions` callbacks.
-- `create` should be atomic and throw `EngineDocumentAlreadyExistsError` when the key already exists.
-- `update` should throw `EngineDocumentNotFoundError` when the key does not exist.
 
 See `dist/index.d.ts` and `dist/engines/memory.d.ts` for full signatures.
 

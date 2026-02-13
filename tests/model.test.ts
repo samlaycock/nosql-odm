@@ -13,7 +13,7 @@ function buildSimpleModel() {
       z.object({
         id: z.string(),
         name: z.string(),
-        email: z.string().email(),
+        email: z.email(),
       }),
     )
     .build();
@@ -26,7 +26,7 @@ function buildVersionedModel() {
       z.object({
         id: z.string(),
         name: z.string(),
-        email: z.string().email(),
+        email: z.email(),
       }),
     )
     .schema(
@@ -35,7 +35,7 @@ function buildVersionedModel() {
         id: z.string(),
         firstName: z.string(),
         lastName: z.string(),
-        email: z.string().email(),
+        email: z.email(),
       }),
       {
         migrate(old) {
@@ -59,7 +59,7 @@ function buildThreeVersionModel() {
       z.object({
         id: z.string(),
         name: z.string(),
-        email: z.string().email(),
+        email: z.email(),
       }),
     )
     .schema(
@@ -68,7 +68,7 @@ function buildThreeVersionModel() {
         id: z.string(),
         firstName: z.string(),
         lastName: z.string(),
-        email: z.string().email(),
+        email: z.email(),
       }),
       {
         migrate(old) {
@@ -88,7 +88,7 @@ function buildThreeVersionModel() {
         id: z.string(),
         firstName: z.string(),
         lastName: z.string(),
-        email: z.string().email(),
+        email: z.email(),
         role: z.enum(["admin", "member", "guest"]),
       }),
       {
