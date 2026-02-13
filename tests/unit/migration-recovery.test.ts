@@ -1,8 +1,8 @@
 import { describe, expect, test, beforeEach } from "bun:test";
 import * as z from "zod";
-import { model } from "../src/model";
-import { createStore } from "../src/store";
-import { memoryEngine, type MemoryQueryEngine } from "../src/engines/memory";
+import { model } from "../../src/model";
+import { createStore } from "../../src/store";
+import { memoryEngine, type MemoryQueryEngine } from "../../src/engines/memory";
 
 // ---------------------------------------------------------------------------
 // Helpers

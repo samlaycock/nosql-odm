@@ -10,7 +10,7 @@ A lightweight, schema-first ODM for NoSQL-style data stores.
 - Ignore-first migration behavior for non-migratable documents
 - Dynamic index names (multi-tenant style index partitions)
 - Explicit bulk operations (`batchGet`, `batchSet`, `batchDelete`)
-- Pluggable query engine interface (memory, SQLite, and IndexedDB adapters included)
+- Pluggable query engine interface (memory, SQLite, IndexedDB, and DynamoDB adapters included)
 
 ## Package Intent
 
@@ -31,6 +31,12 @@ For SQLite support:
 
 ```bash
 npm install better-sqlite3
+```
+
+For DynamoDB support:
+
+```bash
+npm install @aws-sdk/lib-dynamodb
 ```
 
 ## Quick Start
@@ -127,6 +133,64 @@ const engine = indexedDbEngine({
   factory: fakeIndexedDB as any,
 });
 ```
+
+## DynamoDB Engine (AWS SDK DocumentClient)
+
+```ts
+import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
+import { dynamoDbEngine } from "nosql-odm/engines/dynamodb";
+
+const baseClient = new DynamoDBClient({ region: "us-east-1" });
+const client = DynamoDBDocumentClient.from(baseClient);
+
+const engine = dynamoDbEngine({
+  client,
+  tableName: "nosql_odm",
+});
+
+const store = createStore(engine, [User]);
+```
+
+The DynamoDB adapter expects a table with:
+
+- Partition key `pk` (string)
+- Sort key `sk` (string)
+
+It stores both model documents and migration metadata in that table using prefixed keys.
+
+## Local Engine Services (Docker Compose)
+
+For engine test suites with runtime dependencies, this repo uses named Docker Compose services.
+
+Start DynamoDB Local:
+
+```bash
+bun run services:up:dynamodb
+```
+
+Stop it:
+
+```bash
+bun run services:down:dynamodb
+```
+
+The DynamoDB Local endpoint is `http://localhost:8000`.
+The DynamoDB engine integration suite uses this service directly (no fake client):
+
+```bash
+bun run test:integration:dynamodb
+```
+
+Test runner modes:
+
+```bash
+bun run test                                 # unit tests only (excludes *.integration.test.ts)
+bun run test:integration                     # all integration suites
+bun run test:integration:dynamodb            # only DynamoDB integration
+```
+
+The DynamoDB integration suite creates and deletes its own test table automatically.
 
 ## CRUD
 

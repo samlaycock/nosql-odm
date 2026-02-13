@@ -37,11 +37,19 @@
       "types": "./dist/engines/indexeddb.d.ts",
       "import": "./dist/engines/indexeddb.mjs",
       "require": "./dist/engines/indexeddb.js"
+    },
+    "./engines/dynamodb": {
+      "types": "./dist/engines/dynamodb.d.ts",
+      "import": "./dist/engines/dynamodb.mjs",
+      "require": "./dist/engines/dynamodb.js"
     }
   },
   "scripts": {
-    "test": "bun test",
-    "test:sqlite": "bun test tests/sqlite-engine.test.ts",
+    "test": "bun test ./tests/unit/*.test.ts",
+    "test:integration": "bun test ./tests/integration/*.test.ts",
+    "test:integration:dynamodb": "bun test ./tests/integration/dynamodb-engine.integration.test.ts",
+    "test:integration:sqlite": "bun test ./tests/integration/sqlite-engine.integration.test.ts",
+    "test:integration:memory": "bun run ./tests/integration/memory-engine.integration.test.ts",
     "lint": "oxlint . --type-aware",
     "lint:fix": "oxlint . --type-aware --fix",
     "fmt": "oxfmt .",
@@ -54,6 +62,8 @@
     "@standard-schema/spec": "1.1.0"
   },
   "devDependencies": {
+    "@aws-sdk/client-dynamodb": "3.989.0",
+    "@aws-sdk/lib-dynamodb": "3.989.0",
     "@changesets/cli": "2.29.8",
     "@types/better-sqlite3": "7.6.13",
     "@types/bun": "latest",
@@ -66,6 +76,7 @@
     "zod": "4.3.6"
   },
   "peerDependencies": {
+    "@aws-sdk/lib-dynamodb": "^3.989.0",
     "better-sqlite3": "^12",
     "typescript": "^5"
   }

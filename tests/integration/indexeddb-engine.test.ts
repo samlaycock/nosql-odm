@@ -1,11 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { indexedDB as fakeIndexedDB } from "fake-indexeddb";
-import { indexedDbEngine, type IndexedDbQueryEngine } from "../src/engines/indexeddb";
+import { indexedDbEngine, type IndexedDbQueryEngine } from "../../src/engines/indexeddb";
 import {
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
   type ComparableVersion,
-} from "../src/engines/types";
+} from "../../src/engines/types";
 
 let engine: IndexedDbQueryEngine;
 let databaseNameCounter = 0;
@@ -196,7 +196,10 @@ describe("indexedDbEngine basic CRUD", () => {
     await engine.put("users", "u1", { id: "u1", name: "Sam" }, { primary: "u1" });
     await engine.put("users", "u1", { id: "u1", name: "Samuel" }, { primary: "u1" });
 
-    expect(await engine.get("users", "u1")).toEqual({ id: "u1", name: "Samuel" });
+    expect(await engine.get("users", "u1")).toEqual({
+      id: "u1",
+      name: "Samuel",
+    });
   });
 
   test("update replaces existing document and indexes", async () => {
@@ -251,8 +254,12 @@ describe("indexedDbEngine basic CRUD", () => {
   test("get returns deep clones, not shared references", async () => {
     await engine.put("users", "u1", { id: "u1", nested: { value: 1 } }, { primary: "u1" });
 
-    const doc1 = (await engine.get("users", "u1")) as { nested: { value: number } };
-    const doc2 = (await engine.get("users", "u1")) as { nested: { value: number } };
+    const doc1 = (await engine.get("users", "u1")) as {
+      nested: { value: number };
+    };
+    const doc2 = (await engine.get("users", "u1")) as {
+      nested: { value: number };
+    };
 
     expect(doc1).toEqual(doc2);
     expect(doc1).not.toBe(doc2);
@@ -405,7 +412,9 @@ describe("indexedDbEngine query behavior", () => {
     await engine.put("users", "u1", { id: "u1" }, { primary: "u1" });
     await engine.put("users", "u2", { id: "u2" }, { primary: "u2" });
 
-    const results = await engine.query("users", { limit: Number.POSITIVE_INFINITY });
+    const results = await engine.query("users", {
+      limit: Number.POSITIVE_INFINITY,
+    });
 
     expect(results.documents).toHaveLength(2);
     expect(results.cursor).toBeNull();
@@ -643,7 +652,11 @@ describe("indexedDbEngine migration getOutdated", () => {
       await engine.put(
         "users",
         `u${String(i).padStart(3, "0")}`,
-        { __v: 1, __indexes: ["primary"], id: `u${String(i).padStart(3, "0")}` },
+        {
+          __v: 1,
+          __indexes: ["primary"],
+          id: `u${String(i).padStart(3, "0")}`,
+        },
         { primary: `u${String(i).padStart(3, "0")}` },
       );
     }

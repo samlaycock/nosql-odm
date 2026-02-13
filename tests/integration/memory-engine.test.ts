@@ -1,10 +1,10 @@
 import { describe, expect, test, beforeEach } from "bun:test";
-import { memoryEngine } from "../src/engines/memory";
+import { memoryEngine } from "../../src/engines/memory";
 import {
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
   type QueryEngine,
-} from "../src/engines/types";
+} from "../../src/engines/types";
 
 // ---------------------------------------------------------------------------
 // Setup
@@ -150,7 +150,10 @@ describe("create()", () => {
   test("creates a document when key does not exist", async () => {
     await engine.create("users", "abc", { id: "abc", name: "Sam" }, { primary: "abc" });
 
-    expect(await engine.get("users", "abc")).toEqual({ id: "abc", name: "Sam" });
+    expect(await engine.get("users", "abc")).toEqual({
+      id: "abc",
+      name: "Sam",
+    });
   });
 
   test("throws EngineDocumentAlreadyExistsError when key exists", async () => {
@@ -163,7 +166,10 @@ describe("create()", () => {
       expect(error).toBeInstanceOf(EngineDocumentAlreadyExistsError);
     }
 
-    expect(await engine.get("users", "abc")).toEqual({ id: "abc", name: "Original" });
+    expect(await engine.get("users", "abc")).toEqual({
+      id: "abc",
+      name: "Original",
+    });
   });
 });
 
@@ -183,7 +189,10 @@ describe("update()", () => {
       { byEmail: "new@example.com" },
     );
 
-    expect(await engine.get("users", "abc")).toEqual({ id: "abc", email: "new@example.com" });
+    expect(await engine.get("users", "abc")).toEqual({
+      id: "abc",
+      email: "new@example.com",
+    });
     const oldResults = await engine.query("users", {
       index: "byEmail",
       filter: { value: "old@example.com" },
@@ -1001,7 +1010,9 @@ describe("migration locking", () => {
     expect(await engine.migration.acquireLock("users", { ttl: Number.NaN })).toBeNull();
     expect(await engine.migration.acquireLock("users", { ttl: -1 })).toBeNull();
     expect(
-      await engine.migration.acquireLock("users", { ttl: Number.POSITIVE_INFINITY }),
+      await engine.migration.acquireLock("users", {
+        ttl: Number.POSITIVE_INFINITY,
+      }),
     ).toBeNull();
   });
 

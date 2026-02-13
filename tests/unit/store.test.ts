@@ -1,17 +1,17 @@
 import { describe, expect, test, beforeEach } from "bun:test";
 import * as z from "zod";
-import { model, ValidationError } from "../src/model";
+import { model, ValidationError } from "../../src/model";
 import {
   createStore,
   DocumentAlreadyExistsError,
   MigrationAlreadyRunningError,
-} from "../src/store";
-import { memoryEngine, type MemoryQueryEngine } from "../src/engines/memory";
+} from "../../src/store";
+import { memoryEngine, type MemoryQueryEngine } from "../../src/engines/memory";
 import {
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
   type QueryEngine,
-} from "../src/engines/types";
+} from "../../src/engines/types";
 
 // ---------------------------------------------------------------------------
 // Helpers
