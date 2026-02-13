@@ -287,6 +287,8 @@ describe("indexedDbEngine batch methods", () => {
     const docs = await engine.batchGet("users", ["u1", "u1"]);
 
     expect(docs).toHaveLength(2);
+    expect(docs[0]?.key).toBe("u1");
+    expect(docs[1]?.key).toBe("u1");
     expect(docs[0]!.doc).not.toBe(docs[1]!.doc);
   });
 });
@@ -483,6 +485,25 @@ describe("indexedDbEngine migration lock/checkpoint/status", () => {
     expect(second?.id).not.toBe(first?.id);
   });
 
+  test("invalid ttl values do not steal and collection scope is isolated", async () => {
+    const lock = await engine.migration.acquireLock("users");
+    const otherLock = await engine.migration.acquireLock("orders");
+
+    expect(lock).not.toBeNull();
+    expect(otherLock).not.toBeNull();
+
+    for (const ttl of [Number.NaN, Number.POSITIVE_INFINITY, -1]) {
+      expect(
+        await engine.migration.acquireLock("users", {
+          ttl,
+        }),
+      ).toBeNull();
+    }
+
+    expect(await engine.migration.acquireLock("users")).toBeNull();
+    expect(await engine.migration.acquireLock("orders")).toBeNull();
+  });
+
   test("checkpoint writes require current lock owner", async () => {
     const first = await engine.migration.acquireLock("users");
 
@@ -515,6 +536,25 @@ describe("indexedDbEngine migration lock/checkpoint/status", () => {
     expect(status).not.toBeNull();
     expect(status?.lock.id).toBe(lock?.id);
     expect(status?.cursor).toBe("cursor-1");
+  });
+
+  test("getStatus shape variants and collection scope", async () => {
+    expect(await engine.migration.getStatus!("users")).toBeNull();
+
+    const lock = await engine.migration.acquireLock("users");
+    const otherLock = await engine.migration.acquireLock("orders");
+    expect(lock).not.toBeNull();
+    expect(otherLock).not.toBeNull();
+
+    const withoutCursor = await engine.migration.getStatus!("users");
+    expect(withoutCursor?.lock.id).toBe(lock?.id);
+    expect(withoutCursor?.cursor).toBeNull();
+    expect(await engine.migration.getStatus!("orders")).not.toBeNull();
+
+    await engine.migration.saveCheckpoint!(lock!, "cursor-a");
+    const withCursor = await engine.migration.getStatus!("users");
+    expect(withCursor?.lock.id).toBe(lock?.id);
+    expect(withCursor?.cursor).toBe("cursor-a");
   });
 });
 

@@ -156,6 +156,48 @@ describe("dynamoDbEngine integration", () => {
     }
   });
 
+  test("create rejects non-object documents", async () => {
+    await expectReject(
+      engine.create(collection, "u1", "not-an-object", { primary: "u1" }),
+      /non-object document/,
+    );
+  });
+
+  test("create rejects circular documents", async () => {
+    const doc: { id: string; self?: unknown } = { id: "u1" };
+    doc.self = doc;
+
+    await expectReject(
+      engine.create(collection, "u1", doc, { primary: "u1" }),
+      /circular|cyclic|serialize|call stack/i,
+    );
+  });
+
+  test("put rejects non-object documents", async () => {
+    await expectReject(
+      engine.put(collection, "u1", "not-an-object", { primary: "u1" }),
+      /non-object document/,
+    );
+  });
+
+  test("update rejects non-object documents", async () => {
+    await engine.put(collection, "u1", { id: "u1" }, { primary: "u1" });
+
+    await expectReject(
+      engine.update(collection, "u1", "not-an-object", { primary: "u1" }),
+      /non-object document/,
+    );
+  });
+
+  test("batchSet rejects non-object documents", async () => {
+    await expectReject(
+      engine.batchSet(collection, [
+        { key: "u1", doc: "not-an-object", indexes: { primary: "u1" } },
+      ]),
+      /non-object document/,
+    );
+  });
+
   test("delete removes documents and ignores missing keys", async () => {
     await engine.put(collection, "u1", { id: "u1" }, { primary: "u1" });
     await engine.delete(collection, "u1");
@@ -208,6 +250,18 @@ describe("dynamoDbEngine integration", () => {
     expect(docs[0]?.key).toBe("u1");
     expect(docs[1]?.key).toBe("u1");
     expect(docs[0]?.doc).not.toBe(docs[1]?.doc);
+  });
+
+  test("batchGet returns deep clones per returned item", async () => {
+    await engine.put(collection, "u1", { id: "u1", nested: { value: 1 } }, { primary: "u1" });
+
+    const docs = await engine.batchGet(collection, ["u1", "u1"]);
+    const first = docs[0]?.doc as { nested: { value: number } };
+    const second = docs[1]?.doc as { nested: { value: number } };
+
+    expect(first).toEqual(second);
+    expect(first).not.toBe(second);
+    expect(first.nested).not.toBe(second.nested);
   });
 
   test("batchGet supports large key sets (chunking path)", async () => {
@@ -541,6 +595,46 @@ describe("dynamoDbEngine integration", () => {
     );
 
     await expectReject(engine.get(collection, "bad"), /invalid document item/);
+  });
+
+  test("get throws for invalid stored indexes value", async () => {
+    await documentClient.send(
+      new PutCommand({
+        TableName: tableName,
+        Item: {
+          pk: `COL#${collection}`,
+          sk: "DOC#bad-indexes",
+          itemType: "doc",
+          collection,
+          key: "bad-indexes",
+          createdAt: 1,
+          doc: { id: "bad-indexes" },
+          indexes: "not-an-object",
+        },
+      }),
+    );
+
+    await expectReject(engine.get(collection, "bad-indexes"), /invalid document item/);
+  });
+
+  test("get throws for non-string stored index values", async () => {
+    await documentClient.send(
+      new PutCommand({
+        TableName: tableName,
+        Item: {
+          pk: `COL#${collection}`,
+          sk: "DOC#bad-index-value",
+          itemType: "doc",
+          collection,
+          key: "bad-index-value",
+          createdAt: 1,
+          doc: { id: "bad-index-value" },
+          indexes: { primary: 1 },
+        },
+      }),
+    );
+
+    await expectReject(engine.get(collection, "bad-index-value"), /invalid document item/);
   });
 
   test("loadCheckpoint throws for invalid checkpoint item", async () => {

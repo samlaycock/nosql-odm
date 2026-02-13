@@ -576,6 +576,12 @@ function createDocumentItem(
   doc: unknown,
   indexes: ResolvedIndexKeys,
 ): StoredDocumentItem {
+  const cloned = structuredClone(doc);
+
+  if (!isRecord(cloned)) {
+    throw new Error("DynamoDB received a non-object document");
+  }
+
   return {
     pk: collectionPartitionKey(collection),
     sk: documentSortKey(key),
@@ -583,7 +589,7 @@ function createDocumentItem(
     collection,
     key,
     createdAt,
-    doc: structuredClone(doc) as Record<string, unknown>,
+    doc: cloned,
     indexes: { ...indexes },
   };
 }

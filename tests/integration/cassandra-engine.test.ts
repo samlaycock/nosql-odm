@@ -132,6 +132,21 @@ describe("cassandraEngine integration", () => {
     }
   });
 
+  test("get returns deep clones", async () => {
+    await engine.put(collection, "u1", { id: "u1", nested: { value: 1 } }, { primary: "u1" });
+
+    const doc1 = (await engine.get(collection, "u1")) as {
+      nested: { value: number };
+    };
+    const doc2 = (await engine.get(collection, "u1")) as {
+      nested: { value: number };
+    };
+
+    expect(doc1).toEqual(doc2);
+    expect(doc1).not.toBe(doc2);
+    expect(doc1.nested).not.toBe(doc2.nested);
+  });
+
   test("put upserts and update replaces existing document", async () => {
     await engine.put(collection, "u1", { id: "u1", name: "Sam" }, { primary: "u1" });
     await engine.update(collection, "u1", { id: "u1", name: "Samuel" }, { primary: "u1" });
@@ -376,6 +391,13 @@ describe("cassandraEngine integration", () => {
 
     expect(status?.lock.id).toBe(stolen?.id);
     expect(status?.cursor).toBe("cursor-b");
+
+    await engine.migration.releaseLock({
+      id: "wrong-id",
+      collection,
+      acquiredAt: stolen!.acquiredAt,
+    });
+    expect(await engine.migration.acquireLock(collection)).toBeNull();
 
     await engine.migration.releaseLock(stolen!);
     expect(await engine.migration.acquireLock(collection)).not.toBeNull();
