@@ -289,6 +289,38 @@ The MongoDB adapter stores model documents and migration metadata in two collect
 
 You can override collection names with `documentsCollection` / `metadataCollection`.
 
+## MySQL Engine (`mysql2`)
+
+```ts
+import { createPool } from "mysql2/promise";
+import { mySqlEngine } from "nosql-odm/engines/mysql";
+
+const pool = createPool({
+  host: "127.0.0.1",
+  port: 3306,
+  user: "root",
+  password: "root",
+  database: "app",
+});
+
+const engine = mySqlEngine({
+  client: pool,
+  database: "app",
+});
+
+const store = createStore(engine, [User]);
+```
+
+The MySQL adapter creates internal tables on first use:
+
+- `<database>.nosql_odm_documents`
+- `<database>.nosql_odm_index_entries`
+- `<database>.nosql_odm_migration_locks`
+- `<database>.nosql_odm_migration_checkpoints`
+
+You can override table names with:
+`documentsTable`, `indexesTable`, `migrationLocksTable`, and `migrationCheckpointsTable`.
+
 ## Firestore Engine (`@google-cloud/firestore`)
 
 ```ts
@@ -410,15 +442,26 @@ The Firestore engine integration suite uses this service directly:
 bun run test:integration:firestore
 ```
 
+Start MySQL:
+
+````bash
+bun run services:up:mysql
 Start Postgres:
 
 ```bash
 bun run services:up:postgres
-```
+````
 
 Stop it:
 
 ```bash
+bun run services:down:mysql
+```
+
+The MySQL engine integration suite uses this service directly:
+
+```bash
+bun run test:integration:mysql
 bun run services:down:postgres
 ```
 
@@ -438,6 +481,7 @@ bun run test:integration:cassandra           # only Cassandra integration
 bun run test:integration:redis               # only Redis integration
 bun run test:integration:mongodb             # only MongoDB integration
 bun run test:integration:firestore           # only Firestore integration
+bun run test:integration:mysql               # only MySQL integration
 bun run test:integration:postgres            # only Postgres integration
 ```
 
