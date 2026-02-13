@@ -4,3 +4,9 @@ services:
     profiles: ["dynamodb"]
     ports:
       - "8000:8000"
+
+  cassandra:
+    image: cassandra:latest
+    profiles: ["cassandra"]
+    ports:
+      - "9042:9042"

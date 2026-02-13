@@ -10,7 +10,7 @@ A lightweight, schema-first ODM for NoSQL-style data stores.
 - Ignore-first migration behavior for non-migratable documents
 - Dynamic index names (multi-tenant style index partitions)
 - Explicit bulk operations (`batchGet`, `batchSet`, `batchDelete`)
-- Pluggable query engine interface (memory, SQLite, IndexedDB, and DynamoDB adapters included)
+- Pluggable query engine interface (memory, SQLite, IndexedDB, DynamoDB, and Cassandra adapters included)
 
 ## Package Intent
 
@@ -37,6 +37,12 @@ For DynamoDB support:
 
 ```bash
 npm install @aws-sdk/lib-dynamodb
+```
+
+For Cassandra support:
+
+```bash
+npm install cassandra-driver
 ```
 
 ## Quick Start
@@ -159,6 +165,33 @@ The DynamoDB adapter expects a table with:
 
 It stores both model documents and migration metadata in that table using prefixed keys.
 
+## Cassandra Engine (`cassandra-driver`)
+
+```ts
+import { Client } from "cassandra-driver";
+import { cassandraEngine } from "nosql-odm/engines/cassandra";
+
+const client = new Client({
+  contactPoints: ["127.0.0.1"],
+  localDataCenter: "datacenter1",
+  protocolOptions: { port: 9042 },
+});
+
+const engine = cassandraEngine({
+  client,
+  keyspace: "app",
+});
+
+const store = createStore(engine, [User]);
+```
+
+The Cassandra adapter creates its internal tables on first use:
+
+- `<keyspace>.nosql_odm_documents`
+- `<keyspace>.nosql_odm_metadata`
+
+You can override table names with `documentsTable` / `metadataTable`.
+
 ## Local Engine Services (Docker Compose)
 
 For engine test suites with runtime dependencies, this repo uses named Docker Compose services.
@@ -182,12 +215,31 @@ The DynamoDB engine integration suite uses this service directly (no fake client
 bun run test:integration:dynamodb
 ```
 
+Start Cassandra:
+
+```bash
+bun run services:up:cassandra
+```
+
+Stop it:
+
+```bash
+bun run services:down:cassandra
+```
+
+The Cassandra engine integration suite uses this service directly:
+
+```bash
+bun run test:integration:cassandra
+```
+
 Test runner modes:
 
 ```bash
-bun run test                                 # unit tests only (excludes *.integration.test.ts)
+bun run test                                 # unit tests only (./tests/unit/*.test.ts)
 bun run test:integration                     # all integration suites
 bun run test:integration:dynamodb            # only DynamoDB integration
+bun run test:integration:cassandra           # only Cassandra integration
 ```
 
 The DynamoDB integration suite creates and deletes its own test table automatically.

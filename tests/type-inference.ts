@@ -1,6 +1,6 @@
 import * as z from "zod";
-import { createStore, model } from "../../src";
-import { memoryEngine } from "../../src/engines/memory";
+import { createStore, model } from "../src";
+import { memoryEngine } from "../src/engines/memory";
 
 const Users = model("users")
   .schema(

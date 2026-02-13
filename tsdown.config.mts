@@ -7,6 +7,7 @@ export default defineConfig({
     "./src/engines/sqlite.ts",
     "./src/engines/indexeddb.ts",
     "./src/engines/dynamodb.ts",
+    "./src/engines/cassandra.ts",
   ],
   format: ["cjs", "esm"],
   platform: "neutral",

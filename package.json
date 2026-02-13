@@ -42,14 +42,20 @@
       "types": "./dist/engines/dynamodb.d.ts",
       "import": "./dist/engines/dynamodb.mjs",
       "require": "./dist/engines/dynamodb.js"
+    },
+    "./engines/cassandra": {
+      "types": "./dist/engines/cassandra.d.ts",
+      "import": "./dist/engines/cassandra.mjs",
+      "require": "./dist/engines/cassandra.js"
     }
   },
   "scripts": {
     "test": "bun test ./tests/unit/*.test.ts",
     "test:integration": "bun test ./tests/integration/*.test.ts",
-    "test:integration:dynamodb": "bun test ./tests/integration/dynamodb-engine.integration.test.ts",
-    "test:integration:sqlite": "bun test ./tests/integration/sqlite-engine.integration.test.ts",
-    "test:integration:memory": "bun run ./tests/integration/memory-engine.integration.test.ts",
+    "test:integration:memory": "bun test ./tests/integration/memory-engine.test.ts",
+    "test:integration:indexeddb": "bun test ./tests/integration/indexeddb-engine.test.ts",
+    "test:integration:dynamodb": "bun test ./tests/integration/dynamodb-engine.test.ts",
+    "test:integration:cassandra": "bun test ./tests/integration/cassandra-engine.test.ts",
     "lint": "oxlint . --type-aware",
     "lint:fix": "oxlint . --type-aware --fix",
     "fmt": "oxfmt .",
@@ -68,6 +74,7 @@
     "@types/better-sqlite3": "7.6.13",
     "@types/bun": "latest",
     "better-sqlite3": "12.6.2",
+    "cassandra-driver": "4.8.0",
     "fake-indexeddb": "6.2.5",
     "oxfmt": "0.28.0",
     "oxlint": "1.43.0",
@@ -78,6 +85,7 @@
   "peerDependencies": {
     "@aws-sdk/lib-dynamodb": "^3.989.0",
     "better-sqlite3": "^12",
+    "cassandra-driver": "^4.8.0",
     "typescript": "^5"
   }
 }
