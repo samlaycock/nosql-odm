@@ -33,6 +33,8 @@ export {
   type Store,
 } from "./store";
 
+export { EngineDocumentAlreadyExistsError, EngineDocumentNotFoundError } from "./engines/types";
+
 export type {
   ComparableVersion,
   ResolvedIndexKeys,

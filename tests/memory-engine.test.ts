@@ -1,6 +1,10 @@
 import { describe, expect, test, beforeEach } from "bun:test";
 import { memoryEngine } from "../src/engines/memory";
-import type { QueryEngine } from "../src/engines/types";
+import {
+  EngineDocumentAlreadyExistsError,
+  EngineDocumentNotFoundError,
+  type QueryEngine,
+} from "../src/engines/types";
 
 // ---------------------------------------------------------------------------
 // Setup
@@ -139,6 +143,67 @@ describe("put()", () => {
 
     expect(oldResults.documents).toHaveLength(0);
     expect(newResults.documents).toHaveLength(1);
+  });
+});
+
+describe("create()", () => {
+  test("creates a document when key does not exist", async () => {
+    await engine.create("users", "abc", { id: "abc", name: "Sam" }, { primary: "abc" });
+
+    expect(await engine.get("users", "abc")).toEqual({ id: "abc", name: "Sam" });
+  });
+
+  test("throws EngineDocumentAlreadyExistsError when key exists", async () => {
+    await engine.put("users", "abc", { id: "abc", name: "Original" }, { primary: "abc" });
+
+    try {
+      await engine.create("users", "abc", { id: "abc", name: "Duplicate" }, { primary: "abc" });
+      throw new Error("expected create to fail with duplicate error");
+    } catch (error) {
+      expect(error).toBeInstanceOf(EngineDocumentAlreadyExistsError);
+    }
+
+    expect(await engine.get("users", "abc")).toEqual({ id: "abc", name: "Original" });
+  });
+});
+
+describe("update()", () => {
+  test("updates an existing document", async () => {
+    await engine.put(
+      "users",
+      "abc",
+      { id: "abc", email: "old@example.com" },
+      { byEmail: "old@example.com" },
+    );
+
+    await engine.update(
+      "users",
+      "abc",
+      { id: "abc", email: "new@example.com" },
+      { byEmail: "new@example.com" },
+    );
+
+    expect(await engine.get("users", "abc")).toEqual({ id: "abc", email: "new@example.com" });
+    const oldResults = await engine.query("users", {
+      index: "byEmail",
+      filter: { value: "old@example.com" },
+    });
+    const newResults = await engine.query("users", {
+      index: "byEmail",
+      filter: { value: "new@example.com" },
+    });
+
+    expect(oldResults.documents).toHaveLength(0);
+    expect(newResults.documents).toHaveLength(1);
+  });
+
+  test("throws EngineDocumentNotFoundError for missing documents", async () => {
+    try {
+      await engine.update("users", "missing", { id: "missing" }, { primary: "missing" });
+      throw new Error("expected update to fail with not found error");
+    } catch (error) {
+      expect(error).toBeInstanceOf(EngineDocumentNotFoundError);
+    }
   });
 });
 

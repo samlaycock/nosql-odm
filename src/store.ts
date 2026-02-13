@@ -1,10 +1,12 @@
-import type {
-  QueryEngine,
-  QueryParams,
-  QueryFilter,
-  WhereFilter,
-  MigrationCriteria,
-  MigrationStatus,
+import {
+  EngineDocumentAlreadyExistsError,
+  EngineDocumentNotFoundError,
+  type QueryEngine,
+  type QueryParams,
+  type QueryFilter,
+  type WhereFilter,
+  type MigrationCriteria,
+  type MigrationStatus,
 } from "./engines/types";
 import type { ProjectionSkipReason } from "./model";
 import { ModelDefinition } from "./model";
@@ -265,7 +267,7 @@ class BoundModelImpl<
     }
 
     if (projected.migrated) {
-      await this.writeback(key, projected.value, options);
+      await this.writebackMany([{ key, value: projected.value }], options);
     }
 
     return projected.value;
@@ -278,6 +280,7 @@ class BoundModelImpl<
     const resolved = this.resolveQuery(params);
     const raw = await this.engine.query(this.model.name, resolved, options);
     const documents: T[] = [];
+    const writebacks: { key: string; value: T }[] = [];
 
     for (const { key, doc: rawDoc } of raw.documents) {
       const projected = await this.model.projectToLatest(rawDoc as Record<string, unknown>);
@@ -287,27 +290,31 @@ class BoundModelImpl<
       }
 
       if (projected.migrated) {
-        await this.writeback(key, projected.value, options);
+        writebacks.push({ key, value: projected.value });
       }
 
       documents.push(projected.value);
     }
 
+    await this.writebackMany(writebacks, options);
+
     return { documents, cursor: raw.cursor };
   }
 
   async create(key: string, data: T, options?: TOptions): Promise<T> {
-    const existing = await this.engine.get(this.model.name, key, options);
-
-    if (existing !== null && existing !== undefined) {
-      throw new DocumentAlreadyExistsError(this.model.name, key);
-    }
-
     const validated = await this.model.validate(data);
     const doc = this.stamp(validated as object, key);
     const indexes = this.model.resolveIndexKeys(validated);
 
-    await this.engine.put(this.model.name, key, doc, indexes, options);
+    try {
+      await this.engine.create(this.model.name, key, doc, indexes, options);
+    } catch (error) {
+      if (error instanceof EngineDocumentAlreadyExistsError) {
+        throw new DocumentAlreadyExistsError(this.model.name, key);
+      }
+
+      throw error;
+    }
 
     return validated;
   }
@@ -336,7 +343,15 @@ class BoundModelImpl<
     const doc = this.stamp(validated as object, key);
     const indexes = this.model.resolveIndexKeys(validated);
 
-    await this.engine.put(this.model.name, key, doc, indexes, options);
+    try {
+      await this.engine.update(this.model.name, key, doc, indexes, options);
+    } catch (error) {
+      if (error instanceof EngineDocumentNotFoundError) {
+        throw new Error(`Document "${key}" not found in model "${this.model.name}"`);
+      }
+
+      throw error;
+    }
 
     return validated;
   }
@@ -346,12 +361,9 @@ class BoundModelImpl<
   }
 
   async batchGet(keys: string[], options?: TOptions): Promise<T[]> {
-    if (!this.engine.batchGet) {
-      throw new Error(`Engine does not support batchGet`);
-    }
-
     const rawDocs = await this.engine.batchGet(this.model.name, keys, options);
     const results: T[] = [];
+    const writebacks: { key: string; value: T }[] = [];
 
     for (const { key, doc: rawDoc } of rawDocs) {
       const projected = await this.model.projectToLatest(rawDoc as Record<string, unknown>);
@@ -361,11 +373,13 @@ class BoundModelImpl<
       }
 
       if (projected.migrated) {
-        await this.writeback(key, projected.value, options);
+        writebacks.push({ key, value: projected.value });
       }
 
       results.push(projected.value);
     }
+
+    await this.writebackMany(writebacks, options);
 
     return results;
   }
@@ -393,34 +407,21 @@ class BoundModelImpl<
       });
     }
 
-    if (this.engine.batchSet) {
-      await this.engine.batchSet(
-        this.model.name,
-        prepared.map((item) => ({
-          key: item.key,
-          doc: item.doc,
-          indexes: item.indexes,
-        })),
-        options,
-      );
-    } else {
-      for (const item of prepared) {
-        await this.engine.put(this.model.name, item.key, item.doc, item.indexes, options);
-      }
-    }
+    await this.engine.batchSet(
+      this.model.name,
+      prepared.map((item) => ({
+        key: item.key,
+        doc: item.doc,
+        indexes: item.indexes,
+      })),
+      options,
+    );
 
     return prepared.map((item) => item.validated);
   }
 
   async batchDelete(keys: string[], options?: TOptions): Promise<void> {
-    if (this.engine.batchDelete) {
-      await this.engine.batchDelete(this.model.name, keys, options);
-      return;
-    }
-
-    for (const key of keys) {
-      await this.engine.delete(this.model.name, key, options);
-    }
+    await this.engine.batchDelete(this.model.name, keys, options);
   }
 
   async migrateAll(options?: MigrationRunOptions): Promise<MigrationResult> {
@@ -456,6 +457,12 @@ class BoundModelImpl<
         // The engine returns only documents that need migration or reindexing.
         const page = await this.engine.migration.getOutdated(collection, criteria, cursor);
 
+        const writes: {
+          key: string;
+          doc: Record<string, unknown>;
+          indexes: Record<string, string>;
+        }[] = [];
+
         for (const { key, doc: rawDoc } of page.documents) {
           const projected = await this.model.projectToLatest(rawDoc as Record<string, unknown>);
 
@@ -467,11 +474,15 @@ class BoundModelImpl<
 
           const stamped = this.stamp(projected.value as object, key);
           const indexes = this.model.resolveIndexKeys(projected.value);
-          await this.engine.put(collection, key, stamped, indexes);
+          writes.push({ key, doc: stamped, indexes });
 
           if (projected.migrated) {
             migrated++;
           }
+        }
+
+        if (writes.length > 0) {
+          await this.engine.batchSet(collection, writes);
         }
 
         cursor = page.cursor ?? undefined;
@@ -520,19 +531,29 @@ class BoundModelImpl<
     return ensureJsonCompatibleDocument(stamped, this.model.name, key);
   }
 
-  // Writes the migrated document back to the engine so future reads don't need
+  // Writes migrated documents back to the engine so future reads don't need
   // to re-migrate. Skipped in "readonly" and "eager" modes — readonly because
   // writes are not permitted, eager because migration is expected to happen
   // via migrateAll() rather than on individual reads.
-  private async writeback(key: string, data: T, options?: TOptions): Promise<void> {
+  private async writebackMany(
+    items: { key: string; value: T }[],
+    options?: TOptions,
+  ): Promise<void> {
     if (this.model.options.migration !== "lazy") {
       return;
     }
 
-    const doc = this.stamp(data as object, key);
-    const indexes = this.model.resolveIndexKeys(data);
+    if (items.length === 0) {
+      return;
+    }
 
-    await this.engine.put(this.model.name, key, doc, indexes, options);
+    const prepared = items.map((item) => ({
+      key: item.key,
+      doc: this.stamp(item.value as object, item.key),
+      indexes: this.model.resolveIndexKeys(item.value),
+    }));
+
+    await this.engine.batchSet(this.model.name, prepared, options);
   }
 
   // Resolves query params: `where` shorthand → `index`/`filter`, or pass through

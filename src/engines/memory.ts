@@ -1,11 +1,13 @@
-import type {
-  QueryEngine,
-  QueryParams,
-  EngineQueryResult,
-  KeyedDocument,
-  ResolvedIndexKeys,
-  FieldCondition,
-  MigrationLock,
+import {
+  EngineDocumentAlreadyExistsError,
+  EngineDocumentNotFoundError,
+  type QueryEngine,
+  type QueryParams,
+  type EngineQueryResult,
+  type KeyedDocument,
+  type ResolvedIndexKeys,
+  type FieldCondition,
+  type MigrationLock,
 } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -23,7 +25,7 @@ interface StoredDocument {
 
 export interface MemoryEngineOptions {
   /**
-   * Called before every put(). Throw to simulate a write failure.
+   * Called before every write (create/put/batchSet). Throw to simulate a write failure.
    * Receives the collection name, document key, and the document.
    */
   onBeforePut?: (collection: string, key: string, doc: unknown) => void;
@@ -62,10 +64,40 @@ export function memoryEngine(options?: MemoryEngineOptions): MemoryQueryEngine {
       return stored ? structuredClone(stored.doc) : null;
     },
 
+    async create(collection, key, doc, indexes) {
+      engineOptions.onBeforePut?.(collection, key, doc);
+
+      const col = getCollection(collection);
+
+      if (col.has(key)) {
+        throw new EngineDocumentAlreadyExistsError(collection, key);
+      }
+
+      col.set(key, {
+        doc: structuredClone(doc) as Record<string, unknown>,
+        indexes: { ...indexes },
+      });
+    },
+
     async put(collection, key, doc, indexes) {
       engineOptions.onBeforePut?.(collection, key, doc);
 
       const col = getCollection(collection);
+
+      col.set(key, {
+        doc: structuredClone(doc) as Record<string, unknown>,
+        indexes: { ...indexes },
+      });
+    },
+
+    async update(collection, key, doc, indexes) {
+      engineOptions.onBeforePut?.(collection, key, doc);
+
+      const col = getCollection(collection);
+
+      if (!col.has(key)) {
+        throw new EngineDocumentNotFoundError(collection, key);
+      }
 
       col.set(key, {
         doc: structuredClone(doc) as Record<string, unknown>,

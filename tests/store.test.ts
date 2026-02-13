@@ -7,7 +7,11 @@ import {
   MigrationAlreadyRunningError,
 } from "../src/store";
 import { memoryEngine, type MemoryQueryEngine } from "../src/engines/memory";
-import type { QueryEngine } from "../src/engines/types";
+import {
+  EngineDocumentAlreadyExistsError,
+  EngineDocumentNotFoundError,
+  type QueryEngine,
+} from "../src/engines/types";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -298,6 +302,131 @@ describe("store.create()", () => {
         email: "other@example.com",
       }),
     ).rejects.toThrow(DocumentAlreadyExistsError);
+  });
+
+  test("maps EngineDocumentAlreadyExistsError from engine.create", async () => {
+    const duplicateEngine: QueryEngine<never> = {
+      async get() {
+        return null;
+      },
+      async create() {
+        throw new EngineDocumentAlreadyExistsError("user", "u1");
+      },
+      async put() {},
+      async update() {},
+      async delete() {},
+      async query() {
+        return { documents: [], cursor: null };
+      },
+      async batchGet() {
+        return [];
+      },
+      async batchSet() {},
+      async batchDelete() {},
+      migration: {
+        async acquireLock() {
+          return null;
+        },
+        async releaseLock() {},
+        async getOutdated() {
+          return { documents: [], cursor: null };
+        },
+      },
+    };
+
+    const store = createStore(duplicateEngine, [buildUserV1()]);
+
+    try {
+      await store.user.create("u1", { id: "u1", name: "Sam", email: "sam@example.com" });
+      throw new Error("expected create to fail with duplicate error");
+    } catch (error) {
+      expect(error).toBeInstanceOf(DocumentAlreadyExistsError);
+    }
+  });
+
+  test("rethrows non-duplicate engine.create errors unchanged", async () => {
+    const failingEngine: QueryEngine<never> = {
+      async get() {
+        return null;
+      },
+      async create() {
+        throw new Error("write timeout");
+      },
+      async put() {},
+      async update() {},
+      async delete() {},
+      async query() {
+        return { documents: [], cursor: null };
+      },
+      async batchGet() {
+        return [];
+      },
+      async batchSet() {},
+      async batchDelete() {},
+      migration: {
+        async acquireLock() {
+          return null;
+        },
+        async releaseLock() {},
+        async getOutdated() {
+          return { documents: [], cursor: null };
+        },
+      },
+    };
+
+    const store = createStore(failingEngine, [buildUserV1()]);
+
+    try {
+      await store.user.create("u1", { id: "u1", name: "Sam", email: "sam@example.com" });
+      throw new Error("expected create to fail");
+    } catch (error) {
+      expect(String(error)).toContain("write timeout");
+    }
+  });
+
+  test("does not pre-read existence; delegates create race handling to engine.create", async () => {
+    let getCalls = 0;
+    let createCalls = 0;
+    const trackingEngine: QueryEngine<never> = {
+      async get() {
+        getCalls++;
+        throw new Error("store.create should not call engine.get");
+      },
+      async create() {
+        createCalls++;
+      },
+      async put() {},
+      async update() {},
+      async delete() {},
+      async query() {
+        return { documents: [], cursor: null };
+      },
+      async batchGet() {
+        return [];
+      },
+      async batchSet() {},
+      async batchDelete() {},
+      migration: {
+        async acquireLock() {
+          return null;
+        },
+        async releaseLock() {},
+        async getOutdated() {
+          return { documents: [], cursor: null };
+        },
+      },
+    };
+
+    const store = createStore(trackingEngine, [buildUserV1()]);
+
+    await store.user.create("u1", {
+      id: "u1",
+      name: "Sam",
+      email: "sam@example.com",
+    });
+
+    expect(getCalls).toBe(0);
+    expect(createCalls).toBe(1);
   });
 
   test("computes and stores index keys", async () => {
@@ -644,6 +773,98 @@ describe("store.update()", () => {
     expect(oldResults.documents).toHaveLength(0);
     expect(newResults.documents).toHaveLength(1);
   });
+
+  test("throws not found when engine.update reports concurrent delete", async () => {
+    const raceEngine: QueryEngine<never> = {
+      async get() {
+        return {
+          __v: 1,
+          __indexes: ["byEmail", "primary"],
+          id: "u1",
+          name: "Sam",
+          email: "sam@example.com",
+        };
+      },
+      async create() {},
+      async put() {},
+      async update() {
+        throw new EngineDocumentNotFoundError("user", "u1");
+      },
+      async delete() {},
+      async query() {
+        return { documents: [], cursor: null };
+      },
+      async batchGet() {
+        return [];
+      },
+      async batchSet() {},
+      async batchDelete() {},
+      migration: {
+        async acquireLock() {
+          return null;
+        },
+        async releaseLock() {},
+        async getOutdated() {
+          return { documents: [], cursor: null };
+        },
+      },
+    };
+
+    const store = createStore(raceEngine, [buildUserV1()]);
+
+    try {
+      await store.user.update("u1", { name: "Samuel" });
+      throw new Error("expected update to fail with not found");
+    } catch (error) {
+      expect(String(error)).toContain('Document "u1" not found in model "user"');
+    }
+  });
+
+  test("rethrows non-not-found engine.update errors unchanged", async () => {
+    const raceEngine: QueryEngine<never> = {
+      async get() {
+        return {
+          __v: 1,
+          __indexes: ["byEmail", "primary"],
+          id: "u1",
+          name: "Sam",
+          email: "sam@example.com",
+        };
+      },
+      async create() {},
+      async put() {},
+      async update() {
+        throw new Error("write timeout");
+      },
+      async delete() {},
+      async query() {
+        return { documents: [], cursor: null };
+      },
+      async batchGet() {
+        return [];
+      },
+      async batchSet() {},
+      async batchDelete() {},
+      migration: {
+        async acquireLock() {
+          return null;
+        },
+        async releaseLock() {},
+        async getOutdated() {
+          return { documents: [], cursor: null };
+        },
+      },
+    };
+
+    const store = createStore(raceEngine, [buildUserV1()]);
+
+    try {
+      await store.user.update("u1", { name: "Samuel" });
+      throw new Error("expected update to fail");
+    } catch (error) {
+      expect(String(error)).toContain("write timeout");
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -718,6 +939,55 @@ describe("store.batchGet()", () => {
     const results = await store.user.batchGet(["u1", "missing"]);
 
     expect(results).toHaveLength(1);
+  });
+
+  test("delegates to engine.batchGet and does not fall back to per-key engine.get", async () => {
+    const calls: string[] = [];
+    const trackingEngine: QueryEngine<never> = {
+      async get() {
+        calls.push("get");
+        throw new Error("batchGet should not call engine.get");
+      },
+      async create() {},
+      async put() {},
+      async update() {},
+      async delete() {},
+      async query() {
+        return { documents: [], cursor: null };
+      },
+      async batchGet() {
+        calls.push("batchGet");
+        return [
+          {
+            key: "u1",
+            doc: {
+              __v: 1,
+              __indexes: ["byEmail", "primary"],
+              id: "u1",
+              name: "Sam",
+              email: "sam@example.com",
+            },
+          },
+        ];
+      },
+      async batchSet() {},
+      async batchDelete() {},
+      migration: {
+        async acquireLock() {
+          return null;
+        },
+        async releaseLock() {},
+        async getOutdated() {
+          return { documents: [], cursor: null };
+        },
+      },
+    };
+
+    const store = createStore(trackingEngine, [buildUserV1()]);
+    const results = await store.user.batchGet(["u1"]);
+
+    expect(results).toEqual([{ id: "u1", name: "Sam", email: "sam@example.com" }]);
+    expect(calls).toEqual(["batchGet"]);
   });
 });
 
@@ -846,6 +1116,51 @@ describe("store.batchSet()", () => {
     expect(store.thing.batchSet([{ data: { key: "a", value: "b" } } as any])).rejects.toThrow(
       "Invalid document key",
     );
+  });
+
+  test("delegates to engine.batchSet and does not fall back to per-item engine.put", async () => {
+    const calls: string[] = [];
+    const trackingEngine: QueryEngine<never> = {
+      async get() {
+        return null;
+      },
+      async create() {},
+      async put() {
+        calls.push("put");
+        throw new Error("batchSet should not call engine.put");
+      },
+      async update() {},
+      async delete() {},
+      async query() {
+        return { documents: [], cursor: null };
+      },
+      async batchGet() {
+        return [];
+      },
+      async batchSet() {
+        calls.push("batchSet");
+      },
+      async batchDelete() {},
+      migration: {
+        async acquireLock() {
+          return null;
+        },
+        async releaseLock() {},
+        async getOutdated() {
+          return { documents: [], cursor: null };
+        },
+      },
+    };
+
+    const store = createStore(trackingEngine, [buildUserV1()]);
+    await store.user.batchSet([
+      {
+        key: "u1",
+        data: { id: "u1", name: "Sam", email: "sam@example.com" },
+      },
+    ]);
+
+    expect(calls).toEqual(["batchSet"]);
   });
 });
 
@@ -1041,6 +1356,46 @@ describe("store.batchDelete()", () => {
     expect(store.user.batchDelete(["missing", "u1", "still-missing"])).resolves.toBeUndefined();
     expect(await store.user.findByKey("u1")).toBeNull();
   });
+
+  test("delegates to engine.batchDelete and does not fall back to per-key engine.delete", async () => {
+    const calls: string[] = [];
+    const trackingEngine: QueryEngine<never> = {
+      async get() {
+        return null;
+      },
+      async create() {},
+      async put() {},
+      async update() {},
+      async delete() {
+        calls.push("delete");
+        throw new Error("batchDelete should not call engine.delete");
+      },
+      async query() {
+        return { documents: [], cursor: null };
+      },
+      async batchGet() {
+        return [];
+      },
+      async batchSet() {},
+      async batchDelete() {
+        calls.push("batchDelete");
+      },
+      migration: {
+        async acquireLock() {
+          return null;
+        },
+        async releaseLock() {},
+        async getOutdated() {
+          return { documents: [], cursor: null };
+        },
+      },
+    };
+
+    const store = createStore(trackingEngine, [buildUserV1()]);
+    await store.user.batchDelete(["u1", "u2"]);
+
+    expect(calls).toEqual(["batchDelete"]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1086,6 +1441,45 @@ describe("lazy migration on findByKey", () => {
     expect(raw.firstName).toBe("Sam");
     expect(raw.lastName).toBe("Laycock");
     expect(raw.name).toBeUndefined();
+  });
+
+  test("uses engine.batchSet for lazy writeback", async () => {
+    const calls: { collection: string; items: unknown[] }[] = [];
+    const trackingEngine: QueryEngine<never> = {
+      async get() {
+        return { __v: 1, id: "u1", name: "Sam Laycock", email: "sam@example.com" };
+      },
+      async create() {},
+      async put() {},
+      async update() {},
+      async delete() {},
+      async query() {
+        return { documents: [], cursor: null };
+      },
+      async batchGet() {
+        return [];
+      },
+      async batchSet(collection, items) {
+        calls.push({ collection, items });
+      },
+      async batchDelete() {},
+      migration: {
+        async acquireLock() {
+          return null;
+        },
+        async releaseLock() {},
+        async getOutdated() {
+          return { documents: [], cursor: null };
+        },
+      },
+    };
+
+    const store = createStore(trackingEngine, [buildUserV2()]);
+    await store.user.findByKey("u1");
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.collection).toBe("user");
+    expect((calls[0]!.items[0] as { key: string }).key).toBe("u1");
   });
 
   test("auto-migrates v1 to v3 through entire chain", async () => {
@@ -1269,6 +1663,56 @@ describe("lazy migration on query", () => {
       email: "jane@example.com",
     });
   });
+
+  test("uses engine.batchSet for lazy writeback", async () => {
+    const calls: { collection: string; items: unknown[] }[] = [];
+    const trackingEngine: QueryEngine<never> = {
+      async get() {
+        return null;
+      },
+      async create() {},
+      async put() {},
+      async update() {},
+      async delete() {},
+      async query() {
+        return {
+          documents: [
+            {
+              key: "u1",
+              doc: { __v: 1, id: "u1", name: "Sam Laycock", email: "sam@example.com" },
+            },
+          ],
+          cursor: null,
+        };
+      },
+      async batchGet() {
+        return [];
+      },
+      async batchSet(collection, items) {
+        calls.push({ collection, items });
+      },
+      async batchDelete() {},
+      migration: {
+        async acquireLock() {
+          return null;
+        },
+        async releaseLock() {},
+        async getOutdated() {
+          return { documents: [], cursor: null };
+        },
+      },
+    };
+
+    const store = createStore(trackingEngine, [buildUserV2()]);
+    await store.user.query({
+      index: "byEmail",
+      filter: { value: "sam@example.com" },
+    });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.collection).toBe("user");
+    expect((calls[0]!.items[0] as { key: string }).key).toBe("u1");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1312,6 +1756,50 @@ describe("lazy migration on batchGet", () => {
     const raw2 = (await engine.get("user", "u2")) as Record<string, unknown>;
     expect(raw1.__v).toBe(2);
     expect(raw2.__v).toBe(2);
+  });
+
+  test("uses engine.batchSet for lazy writeback", async () => {
+    const calls: { collection: string; items: unknown[] }[] = [];
+    const trackingEngine: QueryEngine<never> = {
+      async get() {
+        return null;
+      },
+      async create() {},
+      async put() {},
+      async update() {},
+      async delete() {},
+      async query() {
+        return { documents: [], cursor: null };
+      },
+      async batchGet() {
+        return [
+          {
+            key: "u1",
+            doc: { __v: 1, id: "u1", name: "Sam Laycock", email: "sam@example.com" },
+          },
+        ];
+      },
+      async batchSet(collection, items) {
+        calls.push({ collection, items });
+      },
+      async batchDelete() {},
+      migration: {
+        async acquireLock() {
+          return null;
+        },
+        async releaseLock() {},
+        async getOutdated() {
+          return { documents: [], cursor: null };
+        },
+      },
+    };
+
+    const store = createStore(trackingEngine, [buildUserV2()]);
+    await store.user.batchGet(["u1"]);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.collection).toBe("user");
+    expect((calls[0]!.items[0] as { key: string }).key).toBe("u1");
   });
 });
 
@@ -1556,6 +2044,60 @@ describe("store.model.migrateAll()", () => {
       expect(raw.firstName).toBeDefined();
       expect(raw.name).toBeUndefined();
     }
+  });
+
+  test("uses engine.batchSet to persist migrated pages", async () => {
+    const batchSetCalls: { collection: string; items: unknown[] }[] = [];
+    const lock = { id: "lock-1", collection: "user", acquiredAt: Date.now() };
+    const trackingEngine: QueryEngine<never> = {
+      async get() {
+        return null;
+      },
+      async create() {},
+      async put() {},
+      async update() {},
+      async delete() {},
+      async query() {
+        return { documents: [], cursor: null };
+      },
+      async batchGet() {
+        return [];
+      },
+      async batchSet(collection, items) {
+        batchSetCalls.push({ collection, items });
+      },
+      async batchDelete() {},
+      migration: {
+        async acquireLock() {
+          return lock;
+        },
+        async releaseLock() {},
+        async getOutdated(_collection, _criteria, cursor) {
+          if (cursor) {
+            return { documents: [], cursor: null };
+          }
+
+          return {
+            documents: [
+              {
+                key: "u1",
+                doc: { __v: 1, id: "u1", name: "Sam Laycock", email: "sam@example.com" },
+              },
+            ],
+            cursor: null,
+          };
+        },
+      },
+    };
+
+    const store = createStore(trackingEngine, [buildUserV2()]);
+    const result = await store.user.migrateAll();
+
+    expect(result.status).toBe("completed");
+    expect(result.migrated).toBe(1);
+    expect(batchSetCalls).toHaveLength(1);
+    expect(batchSetCalls[0]!.collection).toBe("user");
+    expect((batchSetCalls[0]!.items[0] as { key: string }).key).toBe("u1");
   });
 
   test("skips documents already at latest version", async () => {
@@ -2793,39 +3335,6 @@ describe("edge case version values in store", () => {
 });
 
 // ---------------------------------------------------------------------------
-// batchGet on engine without batchGet support
-// ---------------------------------------------------------------------------
-
-describe("batchGet on unsupported engine", () => {
-  test("throws when engine does not support batchGet", async () => {
-    // Create a minimal engine without batchGet
-    const minimalEngine: QueryEngine<never> = {
-      async get() {
-        return null;
-      },
-      async put() {},
-      async delete() {},
-      async query() {
-        return { documents: [], cursor: null };
-      },
-      migration: {
-        async acquireLock() {
-          return null;
-        },
-        async releaseLock() {},
-        async getOutdated() {
-          return { documents: [], cursor: null };
-        },
-      },
-    };
-
-    const store = createStore(minimalEngine, [buildUserV1()]);
-
-    expect(store.user.batchGet(["u1"])).rejects.toThrow("Engine does not support batchGet");
-  });
-});
-
-// ---------------------------------------------------------------------------
 // Various data types as document fields (key is always explicit)
 // ---------------------------------------------------------------------------
 
@@ -2876,17 +3385,93 @@ describe("various data types with explicit keys", () => {
 // ---------------------------------------------------------------------------
 
 describe("engine options passthrough", () => {
-  test("findByKey passes options to engine.get", async () => {
-    const calls: unknown[] = [];
-    const trackingEngine: QueryEngine<{ trace: string }> = {
-      async get(_collection, _id, options) {
-        calls.push({ method: "get", options });
+  function buildTrackingEngine(
+    calls: unknown[],
+    methods: {
+      get?: (_collection: string, _id: string, options?: { trace: string }) => Promise<unknown>;
+      create?: (
+        _collection: string,
+        _id: string,
+        _doc: unknown,
+        _indexes: Record<string, string>,
+        options?: { trace: string },
+      ) => Promise<void>;
+      update?: (
+        _collection: string,
+        _id: string,
+        _doc: unknown,
+        _indexes: Record<string, string>,
+        options?: { trace: string },
+      ) => Promise<void>;
+      delete?: (_collection: string, _id: string, options?: { trace: string }) => Promise<void>;
+      query?: (
+        _collection: string,
+        _params: unknown,
+        options?: { trace: string },
+      ) => Promise<{
+        documents: [];
+        cursor: null;
+      }>;
+      batchGet?: (_collection: string, _ids: string[], options?: { trace: string }) => Promise<[]>;
+      batchSet?: (
+        _collection: string,
+        _items: unknown[],
+        options?: { trace: string },
+      ) => Promise<void>;
+      batchDelete?: (
+        _collection: string,
+        _ids: string[],
+        options?: { trace: string },
+      ) => Promise<void>;
+    } = {},
+  ): QueryEngine<{ trace: string }> {
+    return {
+      async get(collection, id, options) {
+        if (methods.get) {
+          return methods.get(collection, id, options);
+        }
+
         return null;
       },
+      async create(collection, id, doc, indexes, options) {
+        if (methods.create) {
+          await methods.create(collection, id, doc, indexes, options);
+        }
+      },
       async put() {},
-      async delete() {},
-      async query() {
+      async update(collection, id, doc, indexes, options) {
+        if (methods.update) {
+          await methods.update(collection, id, doc, indexes, options);
+        }
+      },
+      async delete(collection, id, options) {
+        if (methods.delete) {
+          await methods.delete(collection, id, options);
+        }
+      },
+      async query(collection, params, options) {
+        if (methods.query) {
+          return methods.query(collection, params, options);
+        }
+
         return { documents: [], cursor: null };
+      },
+      async batchGet(collection, ids, options) {
+        if (methods.batchGet) {
+          return methods.batchGet(collection, ids, options);
+        }
+
+        return [];
+      },
+      async batchSet(collection, items, options) {
+        if (methods.batchSet) {
+          await methods.batchSet(collection, items, options);
+        }
+      },
+      async batchDelete(collection, ids, options) {
+        if (methods.batchDelete) {
+          await methods.batchDelete(collection, ids, options);
+        }
       },
       migration: {
         async acquireLock() {
@@ -2898,6 +3483,16 @@ describe("engine options passthrough", () => {
         },
       },
     };
+  }
+
+  test("findByKey passes options to engine.get", async () => {
+    const calls: unknown[] = [];
+    const trackingEngine = buildTrackingEngine(calls, {
+      async get(_collection, _id, options) {
+        calls.push({ method: "get", options });
+        return null;
+      },
+    });
 
     const store = createStore(trackingEngine, [buildUserV1()]);
     await store.user.findByKey("u1", { trace: "test-trace" });
@@ -2906,29 +3501,40 @@ describe("engine options passthrough", () => {
     expect((calls[0] as any).options).toEqual({ trace: "test-trace" });
   });
 
-  test("create passes options to engine.put", async () => {
+  test("findByKey lazy writeback passes options to engine.batchSet", async () => {
     const calls: unknown[] = [];
-    const trackingEngine: QueryEngine<{ trace: string }> = {
-      async get() {
-        return null;
+    const trackingEngine = buildTrackingEngine(calls, {
+      async get(_collection, _id, options) {
+        calls.push({ method: "get", options });
+        return {
+          __v: 1,
+          __indexes: ["byEmail", "primary"],
+          id: "u1",
+          name: "Sam Laycock",
+          email: "sam@example.com",
+        };
       },
-      async put(_collection, _id, _doc, _indexes, options) {
-        calls.push({ method: "put", options });
+      async batchSet(_collection, items, options) {
+        calls.push({ method: "batchSet", options, items: items.length });
       },
-      async delete() {},
-      async query() {
-        return { documents: [], cursor: null };
+    });
+
+    const store = createStore(trackingEngine, [buildUserV2()]);
+    await store.user.findByKey("u1", { trace: "lazy-writeback-trace" });
+
+    expect(calls).toHaveLength(2);
+    expect((calls[0] as any).options).toEqual({ trace: "lazy-writeback-trace" });
+    expect((calls[1] as any).options).toEqual({ trace: "lazy-writeback-trace" });
+    expect((calls[1] as any).items).toBe(1);
+  });
+
+  test("create passes options to engine.create", async () => {
+    const calls: unknown[] = [];
+    const trackingEngine = buildTrackingEngine(calls, {
+      async create(_collection, _id, _doc, _indexes, options) {
+        calls.push({ method: "create", options });
       },
-      migration: {
-        async acquireLock() {
-          return null;
-        },
-        async releaseLock() {},
-        async getOutdated() {
-          return { documents: [], cursor: null };
-        },
-      },
-    };
+    });
 
     const store = createStore(trackingEngine, [buildUserV1()]);
     await store.user.create(
@@ -2941,29 +3547,63 @@ describe("engine options passthrough", () => {
     expect((calls[0] as any).options).toEqual({ trace: "create-trace" });
   });
 
+  test("update passes options to engine.update", async () => {
+    const calls: unknown[] = [];
+    const trackingEngine = buildTrackingEngine(calls, {
+      async get() {
+        return {
+          __v: 1,
+          __indexes: ["primary", "byEmail"],
+          id: "u1",
+          name: "Sam",
+          email: "sam@example.com",
+        };
+      },
+      async update(_collection, _id, _doc, _indexes, options) {
+        calls.push({ method: "update", options });
+      },
+    });
+
+    const store = createStore(trackingEngine, [buildUserV1()]);
+    await store.user.update("u1", { name: "Sam Updated" }, { trace: "update-trace" });
+
+    expect(calls).toHaveLength(1);
+    expect((calls[0] as any).options).toEqual({ trace: "update-trace" });
+  });
+
+  test("update passes options to both engine.get and engine.update", async () => {
+    const calls: unknown[] = [];
+    const trackingEngine = buildTrackingEngine(calls, {
+      async get(_collection, _id, options) {
+        calls.push({ method: "get", options });
+        return {
+          __v: 1,
+          __indexes: ["primary", "byEmail"],
+          id: "u1",
+          name: "Sam",
+          email: "sam@example.com",
+        };
+      },
+      async update(_collection, _id, _doc, _indexes, options) {
+        calls.push({ method: "update", options });
+      },
+    });
+
+    const store = createStore(trackingEngine, [buildUserV1()]);
+    await store.user.update("u1", { name: "Sam Updated" }, { trace: "update-trace-2" });
+
+    expect(calls).toHaveLength(2);
+    expect((calls[0] as any).options).toEqual({ trace: "update-trace-2" });
+    expect((calls[1] as any).options).toEqual({ trace: "update-trace-2" });
+  });
+
   test("delete passes options to engine.delete", async () => {
     const calls: unknown[] = [];
-    const trackingEngine: QueryEngine<{ trace: string }> = {
-      async get() {
-        return null;
-      },
-      async put() {},
+    const trackingEngine = buildTrackingEngine(calls, {
       async delete(_collection, _id, options) {
         calls.push({ method: "delete", options });
       },
-      async query() {
-        return { documents: [], cursor: null };
-      },
-      migration: {
-        async acquireLock() {
-          return null;
-        },
-        async releaseLock() {},
-        async getOutdated() {
-          return { documents: [], cursor: null };
-        },
-      },
-    };
+    });
 
     const store = createStore(trackingEngine, [buildUserV1()]);
     await store.user.delete("u1", { trace: "delete-trace" });
@@ -2974,26 +3614,12 @@ describe("engine options passthrough", () => {
 
   test("query passes options to engine.query", async () => {
     const calls: unknown[] = [];
-    const trackingEngine: QueryEngine<{ trace: string }> = {
-      async get() {
-        return null;
-      },
-      async put() {},
-      async delete() {},
+    const trackingEngine = buildTrackingEngine(calls, {
       async query(_collection, _params, options) {
         calls.push({ method: "query", options });
         return { documents: [], cursor: null };
       },
-      migration: {
-        async acquireLock() {
-          return null;
-        },
-        async releaseLock() {},
-        async getOutdated() {
-          return { documents: [], cursor: null };
-        },
-      },
-    };
+    });
 
     const store = createStore(trackingEngine, [buildUserV1()]);
     await store.user.query(
@@ -3007,28 +3633,11 @@ describe("engine options passthrough", () => {
 
   test("batchSet passes options to engine.batchSet when available", async () => {
     const calls: unknown[] = [];
-    const trackingEngine: QueryEngine<{ trace: string }> = {
-      async get() {
-        return null;
-      },
-      async put() {},
-      async delete() {},
-      async query() {
-        return { documents: [], cursor: null };
-      },
+    const trackingEngine = buildTrackingEngine(calls, {
       async batchSet(_collection, items, options) {
         calls.push({ method: "batchSet", options, items: items.length });
       },
-      migration: {
-        async acquireLock() {
-          return null;
-        },
-        async releaseLock() {},
-        async getOutdated() {
-          return { documents: [], cursor: null };
-        },
-      },
-    };
+    });
 
     const store = createStore(trackingEngine, [buildUserV1()]);
     await store.user.batchSet(
@@ -3050,74 +3659,29 @@ describe("engine options passthrough", () => {
     expect((calls[0] as any).items).toBe(2);
   });
 
-  test("batchSet falls back to engine.put and passes options", async () => {
+  test("batchGet passes options to engine.batchGet", async () => {
     const calls: unknown[] = [];
-    const trackingEngine: QueryEngine<{ trace: string }> = {
-      async get() {
-        return null;
+    const trackingEngine = buildTrackingEngine(calls, {
+      async batchGet(_collection, _ids, options) {
+        calls.push({ method: "batchGet", options });
+        return [];
       },
-      async put(_collection, _id, _doc, _indexes, options) {
-        calls.push({ method: "put", options });
-      },
-      async delete() {},
-      async query() {
-        return { documents: [], cursor: null };
-      },
-      migration: {
-        async acquireLock() {
-          return null;
-        },
-        async releaseLock() {},
-        async getOutdated() {
-          return { documents: [], cursor: null };
-        },
-      },
-    };
+    });
 
     const store = createStore(trackingEngine, [buildUserV1()]);
-    await store.user.batchSet(
-      [
-        {
-          key: "u1",
-          data: { id: "u1", name: "Sam", email: "sam@example.com" },
-        },
-        {
-          key: "u2",
-          data: { id: "u2", name: "Jane", email: "jane@example.com" },
-        },
-      ],
-      { trace: "batch-set-fallback" },
-    );
+    await store.user.batchGet(["u1", "u2"], { trace: "batch-get-trace" });
 
-    expect(calls).toHaveLength(2);
-    expect((calls[0] as any).options).toEqual({ trace: "batch-set-fallback" });
-    expect((calls[1] as any).options).toEqual({ trace: "batch-set-fallback" });
+    expect(calls).toHaveLength(1);
+    expect((calls[0] as any).options).toEqual({ trace: "batch-get-trace" });
   });
 
   test("batchDelete passes options to engine.batchDelete when available", async () => {
     const calls: unknown[] = [];
-    const trackingEngine: QueryEngine<{ trace: string }> = {
-      async get() {
-        return null;
-      },
-      async put() {},
-      async delete() {},
-      async query() {
-        return { documents: [], cursor: null };
-      },
+    const trackingEngine = buildTrackingEngine(calls, {
       async batchDelete(_collection, ids, options) {
         calls.push({ method: "batchDelete", options, ids: ids.length });
       },
-      migration: {
-        async acquireLock() {
-          return null;
-        },
-        async releaseLock() {},
-        async getOutdated() {
-          return { documents: [], cursor: null };
-        },
-      },
-    };
+    });
 
     const store = createStore(trackingEngine, [buildUserV1()]);
     await store.user.batchDelete(["u1", "u2"], { trace: "batch-delete-trace" });
@@ -3125,44 +3689,6 @@ describe("engine options passthrough", () => {
     expect(calls).toHaveLength(1);
     expect((calls[0] as any).options).toEqual({ trace: "batch-delete-trace" });
     expect((calls[0] as any).ids).toBe(2);
-  });
-
-  test("batchDelete falls back to engine.delete and passes options", async () => {
-    const calls: unknown[] = [];
-    const trackingEngine: QueryEngine<{ trace: string }> = {
-      async get() {
-        return null;
-      },
-      async put() {},
-      async delete(_collection, _id, options) {
-        calls.push({ method: "delete", options });
-      },
-      async query() {
-        return { documents: [], cursor: null };
-      },
-      migration: {
-        async acquireLock() {
-          return null;
-        },
-        async releaseLock() {},
-        async getOutdated() {
-          return { documents: [], cursor: null };
-        },
-      },
-    };
-
-    const store = createStore(trackingEngine, [buildUserV1()]);
-    await store.user.batchDelete(["u1", "u2"], {
-      trace: "batch-delete-fallback",
-    });
-
-    expect(calls).toHaveLength(2);
-    expect((calls[0] as any).options).toEqual({
-      trace: "batch-delete-fallback",
-    });
-    expect((calls[1] as any).options).toEqual({
-      trace: "batch-delete-fallback",
-    });
   });
 });
 

@@ -298,23 +298,28 @@ const User = model("user", {
 
 Required methods:
 
-- `get`, `put`, `delete`, `query`
+- `get`, `create`, `put`, `update`, `delete`, `query`
 - Migration: `acquireLock`, `releaseLock`, `getOutdated`
+
+Required batch methods:
+
+- `batchGet`, `batchSet`, `batchDelete`
 
 Optional methods:
 
-- `batchGet`, `batchSet`, `batchDelete`
 - Migration checkpoints: `saveCheckpoint`, `loadCheckpoint`, `clearCheckpoint`
 - Migration status: `getStatus`
 - `getOutdated` criteria can receive custom `parseVersion` / `compareVersions` callbacks.
+- `create` should be atomic and throw `EngineDocumentAlreadyExistsError` when the key already exists.
+- `update` should throw `EngineDocumentNotFoundError` when the key does not exist.
 
 See `dist/index.d.ts` and `dist/engines/memory.d.ts` for full signatures.
 
 ## Notes
 
 - `create` and `batchSet` require explicit string keys (the `key` parameter is the storage key, distinct from any `id` field in your data).
-- `create` throws if the key already exists (`DocumentAlreadyExistsError`).
-- `batchGet` requires engine support for `batchGet`; `batchSet`/`batchDelete` fall back to per-item writes/deletes if adapter methods are not implemented.
+- `create` throws if the key already exists (`DocumentAlreadyExistsError`), based on the adapter's atomic `engine.create` behavior.
+- `batchGet`, `batchSet`, and `batchDelete` are required adapter methods.
 - Query comparisons are lexicographic (index values are stored as strings).
 - Adding a new schema version resets builder indexes; re-add indexes for the latest shape.
 - `create`, `batchSet`, and `update` validate against the latest schema.

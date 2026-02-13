@@ -1,15 +1,17 @@
 import type Database from "better-sqlite3";
-import type {
-  AcquireLockOptions,
-  ComparableVersion,
-  EngineQueryResult,
-  FieldCondition,
-  KeyedDocument,
-  MigrationCriteria,
-  MigrationLock,
-  QueryEngine,
-  QueryParams,
-  ResolvedIndexKeys,
+import {
+  EngineDocumentAlreadyExistsError,
+  EngineDocumentNotFoundError,
+  type AcquireLockOptions,
+  type ComparableVersion,
+  type EngineQueryResult,
+  type FieldCondition,
+  type KeyedDocument,
+  type MigrationCriteria,
+  type MigrationLock,
+  type QueryEngine,
+  type QueryParams,
+  type ResolvedIndexKeys,
 } from "./types";
 
 const LATEST_SCHEMA_VERSION = 1;
@@ -73,9 +75,19 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
       doc_json = excluded.doc_json
   `);
 
+  const insertDocumentStmt = db.prepare<[string, string, string]>(
+    `INSERT INTO documents (collection, doc_key, doc_json) VALUES (?, ?, ?)`,
+  );
+
   const deleteDocumentStmt = db.prepare<[string, string]>(
     `DELETE FROM documents WHERE collection = ? AND doc_key = ?`,
   );
+
+  const updateDocumentStmt = db.prepare<[string, string, string]>(`
+    UPDATE documents
+    SET doc_json = ?
+    WHERE collection = ? AND doc_key = ?
+  `);
 
   const deleteIndexesForDocumentStmt = db.prepare<[string, string]>(
     `DELETE FROM index_entries WHERE collection = ? AND doc_key = ?`,
@@ -162,6 +174,33 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
     },
   );
 
+  const updateTxn = db.transaction(
+    (collection: string, key: string, docJson: string, indexes: ResolvedIndexKeys) => {
+      const result = updateDocumentStmt.run(docJson, collection, key) as { changes?: unknown };
+      const changes = Number(result?.changes ?? 0);
+
+      if (!Number.isFinite(changes) || changes < 1) {
+        throw new EngineDocumentNotFoundError(collection, key);
+      }
+
+      deleteIndexesForDocumentStmt.run(collection, key);
+
+      for (const [indexName, indexValue] of Object.entries(indexes)) {
+        insertIndexStmt.run(collection, key, indexName, String(indexValue));
+      }
+    },
+  );
+
+  const createTxn = db.transaction(
+    (collection: string, key: string, docJson: string, indexes: ResolvedIndexKeys) => {
+      insertDocumentStmt.run(collection, key, docJson);
+
+      for (const [indexName, indexValue] of Object.entries(indexes)) {
+        insertIndexStmt.run(collection, key, indexName, String(indexValue));
+      }
+    },
+  );
+
   const batchSetTxn = db.transaction(
     (
       collection: string,
@@ -230,10 +269,29 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
       return parseStoredDocument(row.doc_json, collection, key);
     },
 
+    async create(collection, key, doc, indexes) {
+      const docJson = serializeDocument(doc, collection, key);
+
+      try {
+        createTxn(collection, key, docJson, indexes);
+      } catch (error) {
+        if (isSqliteUniqueConstraintError(error)) {
+          throw new EngineDocumentAlreadyExistsError(collection, key);
+        }
+
+        throw error;
+      }
+    },
+
     async put(collection, key, doc, indexes) {
       const docJson = serializeDocument(doc, collection, key);
 
       putTxn(collection, key, docJson, indexes);
+    },
+
+    async update(collection, key, doc, indexes) {
+      const docJson = serializeDocument(doc, collection, key);
+      updateTxn(collection, key, docJson, indexes);
     },
 
     async delete(collection, key) {
@@ -552,6 +610,23 @@ function serializeDocument(doc: unknown, collection: string, key: string): strin
   }
 
   return encoded;
+}
+
+function isSqliteUniqueConstraintError(error: unknown): boolean {
+  if (typeof error === "object" && error !== null) {
+    const code = (error as { code?: unknown }).code;
+
+    if (typeof code === "string" && code.startsWith("SQLITE_CONSTRAINT")) {
+      return true;
+    }
+  }
+
+  const message = error instanceof Error ? error.message : String(error);
+
+  return (
+    message.includes("UNIQUE constraint failed") ||
+    message.includes("PRIMARY KEY constraint failed")
+  );
 }
 
 function parseStoredDocument(encoded: string, collection: string, key: string): unknown {

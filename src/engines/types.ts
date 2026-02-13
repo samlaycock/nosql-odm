@@ -15,6 +15,38 @@ export interface BatchSetItem {
   indexes: ResolvedIndexKeys;
 }
 
+/**
+ * Engine-level duplicate-key error used by create() to signal that the
+ * storage key already exists in the collection.
+ */
+export class EngineDocumentAlreadyExistsError extends Error {
+  readonly collection: string;
+  readonly key: string;
+
+  constructor(collection: string, key: string) {
+    super(`Document "${key}" already exists in model "${collection}"`);
+    this.name = "EngineDocumentAlreadyExistsError";
+    this.collection = collection;
+    this.key = key;
+  }
+}
+
+/**
+ * Engine-level missing-key error used by update() to signal that the
+ * storage key does not exist in the collection.
+ */
+export class EngineDocumentNotFoundError extends Error {
+  readonly collection: string;
+  readonly key: string;
+
+  constructor(collection: string, key: string) {
+    super(`Document "${key}" not found in model "${collection}"`);
+    this.name = "EngineDocumentNotFoundError";
+    this.collection = collection;
+    this.key = key;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Query
 // ---------------------------------------------------------------------------
@@ -122,7 +154,31 @@ export interface MigrationStatus {
 export interface QueryEngine<TOptions = Record<string, unknown>> {
   get(collection: string, key: string, options?: TOptions): Promise<unknown>;
 
+  /**
+   * Creates a new document. Must reject with EngineDocumentAlreadyExistsError
+   * when the key already exists.
+   */
+  create(
+    collection: string,
+    key: string,
+    doc: unknown,
+    indexes: ResolvedIndexKeys,
+    options?: TOptions,
+  ): Promise<void>;
+
   put(
+    collection: string,
+    key: string,
+    doc: unknown,
+    indexes: ResolvedIndexKeys,
+    options?: TOptions,
+  ): Promise<void>;
+
+  /**
+   * Updates an existing document. Must reject with EngineDocumentNotFoundError
+   * when the key does not exist.
+   */
+  update(
     collection: string,
     key: string,
     doc: unknown,
@@ -134,9 +190,9 @@ export interface QueryEngine<TOptions = Record<string, unknown>> {
 
   query(collection: string, params: QueryParams, options?: TOptions): Promise<EngineQueryResult>;
 
-  batchGet?(collection: string, keys: string[], options?: TOptions): Promise<KeyedDocument[]>;
-  batchSet?(collection: string, items: BatchSetItem[], options?: TOptions): Promise<void>;
-  batchDelete?(collection: string, keys: string[], options?: TOptions): Promise<void>;
+  batchGet(collection: string, keys: string[], options?: TOptions): Promise<KeyedDocument[]>;
+  batchSet(collection: string, items: BatchSetItem[], options?: TOptions): Promise<void>;
+  batchDelete(collection: string, keys: string[], options?: TOptions): Promise<void>;
 
   migration: {
     /**
