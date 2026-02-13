@@ -444,13 +444,13 @@ bun run test:integration:firestore
 
 Start MySQL:
 
-```bash
+````bash
 bun run services:up:mysql
 Start Postgres:
 
 ```bash
 bun run services:up:postgres
-```
+````
 
 Stop it:
 
