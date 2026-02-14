@@ -688,15 +688,23 @@ async function replaceIndexes(
 }
 
 async function ensureSchema(client: PostgresQueryableLike, refs: TableRefs): Promise<void> {
+  const session = await acquireSession(client);
+  const lockKey = toAdvisoryLockKey(
+    `${refs.schema}|${refs.documentsTable}|${refs.indexesTable}|${refs.migrationLocksTable}|${refs.migrationCheckpointsTable}`,
+  );
+
+  await session.query(`SELECT pg_advisory_lock($1)`, [lockKey]);
+
+  try {
   const documentsCollectionIdIndex = quoteIdentifier(
     createIndexName(refs.documentsTable, "collection_id_idx"),
   );
   const indexesLookupIndex = quoteIdentifier(createIndexName(refs.indexesTable, "lookup_idx"));
   const indexesScanIndex = quoteIdentifier(createIndexName(refs.indexesTable, "scan_idx"));
 
-  await client.query(`CREATE SCHEMA IF NOT EXISTS ${refs.schema}`);
+    await session.query(`CREATE SCHEMA IF NOT EXISTS ${refs.schema}`);
 
-  await client.query(`
+    await session.query(`
     CREATE TABLE IF NOT EXISTS ${refs.documentsTable} (
       id BIGSERIAL NOT NULL,
       collection TEXT NOT NULL,
@@ -706,11 +714,11 @@ async function ensureSchema(client: PostgresQueryableLike, refs: TableRefs): Pro
     )
   `);
 
-  await client.query(
-    `CREATE INDEX IF NOT EXISTS ${documentsCollectionIdIndex} ON ${refs.documentsTable} (collection, id)`,
-  );
+    await session.query(
+      `CREATE INDEX IF NOT EXISTS ${documentsCollectionIdIndex} ON ${refs.documentsTable} (collection, id)`,
+    );
 
-  await client.query(`
+    await session.query(`
     CREATE TABLE IF NOT EXISTS ${refs.indexesTable} (
       collection TEXT NOT NULL,
       doc_key TEXT NOT NULL,
@@ -723,14 +731,14 @@ async function ensureSchema(client: PostgresQueryableLike, refs: TableRefs): Pro
     )
   `);
 
-  await client.query(
-    `CREATE INDEX IF NOT EXISTS ${indexesLookupIndex} ON ${refs.indexesTable} (collection, index_name, index_value, doc_key)`,
-  );
-  await client.query(
-    `CREATE INDEX IF NOT EXISTS ${indexesScanIndex} ON ${refs.indexesTable} (collection, index_name, doc_key)`,
-  );
+    await session.query(
+      `CREATE INDEX IF NOT EXISTS ${indexesLookupIndex} ON ${refs.indexesTable} (collection, index_name, index_value, doc_key)`,
+    );
+    await session.query(
+      `CREATE INDEX IF NOT EXISTS ${indexesScanIndex} ON ${refs.indexesTable} (collection, index_name, doc_key)`,
+    );
 
-  await client.query(`
+    await session.query(`
     CREATE TABLE IF NOT EXISTS ${refs.migrationLocksTable} (
       collection TEXT PRIMARY KEY,
       lock_id TEXT NOT NULL,
@@ -738,12 +746,19 @@ async function ensureSchema(client: PostgresQueryableLike, refs: TableRefs): Pro
     )
   `);
 
-  await client.query(`
+    await session.query(`
     CREATE TABLE IF NOT EXISTS ${refs.migrationCheckpointsTable} (
       collection TEXT PRIMARY KEY,
       cursor TEXT NOT NULL
     )
   `);
+  } finally {
+    try {
+      await session.query(`SELECT pg_advisory_unlock($1)`, [lockKey]);
+    } finally {
+      session.release?.();
+    }
+  }
 }
 
 async function withTransaction<T>(
@@ -786,6 +801,18 @@ async function acquireSession(
 interface SqlBuilder {
   values: (string | number)[];
   push(value: string | number): string;
+}
+
+function toAdvisoryLockKey(value: string): number {
+  // FNV-1a 32-bit hash for a stable advisory-lock key.
+  let hash = 2166136261;
+
+  for (let i = 0; i < value.length; i++) {
+    hash ^= value.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+
+  return hash | 0;
 }
 
 function createSqlBuilder(): SqlBuilder {
