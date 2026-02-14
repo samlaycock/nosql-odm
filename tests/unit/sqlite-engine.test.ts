@@ -90,7 +90,7 @@ describe("sqlite setup", () => {
       const versionRow = setupEngine.db.prepare(`PRAGMA user_version`).get() as {
         user_version?: unknown;
       };
-      expect(Number(versionRow.user_version)).toBe(1);
+      expect(Number(versionRow.user_version)).toBe(2);
 
       const tables = new Set(
         (
@@ -108,6 +108,7 @@ describe("sqlite setup", () => {
 
       expect(tables.has("documents")).toBe(true);
       expect(tables.has("index_entries")).toBe(true);
+      expect(tables.has("migration_metadata")).toBe(true);
       expect(tables.has("migration_locks")).toBe(true);
       expect(tables.has("migration_checkpoints")).toBe(true);
     } finally {
@@ -149,6 +150,7 @@ describe("sqlite setup", () => {
         collection TEXT NOT NULL,
         doc_key TEXT NOT NULL,
         doc_json TEXT NOT NULL,
+        write_version INTEGER NOT NULL DEFAULT 1,
         UNIQUE (collection, doc_key)
       );
 
@@ -183,7 +185,19 @@ describe("sqlite setup", () => {
         cursor TEXT NOT NULL
       );
 
-      PRAGMA user_version = 1;
+      CREATE TABLE IF NOT EXISTS migration_metadata (
+        collection TEXT NOT NULL,
+        doc_key TEXT NOT NULL,
+        target_version INTEGER NULL,
+        version_state TEXT NULL,
+        index_signature TEXT NULL,
+        PRIMARY KEY (collection, doc_key),
+        FOREIGN KEY (collection, doc_key)
+          REFERENCES documents (collection, doc_key)
+          ON DELETE CASCADE
+      );
+
+      PRAGMA user_version = 2;
     `);
 
     const migratedEngine = sqliteEngine({
@@ -607,6 +621,70 @@ describe("batchSet()", () => {
     };
 
     expect(stored.nested.value).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// batchSetWithResult
+// ---------------------------------------------------------------------------
+
+describe("batchSetWithResult()", () => {
+  test("skips stale migration writes when document changed concurrently", async () => {
+    await engine.put(
+      "users",
+      "u1",
+      { __v: 1, __indexes: ["primary"], id: "u1", name: "Before", email: "before@example.com" },
+      { primary: "u1" },
+    );
+
+    const outdated = await engine.migration.getOutdated("users", {
+      version: 2,
+      versionField: "__v",
+      indexes: ["primary"],
+      indexesField: "__indexes",
+    });
+    const token = outdated.documents[0]?.writeToken;
+
+    expect(typeof token).toBe("string");
+
+    await engine.update(
+      "users",
+      "u1",
+      {
+        __v: 1,
+        __indexes: ["primary"],
+        id: "u1",
+        name: "Concurrent",
+        email: "concurrent@example.com",
+      },
+      { primary: "u1" },
+    );
+
+    const result = await engine.batchSetWithResult!("users", [
+      {
+        key: "u1",
+        doc: {
+          __v: 2,
+          __indexes: ["primary"],
+          id: "u1",
+          firstName: "Before",
+          lastName: "",
+          email: "before@example.com",
+        },
+        indexes: { primary: "u1" },
+        expectedWriteToken: token,
+      },
+    ]);
+
+    expect(result.persistedKeys).toEqual([]);
+    expect(result.conflictedKeys).toEqual(["u1"]);
+    expect(await engine.get("users", "u1")).toEqual({
+      __v: 1,
+      __indexes: ["primary"],
+      id: "u1",
+      name: "Concurrent",
+      email: "concurrent@example.com",
+    });
   });
 });
 
