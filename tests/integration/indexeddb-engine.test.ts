@@ -6,12 +6,14 @@ import {
   EngineDocumentNotFoundError,
   type ComparableVersion,
 } from "../../src/engines/types";
-import { createTestResourceName, expectReject } from "./helpers";
+import { createCollectionNameFactory, createTestResourceName, expectReject } from "./helpers";
+import { runMigrationIntegrationSuite } from "./migration-suite";
 
 let engine: IndexedDbQueryEngine;
 let databaseNameCounter = 0;
 let currentDatabaseName = "";
 const databaseNameBase = createTestResourceName("nosql_odm_indexeddb_test");
+const nextCollection = createCollectionNameFactory();
 type IndexedDbFactory = NonNullable<NonNullable<Parameters<typeof indexedDbEngine>[0]>["factory"]>;
 type RawHandler = ((event: unknown) => void) | null;
 
@@ -64,6 +66,12 @@ beforeEach(() => {
 
 afterEach(async () => {
   await engine.deleteDatabase();
+});
+
+runMigrationIntegrationSuite({
+  engineName: "indexedDbEngine integration",
+  getEngine: () => engine,
+  nextCollection,
 });
 
 async function openRawDatabase(databaseName: string): Promise<RawDatabase> {

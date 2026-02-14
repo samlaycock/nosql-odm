@@ -8,11 +8,39 @@
  */
 export type ResolvedIndexKeys = Record<string, string>;
 export type ComparableVersion = string | number;
+export type MigrationVersionState = "current" | "stale" | "ahead" | "unknown";
+
+export interface MigrationDocumentMetadata {
+  /**
+   * The schema version this state was evaluated against.
+   */
+  targetVersion: number;
+  /**
+   * Version state relative to targetVersion.
+   */
+  versionState: MigrationVersionState;
+  /**
+   * Canonical signature of stored index names for the document.
+   */
+  indexSignature: string | null;
+}
 
 export interface BatchSetItem {
   key: string;
   doc: unknown;
   indexes: ResolvedIndexKeys;
+  migrationMetadata?: MigrationDocumentMetadata;
+  /**
+   * Optional optimistic-write token captured when the document was read.
+   * Engines that support conditional writes can use this to avoid clobbering
+   * concurrent updates.
+   */
+  expectedWriteToken?: string;
+}
+
+export interface BatchSetResult {
+  persistedKeys: string[];
+  conflictedKeys: string[];
 }
 
 /**
@@ -95,6 +123,10 @@ export type WhereFilter = Record<string, string | number | FieldCondition>;
 export interface KeyedDocument {
   key: string;
   doc: unknown;
+  /**
+   * Optional engine-specific optimistic-write token for conditional updates.
+   */
+  writeToken?: string;
 }
 
 /**
@@ -164,6 +196,7 @@ export interface QueryEngine<TOptions = Record<string, unknown>> {
     doc: unknown,
     indexes: ResolvedIndexKeys,
     options?: TOptions,
+    migrationMetadata?: MigrationDocumentMetadata,
   ): Promise<void>;
 
   put(
@@ -172,6 +205,7 @@ export interface QueryEngine<TOptions = Record<string, unknown>> {
     doc: unknown,
     indexes: ResolvedIndexKeys,
     options?: TOptions,
+    migrationMetadata?: MigrationDocumentMetadata,
   ): Promise<void>;
 
   /**
@@ -184,6 +218,7 @@ export interface QueryEngine<TOptions = Record<string, unknown>> {
     doc: unknown,
     indexes: ResolvedIndexKeys,
     options?: TOptions,
+    migrationMetadata?: MigrationDocumentMetadata,
   ): Promise<void>;
 
   delete(collection: string, key: string, options?: TOptions): Promise<void>;
@@ -192,6 +227,11 @@ export interface QueryEngine<TOptions = Record<string, unknown>> {
 
   batchGet(collection: string, keys: string[], options?: TOptions): Promise<KeyedDocument[]>;
   batchSet(collection: string, items: BatchSetItem[], options?: TOptions): Promise<void>;
+  batchSetWithResult?(
+    collection: string,
+    items: BatchSetItem[],
+    options?: TOptions,
+  ): Promise<BatchSetResult>;
   batchDelete(collection: string, keys: string[], options?: TOptions): Promise<void>;
 
   migration: {
@@ -226,4 +266,6 @@ export interface QueryEngine<TOptions = Record<string, unknown>> {
      */
     getStatus?(collection: string): Promise<MigrationStatus | null>;
   };
+
+  migrator?: import("../migrator").Migrator<TOptions>;
 }

@@ -15,6 +15,7 @@ import {
   type ComparableVersion,
 } from "../../src/engines/types";
 import { createCollectionNameFactory, createTestResourceName, expectReject } from "./helpers";
+import { runMigrationIntegrationSuite } from "./migration-suite";
 
 const host = process.env.MYSQL_HOST ?? "127.0.0.1";
 const port = Number(process.env.MYSQL_PORT ?? "3306");
@@ -23,8 +24,9 @@ const password = process.env.MYSQL_PASSWORD ?? "root";
 const adminDatabase = process.env.MYSQL_ADMIN_DATABASE ?? "mysql";
 const databaseName =
   process.env.MYSQL_TEST_DATABASE ?? createSqlIdentifier(createTestResourceName("nosql_odm_test"));
-const connectAttemptsRaw = Number(process.env.MYSQL_CONNECT_ATTEMPTS ?? "90");
-const connectDelayMsRaw = Number(process.env.MYSQL_CONNECT_DELAY_MS ?? "1000");
+const isCi = process.env.CI === "true";
+const connectAttemptsRaw = Number(process.env.MYSQL_CONNECT_ATTEMPTS ?? (isCi ? "180" : "90"));
+const connectDelayMsRaw = Number(process.env.MYSQL_CONNECT_DELAY_MS ?? (isCi ? "1500" : "1000"));
 
 let adminPool: Pool | null = null;
 let pool: Pool | null = null;
@@ -32,7 +34,7 @@ let engine: MySqlQueryEngine;
 let collection = "";
 const nextCollection = createCollectionNameFactory();
 
-setDefaultTimeout(120_000);
+setDefaultTimeout(isCi ? 300_000 : 120_000);
 
 function quoteIdentifier(value: string): string {
   return `\`${value.replace(/`/g, "``")}\``;
@@ -141,6 +143,12 @@ describe("mySqlEngine integration", () => {
     });
   });
 
+  runMigrationIntegrationSuite({
+    engineName: "mySqlEngine integration",
+    getEngine: () => engine,
+    nextCollection,
+  });
+
   afterAll(async () => {
     if (pool) {
       await pool.end();
@@ -172,6 +180,7 @@ describe("mySqlEngine integration", () => {
       database: databaseName,
       documentsTable: "custom_documents",
       indexesTable: "custom_indexes",
+      migrationMetadataTable: "custom_migration_metadata",
       migrationLocksTable: "custom_locks",
       migrationCheckpointsTable: "custom_checkpoints",
     });
@@ -304,6 +313,70 @@ describe("mySqlEngine integration", () => {
     expect(await engine.get(collection, "u1")).toBeNull();
     expect(await engine.get(collection, "u2")).toEqual({ id: "u2", name: "B" });
     expect(await engine.get(collection, "u3")).toBeNull();
+  });
+
+  test("batchSetWithResult skips stale migration writes when a document changed concurrently", async () => {
+    await engine.put(
+      collection,
+      "u1",
+      {
+        __v: 1,
+        __indexes: ["primary"],
+        id: "u1",
+        name: "Before",
+        email: "before@example.com",
+      },
+      { primary: "u1" },
+    );
+
+    const outdated = await engine.migration.getOutdated(collection, {
+      version: 2,
+      versionField: "__v",
+      indexes: ["primary"],
+      indexesField: "__indexes",
+    });
+    const token = outdated.documents[0]?.writeToken;
+
+    expect(typeof token).toBe("string");
+
+    await engine.update(
+      collection,
+      "u1",
+      {
+        __v: 1,
+        __indexes: ["primary"],
+        id: "u1",
+        name: "Concurrent",
+        email: "concurrent@example.com",
+      },
+      { primary: "u1" },
+    );
+
+    const result = await engine.batchSetWithResult!(collection, [
+      {
+        key: "u1",
+        doc: {
+          __v: 2,
+          __indexes: ["primary"],
+          id: "u1",
+          firstName: "Before",
+          lastName: "",
+          email: "before@example.com",
+        },
+        indexes: { primary: "u1" },
+        expectedWriteToken: token,
+      },
+    ]);
+
+    expect(result.persistedKeys).toEqual([]);
+    expect(result.conflictedKeys).toEqual(["u1"]);
+    expect(await engine.get(collection, "u1")).toEqual({
+      __v: 1,
+      __indexes: ["primary"],
+      id: "u1",
+      name: "Concurrent",
+      email: "concurrent@example.com",
+    });
   });
 
   test("batchGet preserves request order and duplicates", async () => {
@@ -553,7 +626,7 @@ describe("mySqlEngine integration", () => {
       indexes: ["byEmail", "primary"],
     });
 
-    expect(page.documents.map((item) => item.key)).toEqual(["stale", "reindex"]);
+    expect(page.documents.map((item) => item.key)).toEqual(["reindex", "stale"]);
     expect(page.cursor).toBeNull();
   });
 

@@ -15,6 +15,7 @@ import {
   type ComparableVersion,
 } from "../../src/engines/types";
 import { createCollectionNameFactory, createTestResourceName, expectReject } from "./helpers";
+import { runMigrationIntegrationSuite } from "./migration-suite";
 
 const contactPoints = (process.env.CASSANDRA_CONTACT_POINTS ?? "127.0.0.1")
   .split(",")
@@ -22,8 +23,11 @@ const contactPoints = (process.env.CASSANDRA_CONTACT_POINTS ?? "127.0.0.1")
   .filter((item) => item.length > 0);
 const port = Number(process.env.CASSANDRA_PORT ?? "9042");
 const localDataCenter = process.env.CASSANDRA_LOCAL_DATACENTER ?? "datacenter1";
-const connectAttemptsRaw = Number(process.env.CASSANDRA_CONNECT_ATTEMPTS ?? "90");
-const connectDelayMsRaw = Number(process.env.CASSANDRA_CONNECT_DELAY_MS ?? "2000");
+const isCi = process.env.CI === "true";
+const connectAttemptsRaw = Number(process.env.CASSANDRA_CONNECT_ATTEMPTS ?? (isCi ? "120" : "90"));
+const connectDelayMsRaw = Number(
+  process.env.CASSANDRA_CONNECT_DELAY_MS ?? (isCi ? "2500" : "2000"),
+);
 const keyspace = process.env.CASSANDRA_TEST_KEYSPACE ?? createTestResourceName("nosql_odm_test");
 
 const documentsTable = `${keyspace}.nosql_odm_documents`;
@@ -35,7 +39,7 @@ let collection = "";
 let keyspaceCreated = false;
 const nextCollection = createCollectionNameFactory();
 
-setDefaultTimeout(120_000);
+setDefaultTimeout(isCi ? 300_000 : 120_000);
 
 async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => {
@@ -99,6 +103,12 @@ describe("cassandraEngine integration", () => {
       client,
       keyspace,
     });
+  });
+
+  runMigrationIntegrationSuite({
+    engineName: "cassandraEngine integration",
+    getEngine: () => engine,
+    nextCollection,
   });
 
   afterAll(async () => {
@@ -231,6 +241,70 @@ describe("cassandraEngine integration", () => {
     expect(await engine.get(collection, "u1")).toBeNull();
     expect(await engine.get(collection, "u2")).toEqual({ id: "u2", name: "B" });
     expect(await engine.get(collection, "u3")).toBeNull();
+  });
+
+  test("batchSetWithResult skips stale migration writes when a document changed concurrently", async () => {
+    await engine.put(
+      collection,
+      "u1",
+      {
+        __v: 1,
+        __indexes: ["primary"],
+        id: "u1",
+        name: "Before",
+        email: "before@example.com",
+      },
+      { primary: "u1" },
+    );
+
+    const outdated = await engine.migration.getOutdated(collection, {
+      version: 2,
+      versionField: "__v",
+      indexes: ["primary"],
+      indexesField: "__indexes",
+    });
+    const token = outdated.documents[0]?.writeToken;
+
+    expect(typeof token).toBe("string");
+
+    await engine.update(
+      collection,
+      "u1",
+      {
+        __v: 1,
+        __indexes: ["primary"],
+        id: "u1",
+        name: "Concurrent",
+        email: "concurrent@example.com",
+      },
+      { primary: "u1" },
+    );
+
+    const result = await engine.batchSetWithResult!(collection, [
+      {
+        key: "u1",
+        doc: {
+          __v: 2,
+          __indexes: ["primary"],
+          id: "u1",
+          firstName: "Before",
+          lastName: "",
+          email: "before@example.com",
+        },
+        indexes: { primary: "u1" },
+        expectedWriteToken: token,
+      },
+    ]);
+
+    expect(result.persistedKeys).toEqual([]);
+    expect(result.conflictedKeys).toEqual(["u1"]);
+    expect(await engine.get(collection, "u1")).toEqual({
+      __v: 1,
+      __indexes: ["primary"],
+      id: "u1",
+      name: "Concurrent",
+      email: "concurrent@example.com",
+    });
   });
 
   test("batchGet preserves request order and duplicates", async () => {

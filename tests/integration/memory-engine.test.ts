@@ -5,15 +5,24 @@ import {
   EngineDocumentNotFoundError,
   type QueryEngine,
 } from "../../src/engines/types";
+import { createCollectionNameFactory } from "./helpers";
+import { runMigrationIntegrationSuite } from "./migration-suite";
 
 // ---------------------------------------------------------------------------
 // Setup
 // ---------------------------------------------------------------------------
 
 let engine: QueryEngine<never>;
+const nextCollection = createCollectionNameFactory();
 
 beforeEach(() => {
   engine = memoryEngine();
+});
+
+runMigrationIntegrationSuite({
+  engineName: "memoryEngine integration",
+  getEngine: () => engine,
+  nextCollection,
 });
 
 // ---------------------------------------------------------------------------

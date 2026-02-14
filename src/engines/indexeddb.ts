@@ -10,6 +10,7 @@ import {
   type QueryParams,
   type ResolvedIndexKeys,
 } from "./types";
+import { DefaultMigrator } from "../migrator";
 
 // ---------------------------------------------------------------------------
 // Public options / types
@@ -517,6 +518,8 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
       },
     },
   };
+
+  engine.migrator = new DefaultMigrator(engine);
 
   return engine;
 }

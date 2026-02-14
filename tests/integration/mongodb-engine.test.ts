@@ -15,10 +15,12 @@ import {
   type ComparableVersion,
 } from "../../src/engines/types";
 import { createCollectionNameFactory, createTestResourceName, expectReject } from "./helpers";
+import { runMigrationIntegrationSuite } from "./migration-suite";
 
 const mongoUrl = process.env.MONGODB_URL ?? "mongodb://127.0.0.1:27017";
-const connectAttemptsRaw = Number(process.env.MONGODB_CONNECT_ATTEMPTS ?? "60");
-const connectDelayMsRaw = Number(process.env.MONGODB_CONNECT_DELAY_MS ?? "1000");
+const isCi = process.env.CI === "true";
+const connectAttemptsRaw = Number(process.env.MONGODB_CONNECT_ATTEMPTS ?? (isCi ? "180" : "60"));
+const connectDelayMsRaw = Number(process.env.MONGODB_CONNECT_DELAY_MS ?? (isCi ? "1500" : "1000"));
 const databaseName = process.env.MONGODB_TEST_DATABASE ?? createTestResourceName("nosql_odm_test");
 
 const documentsCollectionName = "nosql_odm_documents";
@@ -30,7 +32,7 @@ let engine: MongoDbQueryEngine;
 let collection = "";
 const nextCollection = createCollectionNameFactory();
 
-setDefaultTimeout(120_000);
+setDefaultTimeout(isCi ? 300_000 : 120_000);
 
 function normalizePositiveInteger(value: number, fallback: number): number {
   if (!Number.isFinite(value) || value <= 0) {
@@ -110,6 +112,12 @@ describe("mongoDbEngine integration", () => {
     engine = mongoDbEngine({
       database: requireDatabase(),
     });
+  });
+
+  runMigrationIntegrationSuite({
+    engineName: "mongoDbEngine integration",
+    getEngine: () => engine,
+    nextCollection,
   });
 
   afterAll(async () => {
@@ -270,6 +278,70 @@ describe("mongoDbEngine integration", () => {
     expect(await engine.get(collection, "u1")).toBeNull();
     expect(await engine.get(collection, "u2")).toEqual({ id: "u2", name: "B" });
     expect(await engine.get(collection, "u3")).toBeNull();
+  });
+
+  test("batchSetWithResult skips stale migration writes when a document changed concurrently", async () => {
+    await engine.put(
+      collection,
+      "u1",
+      {
+        __v: 1,
+        __indexes: ["primary"],
+        id: "u1",
+        name: "Before",
+        email: "before@example.com",
+      },
+      { primary: "u1" },
+    );
+
+    const outdated = await engine.migration.getOutdated(collection, {
+      version: 2,
+      versionField: "__v",
+      indexes: ["primary"],
+      indexesField: "__indexes",
+    });
+    const token = outdated.documents[0]?.writeToken;
+
+    expect(typeof token).toBe("string");
+
+    await engine.update(
+      collection,
+      "u1",
+      {
+        __v: 1,
+        __indexes: ["primary"],
+        id: "u1",
+        name: "Concurrent",
+        email: "concurrent@example.com",
+      },
+      { primary: "u1" },
+    );
+
+    const result = await engine.batchSetWithResult!(collection, [
+      {
+        key: "u1",
+        doc: {
+          __v: 2,
+          __indexes: ["primary"],
+          id: "u1",
+          firstName: "Before",
+          lastName: "",
+          email: "before@example.com",
+        },
+        indexes: { primary: "u1" },
+        expectedWriteToken: token,
+      },
+    ]);
+
+    expect(result.persistedKeys).toEqual([]);
+    expect(result.conflictedKeys).toEqual(["u1"]);
+    expect(await engine.get(collection, "u1")).toEqual({
+      __v: 1,
+      __indexes: ["primary"],
+      id: "u1",
+      name: "Concurrent",
+      email: "concurrent@example.com",
+    });
   });
 
   test("batchGet preserves request order and duplicates", async () => {

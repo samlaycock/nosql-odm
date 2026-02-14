@@ -68,6 +68,42 @@ function seedV1Users(engine: MemoryQueryEngine, count: number) {
   return Promise.all(promises);
 }
 
+async function expectReject(
+  work: Promise<unknown>,
+  expected: RegExp | string | (new (...args: never[]) => Error),
+): Promise<void> {
+  let error: unknown = null;
+
+  try {
+    await work;
+  } catch (caught) {
+    error = caught;
+  }
+
+  if (error === null) {
+    throw new Error("Expected promise rejection");
+  }
+
+  const message =
+    error instanceof Error
+      ? (error.stack ?? error.message)
+      : typeof error === "string"
+        ? error
+        : JSON.stringify(error);
+
+  if (expected instanceof RegExp) {
+    expect(message).toMatch(expected);
+    return;
+  }
+
+  if (typeof expected === "string") {
+    expect(message).toContain(expected);
+    return;
+  }
+
+  expect(error).toBeInstanceOf(expected);
+}
+
 let engine: MemoryQueryEngine;
 
 beforeEach(() => {
@@ -99,7 +135,7 @@ describe("migration crash recovery — single page", () => {
     const store1 = createStore(engine, [buildUserV2()]);
 
     // First attempt crashes mid-page
-    expect(store1.user.migrateAll()).rejects.toThrow(SimulatedCrashError);
+    await expectReject(store1.user.migrateAll(), SimulatedCrashError);
 
     // 3 documents were migrated before the crash
     let migratedCount = 0;
@@ -150,7 +186,7 @@ describe("migration crash recovery — single page", () => {
     });
 
     const store = createStore(engine, [buildUserV2()]);
-    expect(store.user.migrateAll()).rejects.toThrow(SimulatedCrashError);
+    await expectReject(store.user.migrateAll(), SimulatedCrashError);
 
     // No documents migrated
     for (let i = 0; i < 5; i++) {
@@ -194,7 +230,7 @@ describe("migration crash recovery — multi-page", () => {
     });
 
     const store1 = createStore(engine, [buildUserV2()]);
-    expect(store1.user.migrateAll()).rejects.toThrow(SimulatedCrashError);
+    await expectReject(store1.user.migrateAll(), SimulatedCrashError);
 
     // Count migrated vs stale
     let migratedCount = 0;
@@ -254,7 +290,7 @@ describe("migration crash recovery — multi-page", () => {
     });
 
     const store1 = createStore(engine, [buildUserV2()]);
-    expect(store1.user.migrateAll()).rejects.toThrow(SimulatedCrashError);
+    await expectReject(store1.user.migrateAll(), SimulatedCrashError);
 
     // Verify checkpoint exists (should be after page 2)
     const checkpoint = await engine.migration.loadCheckpoint!("user");
@@ -312,7 +348,7 @@ describe("migration recovery — multiple sequential crashes", () => {
     });
 
     const store1 = createStore(engine, [buildUserV2()]);
-    expect(store1.user.migrateAll()).rejects.toThrow(SimulatedCrashError);
+    await expectReject(store1.user.migrateAll(), SimulatedCrashError);
 
     // Second attempt: crash after 5 more (10 total)
     putCount = 0;
@@ -326,7 +362,7 @@ describe("migration recovery — multiple sequential crashes", () => {
     });
 
     const store2 = createStore(engine, [buildUserV2()]);
-    expect(store2.user.migrateAll()).rejects.toThrow(SimulatedCrashError);
+    await expectReject(store2.user.migrateAll(), SimulatedCrashError);
 
     // Third attempt: crash after 5 more (15 total)
     putCount = 0;
@@ -340,7 +376,7 @@ describe("migration recovery — multiple sequential crashes", () => {
     });
 
     const store3 = createStore(engine, [buildUserV2()]);
-    expect(store3.user.migrateAll()).rejects.toThrow(SimulatedCrashError);
+    await expectReject(store3.user.migrateAll(), SimulatedCrashError);
 
     // Some progress has been made — at least some docs should be migrated
     let migratedSoFar = 0;
@@ -415,7 +451,7 @@ describe("migration idempotency", () => {
     });
 
     const store1 = createStore(engine, [buildUserV2()]);
-    expect(store1.user.migrateAll()).rejects.toThrow(SimulatedCrashError);
+    await expectReject(store1.user.migrateAll(), SimulatedCrashError);
 
     // Track which IDs get written on retry and whether they were stale
     const retryMigratedIds: string[] = [];
@@ -462,7 +498,7 @@ describe("lock recovery after crash", () => {
     });
 
     const store = createStore(engine, [buildUserV2()]);
-    expect(store.user.migrateAll()).rejects.toThrow(SimulatedCrashError);
+    await expectReject(store.user.migrateAll(), SimulatedCrashError);
 
     // Lock should be released (finally block in migrateAll)
     engine.setOptions({});
@@ -486,7 +522,7 @@ describe("lock recovery after crash", () => {
     const store = createStore(engine, [buildUserV2()]);
 
     // First attempt crashes
-    expect(store.user.migrateAll()).rejects.toThrow(SimulatedCrashError);
+    await expectReject(store.user.migrateAll(), SimulatedCrashError);
 
     // Remove failure
     engine.setOptions({});
@@ -497,7 +533,7 @@ describe("lock recovery after crash", () => {
     expect(result.migrated).toBe(5);
   });
 
-  test("lock from crashed migration does not block other models", async () => {
+  test("store-level migration fails fast when one model crashes", async () => {
     await seedV1Users(engine, 5);
     await engine.put("post", "p1", { __v: 1, id: "p1", title: "Hello", authorId: "u1" }, {});
 
@@ -519,14 +555,7 @@ describe("lock recovery after crash", () => {
       .build();
 
     const store = createStore(engine, [buildUserV2(), postModel]);
-    const results = await store.migrateAll();
-
-    const userResult = results.find((r: any) => r.model === "user");
-    const postResult = results.find((r: any) => r.model === "post");
-
-    // User failed but post should succeed
-    expect(userResult?.status).toBe("failed");
-    expect(postResult?.status).toBe("completed");
+    await expectReject(store.migrateAll(), SimulatedCrashError);
   });
 });
 
@@ -599,7 +628,7 @@ describe("migration crash recovery — multi-version chain", () => {
     });
 
     const store1 = createStore(engine, [buildUserV3()]);
-    expect(store1.user.migrateAll()).rejects.toThrow(SimulatedCrashError);
+    await expectReject(store1.user.migrateAll(), SimulatedCrashError);
 
     // 4 docs migrated to v3
     let migratedCount = 0;
@@ -660,7 +689,7 @@ describe("migration crash recovery — multi-version chain", () => {
     });
 
     const store1 = createStore(engine, [buildUserV3()]);
-    expect(store1.user.migrateAll()).rejects.toThrow(SimulatedCrashError);
+    await expectReject(store1.user.migrateAll(), SimulatedCrashError);
 
     engine.setOptions({});
 
@@ -748,7 +777,7 @@ describe("checkpoint lifecycle", () => {
     expect(raw.lastName).toBe("User");
   });
 
-  test("crash on first page leaves no checkpoint, retry starts from beginning", async () => {
+  test("crash on first page leaves run state with a null cursor, retry starts from beginning", async () => {
     await seedV1Users(engine, 50);
 
     let putCount = 0;
@@ -762,11 +791,13 @@ describe("checkpoint lifecycle", () => {
     });
 
     const store1 = createStore(engine, [buildUserV2()]);
-    expect(store1.user.migrateAll()).rejects.toThrow(SimulatedCrashError);
+    await expectReject(store1.user.migrateAll(), SimulatedCrashError);
 
-    // No checkpoint should exist (checkpoint is only saved between pages)
+    // A run record exists immediately, but cursor remains null because the first page
+    // was never fully committed.
     const checkpoint = await engine.migration.loadCheckpoint!("user");
-    expect(checkpoint).toBeNull();
+    expect(checkpoint).not.toBeNull();
+    expect(String(checkpoint)).toContain('"cursor":null');
 
     engine.setOptions({});
 
@@ -855,7 +886,7 @@ describe("lock TTL — stale lock recovery", () => {
 
     // Without TTL, migrateAll fails
     const store1 = createStore(engine, [buildUserV2()]);
-    expect(store1.user.migrateAll()).rejects.toThrow("already running");
+    await expectReject(store1.user.migrateAll(), "already running");
 
     // With lockTtlMs=0, store-level migrateAll can steal the stale lock.
     const store2 = createStore(engine, [buildUserV2()]);
@@ -893,7 +924,7 @@ describe("migration status observability", () => {
     });
 
     const store = createStore(engine, [buildUserV2()]);
-    expect(store.user.migrateAll()).rejects.toThrow(SimulatedCrashError);
+    await expectReject(store.user.migrateAll(), SimulatedCrashError);
 
     // Lock should be released (finally block), but checkpoint should exist
     const status = await store.user.getMigrationStatus();

@@ -9,6 +9,7 @@ import {
   type FieldCondition,
   type MigrationLock,
 } from "./types";
+import { DefaultMigrator } from "../migrator";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -267,6 +268,8 @@ export function memoryEngine(options?: MemoryEngineOptions): MemoryQueryEngine {
       },
     },
   };
+
+  engine.migrator = new DefaultMigrator(engine);
 
   return engine;
 }
