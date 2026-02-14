@@ -10,6 +10,7 @@ import {
   type QueryParams,
   type ResolvedIndexKeys,
 } from "./types";
+import { DefaultMigrator } from "../migrator";
 
 const DEFAULT_SCHEMA = "public";
 const DEFAULT_DOCUMENTS_TABLE = "nosql_odm_documents";
@@ -451,6 +452,8 @@ export function postgresEngine(options: PostgresEngineOptions): PostgresQueryEng
       },
     },
   };
+
+  engine.migrator = new DefaultMigrator(engine);
 
   return engine;
 }

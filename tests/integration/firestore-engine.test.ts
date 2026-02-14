@@ -16,6 +16,7 @@ import {
   type ComparableVersion,
 } from "../../src/engines/types";
 import { createCollectionNameFactory, expectReject } from "./helpers";
+import { runMigrationIntegrationSuite } from "./migration-suite";
 
 const emulatorHost = process.env.FIRESTORE_EMULATOR_HOST ?? "127.0.0.1:8080";
 const projectId = process.env.FIRESTORE_PROJECT_ID ?? createFirestoreProjectId();
@@ -145,6 +146,12 @@ describe("firestoreEngine integration", () => {
     engine = firestoreEngine({
       database: requireFirestore(),
     });
+  });
+
+  runMigrationIntegrationSuite({
+    engineName: "firestoreEngine integration",
+    getEngine: () => engine,
+    nextCollection,
   });
 
   afterAll(async () => {

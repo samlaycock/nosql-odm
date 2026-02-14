@@ -10,6 +10,7 @@ import {
   type QueryParams,
   type ResolvedIndexKeys,
 } from "./types";
+import { DefaultMigrator } from "../migrator";
 
 const DEFAULT_DOCUMENTS_TABLE = "nosql_odm_documents";
 const DEFAULT_INDEXES_TABLE = "nosql_odm_index_entries";
@@ -429,6 +430,8 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
       },
     },
   };
+
+  engine.migrator = new DefaultMigrator(engine);
 
   return engine;
 }

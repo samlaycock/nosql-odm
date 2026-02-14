@@ -5,8 +5,10 @@ import {
   createStore,
   DocumentAlreadyExistsError,
   MigrationAlreadyRunningError,
+  MigrationScopeConflictError,
 } from "../../src/store";
 import { memoryEngine, type MemoryQueryEngine } from "../../src/engines/memory";
+import { DefaultMigrator } from "../../src/migrator";
 import {
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
@@ -182,6 +184,42 @@ let engine: MemoryQueryEngine;
 beforeEach(() => {
   engine = memoryEngine();
 });
+
+async function expectReject(
+  work: Promise<unknown>,
+  expected: RegExp | string | (new (...args: never[]) => Error),
+): Promise<void> {
+  let error: unknown = null;
+
+  try {
+    await work;
+  } catch (caught) {
+    error = caught;
+  }
+
+  if (error === null) {
+    throw new Error("Expected promise rejection");
+  }
+
+  const message =
+    error instanceof Error
+      ? (error.stack ?? error.message)
+      : typeof error === "string"
+        ? error
+        : JSON.stringify(error);
+
+  if (expected instanceof RegExp) {
+    expect(message).toMatch(expected);
+    return;
+  }
+
+  if (typeof expected === "string") {
+    expect(message).toContain(expected);
+    return;
+  }
+
+  expect(error).toBeInstanceOf(expected);
+}
 
 // ---------------------------------------------------------------------------
 // createStore basics
@@ -1495,6 +1533,7 @@ describe("lazy migration on findByKey", () => {
         },
       },
     };
+    trackingEngine.migrator = new DefaultMigrator(trackingEngine);
 
     const store = createStore(trackingEngine, [buildUserV2()]);
     await store.user.findByKey("u1");
@@ -2081,6 +2120,8 @@ describe("store.model.migrateAll()", () => {
   test("uses engine.batchSet to persist migrated pages", async () => {
     const batchSetCalls: { collection: string; items: unknown[] }[] = [];
     const lock = { id: "lock-1", collection: "user", acquiredAt: Date.now() };
+    let checkpoint: string | null = null;
+    let lockHeld = false;
     const trackingEngine: QueryEngine<never> = {
       async get() {
         return null;
@@ -2101,9 +2142,16 @@ describe("store.model.migrateAll()", () => {
       async batchDelete() {},
       migration: {
         async acquireLock() {
+          if (lockHeld) {
+            return null;
+          }
+
+          lockHeld = true;
           return lock;
         },
-        async releaseLock() {},
+        async releaseLock() {
+          lockHeld = false;
+        },
         async getOutdated(_collection, _criteria, cursor) {
           if (cursor) {
             return { documents: [], cursor: null };
@@ -2124,8 +2172,28 @@ describe("store.model.migrateAll()", () => {
             cursor: null,
           };
         },
+        async saveCheckpoint(_lock, cursor) {
+          checkpoint = cursor;
+        },
+        async loadCheckpoint() {
+          return checkpoint;
+        },
+        async clearCheckpoint() {
+          checkpoint = null;
+        },
+        async getStatus() {
+          if (!lockHeld) {
+            return null;
+          }
+
+          return {
+            lock,
+            cursor: checkpoint,
+          };
+        },
       },
     };
+    trackingEngine.migrator = new DefaultMigrator(trackingEngine);
 
     const store = createStore(trackingEngine, [buildUserV2()]);
     const result = await store.user.migrateAll();
@@ -2353,18 +2421,11 @@ describe("migrateAll() concurrent locking", () => {
       );
     }
 
+    await engine.migration.acquireLock("user");
+
     const store = createStore(engine, [buildUserV2()]);
 
-    // Start first migration
-    const migration1 = store.user.migrateAll();
-
-    // Second migration should fail because lock is held
-    expect(store.user.migrateAll()).rejects.toThrow(MigrationAlreadyRunningError);
-
-    // First should complete
-    const result = await migration1;
-    expect(result.status).toBe("completed");
-    expect(result.migrated).toBe(50);
+    await expectReject(store.user.migrateAll(), MigrationAlreadyRunningError);
   });
 
   test("lock is released after migration completes", async () => {
@@ -2503,21 +2564,14 @@ describe("store.migrateAll()", () => {
     expect(postResult?.migrated).toBe(0);
   });
 
-  test("reports skipped models when lock is held", async () => {
+  test("fails store migration when the scope is covered by an active model migration", async () => {
     await engine.put("user", "u1", { __v: 1, id: "u1", name: "Sam", email: "sam@example.com" }, {});
 
     // Acquire lock externally
     await engine.migration.acquireLock("user");
 
     const store = createStore(engine, [buildUserV2(), buildPost()]);
-    const results = await store.migrateAll();
-
-    const userResult = results.find((r: any) => r.model === "user");
-    const postResult = results.find((r: any) => r.model === "post");
-
-    expect(userResult?.status).toBe("skipped");
-    expect(userResult?.reason).toBe("already running");
-    expect(postResult?.status).toBe("completed");
+    await expectReject(store.migrateAll(), MigrationScopeConflictError);
   });
 
   test("uses lockTtlMs to recover from stale locks", async () => {
@@ -2528,8 +2582,7 @@ describe("store.migrateAll()", () => {
 
     const store = createStore(engine, [buildUserV2()]);
 
-    const first = await store.migrateAll();
-    expect(first[0]?.status).toBe("skipped");
+    await expectReject(store.migrateAll(), MigrationScopeConflictError);
 
     const second = await store.migrateAll({ lockTtlMs: 0 });
     expect(second[0]?.status).toBe("completed");

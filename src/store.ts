@@ -10,6 +10,25 @@ import {
 } from "./engines/types";
 import type { ProjectionSkipReason } from "./model";
 import { ModelDefinition } from "./model";
+import {
+  DefaultMigrator,
+  type MigrationHooks,
+  type MigrationModelContext,
+  type MigrationNextPageResult,
+  type MigrationRunOptions,
+  type MigrationRunProgress,
+  type Migrator,
+  type MigrationScope,
+  MigrationScopeConflictError,
+} from "./migrator";
+
+export type {
+  MigrationHooks,
+  MigrationNextPageResult,
+  MigrationRunOptions,
+  MigrationRunProgress,
+  Migrator,
+} from "./migrator";
 
 // ---------------------------------------------------------------------------
 // Public store types
@@ -36,11 +55,6 @@ export interface MigrationResult {
 }
 
 export type MigrationSkipReasons = Partial<Record<ProjectionSkipReason, number>>;
-
-export interface MigrationRunOptions {
-  /** Lock TTL in milliseconds. If provided, stale locks can be replaced by the engine. */
-  lockTtlMs?: number;
-}
 
 type AnyString = string & {};
 
@@ -85,8 +99,11 @@ export interface BoundModel<
   batchSet(items: BatchSetInputItem<T>[], options?: TOptions): Promise<T[]>;
   batchDelete(keys: string[], options?: TOptions): Promise<void>;
 
+  getOrCreateMigration(options?: MigrationRunOptions): Promise<MigrationRunProgress>;
+  migrateNextPage(options?: MigrationRunOptions): Promise<MigrationNextPageResult>;
   migrateAll(options?: MigrationRunOptions): Promise<MigrationResult>;
   getMigrationStatus(): Promise<MigrationStatus | null>;
+  getMigrationProgress(): Promise<MigrationRunProgress | null>;
 }
 
 /**
@@ -111,6 +128,9 @@ export type Store<
     ModelHasDynamicIndexes<M>
   >;
 } & {
+  getOrCreateMigration(options?: MigrationRunOptions): Promise<MigrationRunProgress>;
+  migrateNextPage(options?: MigrationRunOptions): Promise<MigrationNextPageResult>;
+  getMigrationProgress(): Promise<MigrationRunProgress | null>;
   migrateAll(options?: MigrationRunOptions): Promise<MigrationResult[]>;
 };
 
@@ -130,6 +150,22 @@ export class MigrationAlreadyRunningError extends Error {
     super(`Migration is already running for collection "${collection}"`);
     this.name = "MigrationAlreadyRunningError";
   }
+}
+
+export class MissingMigratorError extends Error {
+  constructor() {
+    super(
+      "No migrator is configured for this store. Pass one via createStore(..., { migrator }) or use an engine that provides engine.migrator.",
+    );
+    this.name = "MissingMigratorError";
+  }
+}
+
+export { MigrationScopeConflictError };
+
+export interface CreateStoreOptions<TOptions = Record<string, unknown>> {
+  migrator?: Migrator<TOptions>;
+  migrationHooks?: MigrationHooks;
 }
 
 type JsonPrimitive = string | number | boolean | null;
@@ -244,13 +280,16 @@ class BoundModelImpl<
 > {
   private model: ModelDefinition<T, any, string, TStaticIndexNames, THasDynamicIndexes>;
   private engine: QueryEngine<TOptions>;
+  private migrator: Migrator<TOptions> | null;
 
   constructor(
     model: ModelDefinition<T, any, string, TStaticIndexNames, THasDynamicIndexes>,
     engine: QueryEngine<TOptions>,
+    migrator: Migrator<TOptions> | null,
   ) {
     this.model = model;
     this.engine = engine;
+    this.migrator = migrator;
   }
 
   async findByKey(key: string, options?: TOptions): Promise<T | null> {
@@ -424,88 +463,55 @@ class BoundModelImpl<
     await this.engine.batchDelete(this.model.name, keys, options);
   }
 
+  async getOrCreateMigration(options?: MigrationRunOptions): Promise<MigrationRunProgress> {
+    const migrator = this.requireMigrator();
+    const contexts = this.modelContextMap();
+    const result = await migrator.getOrCreateRun(this.modelScope(), contexts, options);
+    return result.progress;
+  }
+
+  async migrateNextPage(options?: MigrationRunOptions): Promise<MigrationNextPageResult> {
+    const migrator = this.requireMigrator();
+    return migrator.migrateNextPage(this.modelScope(), this.modelContextMap(), options);
+  }
+
   async migrateAll(options?: MigrationRunOptions): Promise<MigrationResult> {
     const collection = this.model.name;
-    const lock = await this.engine.migration.acquireLock(
-      collection,
-      options?.lockTtlMs !== undefined ? { ttl: options.lockTtlMs } : undefined,
-    );
-
-    if (!lock) {
-      throw new MigrationAlreadyRunningError(collection);
-    }
-
     let migrated = 0;
     let skipped = 0;
     const skipReasons: MigrationSkipReasons = {};
 
-    try {
-      // Build criteria so the engine can efficiently find outdated documents.
-      const criteria: MigrationCriteria = {
-        version: this.model.latestVersion,
-        versionField: this.model.options.versionField,
-        indexes: this.model.indexNames,
-        indexesField: this.model.options.indexesField,
-        parseVersion: this.model.options.parseVersion,
-        compareVersions: this.model.options.compareVersions,
-      };
+    await this.getOrCreateMigration(options);
 
-      // Resume from the last saved checkpoint if a previous run was interrupted.
-      let cursor = (await this.engine.migration.loadCheckpoint?.(collection)) ?? undefined;
+    while (true) {
+      const page = await this.migrateNextPage(options);
 
-      do {
-        // The engine returns only documents that need migration or reindexing.
-        const page = await this.engine.migration.getOutdated(collection, criteria, cursor);
+      if (page.status === "busy") {
+        throw new MigrationAlreadyRunningError(collection);
+      }
 
-        const writes: {
-          key: string;
-          doc: Record<string, unknown>;
-          indexes: Record<string, string>;
-        }[] = [];
+      migrated += page.migrated;
+      skipped += page.skipped;
 
-        for (const { key, doc: rawDoc } of page.documents) {
-          const projected = await this.model.projectToLatest(rawDoc as Record<string, unknown>);
-
-          if (!projected.ok) {
-            skipped++;
-            skipReasons[projected.reason] = (skipReasons[projected.reason] ?? 0) + 1;
-            continue;
-          }
-
-          const stamped = this.stamp(projected.value as object, key);
-          const indexes = this.model.resolveIndexKeys(projected.value);
-          writes.push({ key, doc: stamped, indexes });
-
-          if (projected.migrated) {
-            migrated++;
-          }
+      if (page.skipReasons) {
+        for (const [reason, count] of Object.entries(page.skipReasons)) {
+          skipReasons[reason as ProjectionSkipReason] =
+            (skipReasons[reason as ProjectionSkipReason] ?? 0) + count;
         }
+      }
 
-        if (writes.length > 0) {
-          await this.engine.batchSet(collection, writes);
-        }
-
-        cursor = page.cursor ?? undefined;
-
-        if (cursor) {
-          await this.engine.migration.saveCheckpoint?.(lock, cursor);
-        }
-      } while (cursor);
-
-      // Clear checkpoint after a successful full run so future runs scan
-      // from the beginning and cannot skip older stale documents.
-      await this.engine.migration.clearCheckpoint?.(collection);
-
-      return {
-        model: collection,
-        status: "completed",
-        migrated,
-        skipped,
-        skipReasons: skipped > 0 ? skipReasons : undefined,
-      };
-    } finally {
-      await this.engine.migration.releaseLock(lock);
+      if (page.completed) {
+        break;
+      }
     }
+
+    return {
+      model: collection,
+      status: "completed",
+      migrated,
+      skipped,
+      skipReasons: skipped > 0 ? skipReasons : undefined,
+    };
   }
 
   async getMigrationStatus(): Promise<MigrationStatus | null> {
@@ -514,6 +520,11 @@ class BoundModelImpl<
     }
 
     return this.engine.migration.getStatus(this.model.name);
+  }
+
+  async getMigrationProgress(): Promise<MigrationRunProgress | null> {
+    const migrator = this.requireMigrator();
+    return migrator.getProgress(this.modelScope());
   }
 
   // ---------------------------------------------------------------------------
@@ -554,6 +565,54 @@ class BoundModelImpl<
     }));
 
     await this.engine.batchSet(this.model.name, prepared, options);
+  }
+
+  private migrationCriteria(): MigrationCriteria {
+    return {
+      version: this.model.latestVersion,
+      versionField: this.model.options.versionField,
+      indexes: this.model.indexNames,
+      indexesField: this.model.options.indexesField,
+      parseVersion: this.model.options.parseVersion,
+      compareVersions: this.model.options.compareVersions,
+    };
+  }
+
+  createMigrationContext(): MigrationModelContext {
+    return {
+      collection: this.model.name,
+      criteria: this.migrationCriteria(),
+      project: (doc) => this.model.projectToLatest(doc),
+      toBatchSetItem: (key, value) => ({
+        key,
+        doc: this.stamp(value as object, key),
+        indexes: this.model.resolveIndexKeys(value as T),
+      }),
+      persist: (items) => this.engine.batchSet(this.model.name, items),
+    };
+  }
+
+  modelName(): string {
+    return this.model.name;
+  }
+
+  private modelContextMap(): ReadonlyMap<string, MigrationModelContext> {
+    return new Map([[this.model.name, this.createMigrationContext()]]);
+  }
+
+  private modelScope(): MigrationScope {
+    return {
+      scope: "model",
+      model: this.model.name,
+    };
+  }
+
+  private requireMigrator(): Migrator<TOptions> {
+    if (!this.migrator) {
+      throw new MissingMigratorError();
+    }
+
+    return this.migrator;
   }
 
   // Resolves query params: `where` shorthand → `index`/`filter`, or pass through
@@ -666,7 +725,17 @@ class BoundModelImpl<
 export function createStore<
   const TModels extends readonly ModelDefinition<any, any, string, any, any>[],
   TOptions = Record<string, unknown>,
->(engine: QueryEngine<TOptions>, models: TModels): Store<TModels, TOptions> {
+>(
+  engine: QueryEngine<TOptions>,
+  models: TModels,
+  options?: CreateStoreOptions<TOptions>,
+): Store<TModels, TOptions> {
+  const engineMigrator = options?.migrationHooks
+    ? new DefaultMigrator(engine, {
+        hooks: options.migrationHooks,
+      })
+    : (engine.migrator ?? null);
+  const migrator = options?.migrator ?? engineMigrator;
   const boundModels = new Map<string, BoundModelImpl<any, TOptions, any, any>>();
 
   for (const modelDef of models) {
@@ -674,33 +743,109 @@ export function createStore<
       throw new Error(`Duplicate model name: "${modelDef.name}"`);
     }
 
-    boundModels.set(modelDef.name, new BoundModelImpl(modelDef, engine));
+    boundModels.set(modelDef.name, new BoundModelImpl(modelDef, engine, migrator));
   }
 
-  const store = {
-    // Migrates all models sequentially. Errors are caught per-model so one
-    // model's failure doesn't prevent the others from being migrated.
-    async migrateAll(options?: MigrationRunOptions): Promise<MigrationResult[]> {
-      const results: MigrationResult[] = [];
+  const allModelNames = Array.from(boundModels.keys()).sort((a, b) => a.localeCompare(b));
+  const storeScope: MigrationScope = {
+    scope: "store",
+    models: allModelNames,
+  };
 
-      for (const [name, boundModel] of boundModels) {
-        try {
-          const result = await boundModel.migrateAll(options);
-          results.push(result);
-        } catch (err) {
-          if (err instanceof MigrationAlreadyRunningError) {
-            results.push({
-              model: name,
-              status: "skipped",
-              reason: "already running",
-            });
-          } else {
-            results.push({ model: name, status: "failed", error: err });
+  const migrationContexts = (): ReadonlyMap<string, MigrationModelContext> => {
+    const contexts = new Map<string, MigrationModelContext>();
+
+    for (const boundModel of boundModels.values()) {
+      contexts.set(boundModel.modelName(), boundModel.createMigrationContext());
+    }
+
+    return contexts;
+  };
+
+  const requireMigrator = (): Migrator<TOptions> => {
+    if (!migrator) {
+      throw new MissingMigratorError();
+    }
+
+    return migrator;
+  };
+
+  const store = {
+    async getOrCreateMigration(options?: MigrationRunOptions): Promise<MigrationRunProgress> {
+      const activeMigrator = requireMigrator();
+      const result = await activeMigrator.getOrCreateRun(storeScope, migrationContexts(), options);
+      return result.progress;
+    },
+
+    async migrateNextPage(options?: MigrationRunOptions): Promise<MigrationNextPageResult> {
+      const activeMigrator = requireMigrator();
+      return activeMigrator.migrateNextPage(storeScope, migrationContexts(), options);
+    },
+
+    async getMigrationProgress(): Promise<MigrationRunProgress | null> {
+      const activeMigrator = requireMigrator();
+      return activeMigrator.getProgress(storeScope);
+    },
+
+    async migrateAll(options?: MigrationRunOptions): Promise<MigrationResult[]> {
+      const activeMigrator = requireMigrator();
+      await activeMigrator.getOrCreateRun(storeScope, migrationContexts(), options);
+
+      const aggregates = new Map<
+        string,
+        {
+          migrated: number;
+          skipped: number;
+          skipReasons: MigrationSkipReasons;
+        }
+      >();
+
+      for (const name of allModelNames) {
+        aggregates.set(name, {
+          migrated: 0,
+          skipped: 0,
+          skipReasons: {},
+        });
+      }
+
+      while (true) {
+        const page = await activeMigrator.migrateNextPage(storeScope, migrationContexts(), options);
+
+        if (page.status === "busy") {
+          throw new MigrationAlreadyRunningError("store");
+        }
+
+        if (page.model) {
+          const aggregate = aggregates.get(page.model);
+
+          if (aggregate) {
+            aggregate.migrated += page.migrated;
+            aggregate.skipped += page.skipped;
+
+            if (page.skipReasons) {
+              for (const [reason, count] of Object.entries(page.skipReasons)) {
+                aggregate.skipReasons[reason as ProjectionSkipReason] =
+                  (aggregate.skipReasons[reason as ProjectionSkipReason] ?? 0) + count;
+              }
+            }
           }
+        }
+
+        if (page.completed) {
+          break;
         }
       }
 
-      return results;
+      return allModelNames.map((modelName) => {
+        const aggregate = aggregates.get(modelName)!;
+        return {
+          model: modelName,
+          status: "completed",
+          migrated: aggregate.migrated,
+          skipped: aggregate.skipped,
+          skipReasons: aggregate.skipped > 0 ? aggregate.skipReasons : undefined,
+        } satisfies MigrationResult;
+      });
     },
   } as Store<TModels, TOptions>;
 
@@ -716,8 +861,11 @@ export function createStore<
       batchGet: boundModel.batchGet.bind(boundModel),
       batchSet: boundModel.batchSet.bind(boundModel),
       batchDelete: boundModel.batchDelete.bind(boundModel),
+      getOrCreateMigration: boundModel.getOrCreateMigration.bind(boundModel),
+      migrateNextPage: boundModel.migrateNextPage.bind(boundModel),
       migrateAll: boundModel.migrateAll.bind(boundModel),
       getMigrationStatus: boundModel.getMigrationStatus.bind(boundModel),
+      getMigrationProgress: boundModel.getMigrationProgress.bind(boundModel),
     } satisfies BoundModel<any, TOptions, any, any>;
   }
 

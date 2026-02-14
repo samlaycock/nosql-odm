@@ -15,6 +15,7 @@ import {
   type ComparableVersion,
 } from "../../src/engines/types";
 import { createCollectionNameFactory, createTestResourceName, expectReject } from "./helpers";
+import { runMigrationIntegrationSuite } from "./migration-suite";
 
 const host = process.env.MYSQL_HOST ?? "127.0.0.1";
 const port = Number(process.env.MYSQL_PORT ?? "3306");
@@ -139,6 +140,12 @@ describe("mySqlEngine integration", () => {
       client: requirePool(),
       database: databaseName,
     });
+  });
+
+  runMigrationIntegrationSuite({
+    engineName: "mySqlEngine integration",
+    getEngine: () => engine,
+    nextCollection,
   });
 
   afterAll(async () => {

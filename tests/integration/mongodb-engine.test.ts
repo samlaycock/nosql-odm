@@ -15,6 +15,7 @@ import {
   type ComparableVersion,
 } from "../../src/engines/types";
 import { createCollectionNameFactory, createTestResourceName, expectReject } from "./helpers";
+import { runMigrationIntegrationSuite } from "./migration-suite";
 
 const mongoUrl = process.env.MONGODB_URL ?? "mongodb://127.0.0.1:27017";
 const connectAttemptsRaw = Number(process.env.MONGODB_CONNECT_ATTEMPTS ?? "60");
@@ -110,6 +111,12 @@ describe("mongoDbEngine integration", () => {
     engine = mongoDbEngine({
       database: requireDatabase(),
     });
+  });
+
+  runMigrationIntegrationSuite({
+    engineName: "mongoDbEngine integration",
+    getEngine: () => engine,
+    nextCollection,
   });
 
   afterAll(async () => {

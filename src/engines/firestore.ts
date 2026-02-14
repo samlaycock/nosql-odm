@@ -11,6 +11,7 @@ import {
   type QueryParams,
   type ResolvedIndexKeys,
 } from "./types";
+import { DefaultMigrator } from "../migrator";
 
 const DEFAULT_DOCUMENTS_COLLECTION = "nosql_odm_documents";
 const DEFAULT_METADATA_COLLECTION = "nosql_odm_metadata";
@@ -410,6 +411,8 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
       },
     },
   };
+
+  engine.migrator = new DefaultMigrator(engine);
 
   return engine;
 }
