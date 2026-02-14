@@ -24,8 +24,9 @@ const password = process.env.MYSQL_PASSWORD ?? "root";
 const adminDatabase = process.env.MYSQL_ADMIN_DATABASE ?? "mysql";
 const databaseName =
   process.env.MYSQL_TEST_DATABASE ?? createSqlIdentifier(createTestResourceName("nosql_odm_test"));
-const connectAttemptsRaw = Number(process.env.MYSQL_CONNECT_ATTEMPTS ?? "90");
-const connectDelayMsRaw = Number(process.env.MYSQL_CONNECT_DELAY_MS ?? "1000");
+const isCi = process.env.CI === "true";
+const connectAttemptsRaw = Number(process.env.MYSQL_CONNECT_ATTEMPTS ?? (isCi ? "180" : "90"));
+const connectDelayMsRaw = Number(process.env.MYSQL_CONNECT_DELAY_MS ?? (isCi ? "1500" : "1000"));
 
 let adminPool: Pool | null = null;
 let pool: Pool | null = null;
@@ -33,7 +34,7 @@ let engine: MySqlQueryEngine;
 let collection = "";
 const nextCollection = createCollectionNameFactory();
 
-setDefaultTimeout(120_000);
+setDefaultTimeout(isCi ? 300_000 : 120_000);
 
 function quoteIdentifier(value: string): string {
   return `\`${value.replace(/`/g, "``")}\``;

@@ -23,8 +23,11 @@ const contactPoints = (process.env.CASSANDRA_CONTACT_POINTS ?? "127.0.0.1")
   .filter((item) => item.length > 0);
 const port = Number(process.env.CASSANDRA_PORT ?? "9042");
 const localDataCenter = process.env.CASSANDRA_LOCAL_DATACENTER ?? "datacenter1";
-const connectAttemptsRaw = Number(process.env.CASSANDRA_CONNECT_ATTEMPTS ?? "90");
-const connectDelayMsRaw = Number(process.env.CASSANDRA_CONNECT_DELAY_MS ?? "2000");
+const isCi = process.env.CI === "true";
+const connectAttemptsRaw = Number(process.env.CASSANDRA_CONNECT_ATTEMPTS ?? (isCi ? "120" : "90"));
+const connectDelayMsRaw = Number(
+  process.env.CASSANDRA_CONNECT_DELAY_MS ?? (isCi ? "2500" : "2000"),
+);
 const keyspace = process.env.CASSANDRA_TEST_KEYSPACE ?? createTestResourceName("nosql_odm_test");
 
 const documentsTable = `${keyspace}.nosql_odm_documents`;
@@ -36,7 +39,7 @@ let collection = "";
 let keyspaceCreated = false;
 const nextCollection = createCollectionNameFactory();
 
-setDefaultTimeout(120_000);
+setDefaultTimeout(isCi ? 300_000 : 120_000);
 
 async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => {

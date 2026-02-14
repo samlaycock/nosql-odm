@@ -22,8 +22,9 @@ const port = Number(process.env.POSTGRES_PORT ?? "5432");
 const user = process.env.POSTGRES_USER ?? "postgres";
 const password = process.env.POSTGRES_PASSWORD ?? "postgres";
 const database = process.env.POSTGRES_DATABASE ?? "postgres";
-const connectAttemptsRaw = Number(process.env.POSTGRES_CONNECT_ATTEMPTS ?? "60");
-const connectDelayMsRaw = Number(process.env.POSTGRES_CONNECT_DELAY_MS ?? "1000");
+const isCi = process.env.CI === "true";
+const connectAttemptsRaw = Number(process.env.POSTGRES_CONNECT_ATTEMPTS ?? (isCi ? "180" : "60"));
+const connectDelayMsRaw = Number(process.env.POSTGRES_CONNECT_DELAY_MS ?? (isCi ? "1500" : "1000"));
 const schemaName =
   process.env.POSTGRES_TEST_SCHEMA ?? createTestResourceName("nosql_odm_test").toLowerCase();
 
@@ -32,7 +33,7 @@ let engine: PostgresQueryEngine;
 let collection = "";
 const nextCollection = createCollectionNameFactory();
 
-setDefaultTimeout(120_000);
+setDefaultTimeout(isCi ? 300_000 : 120_000);
 
 function quoteIdentifier(value: string): string {
   return `"${value.replace(/"/g, '""')}"`;
