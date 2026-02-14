@@ -1,4 +1,5 @@
 import {
+  type BatchSetResult,
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
   type ComparableVersion,
@@ -6,7 +7,9 @@ import {
   type FieldCondition,
   type KeyedDocument,
   type MigrationCriteria,
+  type MigrationDocumentMetadata,
   type MigrationLock,
+  type MigrationVersionState,
   type QueryEngine,
   type QueryParams,
   type ResolvedIndexKeys,
@@ -15,40 +18,266 @@ import { DefaultMigrator } from "../migrator";
 
 const DEFAULT_KEY_PREFIX = "nosql_odm";
 const OUTDATED_PAGE_LIMIT = 100;
+const OUTDATED_SYNC_CHUNK_SIZE = 100;
+const NULL_INDEX_SIGNATURE = "";
+const NULL_INDEX_SIGNATURE_TOKEN = "__null__";
 
 const CREATE_DOCUMENT_SCRIPT = `
-if redis.call("EXISTS", KEYS[1]) == 1 then
-  return 0
+local function staleSet(prefix, collection, targetVersion)
+  return prefix .. ":migration:stale:" .. collection .. ":" .. targetVersion
 end
-redis.call("HSET", KEYS[1], "createdAt", ARGV[1], "doc", ARGV[2], "indexes", ARGV[3])
-redis.call("ZADD", KEYS[2], ARGV[1], ARGV[4])
-return 1
-`;
 
-const PUT_DOCUMENT_SCRIPT = `
+local function currentAnySet(prefix, collection, targetVersion)
+  return prefix .. ":migration:current:any:" .. collection .. ":" .. targetVersion
+end
+
+local function currentSignatureSet(prefix, collection, targetVersion, signatureToken)
+  return prefix .. ":migration:current:sig:" .. collection .. ":" .. targetVersion .. ":" .. signatureToken
+end
+
+local function removePreviousIndexes(prefix, collection, key, targetSetKey)
+  local oldTarget = redis.call("HGET", KEYS[1], "migrationTargetVersion")
+  local oldState = redis.call("HGET", KEYS[1], "migrationVersionState")
+  local oldToken = redis.call("HGET", KEYS[1], "migrationIndexSignatureToken")
+
+  if oldToken == false or oldToken == nil or oldToken == "" then
+    oldToken = "__null__"
+  end
+
+  redis.call("ZREM", targetSetKey, key)
+
+  if oldTarget and oldState then
+    if oldState == "stale" then
+      redis.call("ZREM", staleSet(prefix, collection, oldTarget), key)
+    elseif oldState == "current" then
+      redis.call("ZREM", currentAnySet(prefix, collection, oldTarget), key)
+      redis.call("ZREM", currentSignatureSet(prefix, collection, oldTarget, oldToken), key)
+    end
+  end
+end
+
+local function addCurrentIndexes(prefix, collection, key, createdAt, targetVersion, versionState, signatureToken, targetSetKey)
+  redis.call("ZADD", targetSetKey, tonumber(targetVersion), key)
+
+  if versionState == "stale" then
+    redis.call("ZADD", staleSet(prefix, collection, targetVersion), tonumber(createdAt), key)
+  elseif versionState == "current" then
+    redis.call("ZADD", currentAnySet(prefix, collection, targetVersion), tonumber(createdAt), key)
+    redis.call("ZADD", currentSignatureSet(prefix, collection, targetVersion, signatureToken), tonumber(createdAt), key)
+  end
+end
+
+local mode = ARGV[1]
+local prefix = ARGV[2]
+local collection = ARGV[3]
+local key = ARGV[4]
+local createdAtArg = ARGV[5]
+local docJson = ARGV[6]
+local indexesJson = ARGV[7]
+local targetVersion = ARGV[8]
+local versionState = ARGV[9]
+local indexSignature = ARGV[10]
+local indexSignatureToken = ARGV[11]
+local expectedWriteVersionRaw = ARGV[12]
+
+local exists = redis.call("EXISTS", KEYS[1]) == 1
+
+if mode == "create" and exists then
+  return {0, 0}
+end
+
+if mode == "update" and not exists then
+  return {0, 0}
+end
+
+local previousWriteVersion = tonumber(redis.call("HGET", KEYS[1], "writeVersion") or "1")
+
+if mode == "conditional" then
+  local expectedWriteVersion = tonumber(expectedWriteVersionRaw)
+  if (not exists) or (not expectedWriteVersion) or previousWriteVersion ~= expectedWriteVersion then
+    return {2, 0}
+  end
+end
+
 local createdAt = redis.call("HGET", KEYS[1], "createdAt")
 if not createdAt then
-  createdAt = ARGV[1]
+  createdAt = createdAtArg
 end
-redis.call("HSET", KEYS[1], "createdAt", createdAt, "doc", ARGV[2], "indexes", ARGV[3])
-redis.call("ZADD", KEYS[2], createdAt, ARGV[4])
-return createdAt
-`;
 
-const UPDATE_DOCUMENT_SCRIPT = `
-local createdAt = redis.call("HGET", KEYS[1], "createdAt")
-if not createdAt then
-  return 0
+removePreviousIndexes(prefix, collection, key, KEYS[3])
+
+local nextWriteVersion = 1
+if exists then
+  nextWriteVersion = previousWriteVersion + 1
 end
-redis.call("HSET", KEYS[1], "createdAt", createdAt, "doc", ARGV[1], "indexes", ARGV[2])
-redis.call("ZADD", KEYS[2], createdAt, ARGV[3])
-return 1
+
+redis.call(
+  "HSET",
+  KEYS[1],
+  "createdAt",
+  createdAt,
+  "writeVersion",
+  tostring(nextWriteVersion),
+  "doc",
+  docJson,
+  "indexes",
+  indexesJson,
+  "migrationTargetVersion",
+  targetVersion,
+  "migrationVersionState",
+  versionState,
+  "migrationIndexSignature",
+  indexSignature,
+  "migrationIndexSignatureToken",
+  indexSignatureToken
+)
+redis.call("ZADD", KEYS[2], tonumber(createdAt), key)
+addCurrentIndexes(prefix, collection, key, createdAt, targetVersion, versionState, indexSignatureToken, KEYS[3])
+return {1, nextWriteVersion}
 `;
 
 const DELETE_DOCUMENT_SCRIPT = `
+local function staleSet(prefix, collection, targetVersion)
+  return prefix .. ":migration:stale:" .. collection .. ":" .. targetVersion
+end
+
+local function currentAnySet(prefix, collection, targetVersion)
+  return prefix .. ":migration:current:any:" .. collection .. ":" .. targetVersion
+end
+
+local function currentSignatureSet(prefix, collection, targetVersion, signatureToken)
+  return prefix .. ":migration:current:sig:" .. collection .. ":" .. targetVersion .. ":" .. signatureToken
+end
+
+local prefix = ARGV[1]
+local collection = ARGV[2]
+local key = ARGV[3]
+
+local oldTarget = redis.call("HGET", KEYS[1], "migrationTargetVersion")
+local oldState = redis.call("HGET", KEYS[1], "migrationVersionState")
+local oldToken = redis.call("HGET", KEYS[1], "migrationIndexSignatureToken")
+
+if oldToken == false or oldToken == nil or oldToken == "" then
+  oldToken = "__null__"
+end
+
 redis.call("DEL", KEYS[1])
-redis.call("ZREM", KEYS[2], ARGV[1])
+redis.call("ZREM", KEYS[2], key)
+redis.call("ZREM", KEYS[3], key)
+
+if oldTarget and oldState then
+  if oldState == "stale" then
+    redis.call("ZREM", staleSet(prefix, collection, oldTarget), key)
+  elseif oldState == "current" then
+    redis.call("ZREM", currentAnySet(prefix, collection, oldTarget), key)
+    redis.call("ZREM", currentSignatureSet(prefix, collection, oldTarget, oldToken), key)
+  end
+end
+
 return 1
+`;
+
+const UPDATE_MIGRATION_METADATA_SCRIPT = `
+local function staleSet(prefix, collection, targetVersion)
+  return prefix .. ":migration:stale:" .. collection .. ":" .. targetVersion
+end
+
+local function currentAnySet(prefix, collection, targetVersion)
+  return prefix .. ":migration:current:any:" .. collection .. ":" .. targetVersion
+end
+
+local function currentSignatureSet(prefix, collection, targetVersion, signatureToken)
+  return prefix .. ":migration:current:sig:" .. collection .. ":" .. targetVersion .. ":" .. signatureToken
+end
+
+local prefix = ARGV[1]
+local collection = ARGV[2]
+local key = ARGV[3]
+local targetVersion = ARGV[4]
+local versionState = ARGV[5]
+local indexSignature = ARGV[6]
+local indexSignatureToken = ARGV[7]
+local expectedWriteVersionRaw = ARGV[8]
+
+if redis.call("EXISTS", KEYS[1]) == 0 then
+  return 0
+end
+
+local expectedWriteVersion = tonumber(expectedWriteVersionRaw)
+local currentWriteVersion = tonumber(redis.call("HGET", KEYS[1], "writeVersion") or "1")
+if not expectedWriteVersion or currentWriteVersion ~= expectedWriteVersion then
+  return 2
+end
+
+local createdAt = redis.call("HGET", KEYS[1], "createdAt")
+if not createdAt then
+  return 0
+end
+
+local oldTarget = redis.call("HGET", KEYS[1], "migrationTargetVersion")
+local oldState = redis.call("HGET", KEYS[1], "migrationVersionState")
+local oldToken = redis.call("HGET", KEYS[1], "migrationIndexSignatureToken")
+if oldToken == false or oldToken == nil or oldToken == "" then
+  oldToken = "__null__"
+end
+
+redis.call("ZREM", KEYS[2], key)
+if oldTarget and oldState then
+  if oldState == "stale" then
+    redis.call("ZREM", staleSet(prefix, collection, oldTarget), key)
+  elseif oldState == "current" then
+    redis.call("ZREM", currentAnySet(prefix, collection, oldTarget), key)
+    redis.call("ZREM", currentSignatureSet(prefix, collection, oldTarget, oldToken), key)
+  end
+end
+
+redis.call(
+  "HSET",
+  KEYS[1],
+  "migrationTargetVersion",
+  targetVersion,
+  "migrationVersionState",
+  versionState,
+  "migrationIndexSignature",
+  indexSignature,
+  "migrationIndexSignatureToken",
+  indexSignatureToken
+)
+redis.call("ZADD", KEYS[2], tonumber(targetVersion), key)
+
+if versionState == "stale" then
+  redis.call("ZADD", staleSet(prefix, collection, targetVersion), tonumber(createdAt), key)
+elseif versionState == "current" then
+  redis.call("ZADD", currentAnySet(prefix, collection, targetVersion), tonumber(createdAt), key)
+  redis.call("ZADD", currentSignatureSet(prefix, collection, targetVersion, indexSignatureToken), tonumber(createdAt), key)
+end
+
+return 1
+`;
+
+const FETCH_TARGET_CANDIDATES_SCRIPT = `
+return redis.call("ZRANGEBYSCORE", KEYS[1], ARGV[1], ARGV[2], "LIMIT", 0, tonumber(ARGV[3]))
+`;
+
+const FETCH_ZSET_PAGE_BY_SCORE_SCRIPT = `
+return redis.call("ZRANGEBYSCORE", KEYS[1], ARGV[1], "+inf", "WITHSCORES", "LIMIT", 0, tonumber(ARGV[2]))
+`;
+
+const BUILD_MISMATCH_SET_SCRIPT = `
+redis.call("DEL", KEYS[1])
+
+if redis.call("EXISTS", KEYS[2]) == 0 then
+  return 0
+end
+
+if redis.call("EXISTS", KEYS[3]) == 1 then
+  redis.call("ZDIFFSTORE", KEYS[1], 2, KEYS[2], KEYS[3])
+else
+  redis.call("ZUNIONSTORE", KEYS[1], 1, KEYS[2])
+end
+
+redis.call("EXPIRE", KEYS[1], tonumber(ARGV[1]))
+return redis.call("ZCARD", KEYS[1])
 `;
 
 const ACQUIRE_LOCK_SCRIPT = `
@@ -105,6 +334,7 @@ interface RedisClientLike {
   del(keys: string | string[]): Promise<unknown>;
   hGetAll(key: string): Promise<unknown>;
   zRange(key: string, start: number, stop: number): Promise<unknown>;
+  zRem(key: string, members: string | string[]): Promise<unknown>;
   incr(key: string): Promise<unknown>;
   eval(script: string, options: RedisEvalOptionsLike): Promise<unknown>;
 }
@@ -119,13 +349,34 @@ export interface RedisQueryEngine extends QueryEngine<never> {}
 interface StoredDocumentRecord {
   key: string;
   createdAt: number;
+  writeVersion: number;
   doc: Record<string, unknown>;
   indexes: ResolvedIndexKeys;
+  migrationTargetVersion: number;
+  migrationVersionState: MigrationVersionState;
+  migrationIndexSignature: string | null;
+  migrationIndexSignatureToken: string;
 }
 
 interface LockRecord {
   lockId: string;
   acquiredAt: number;
+}
+
+interface MigrationMetadata {
+  targetVersion: number;
+  versionState: MigrationVersionState;
+  indexSignature: string | null;
+}
+
+type UpsertMode = "create" | "put" | "update" | "conditional";
+
+interface OutdatedCursorState {
+  phase: "stale" | "mismatch";
+  staleScore: number | null;
+  mismatchScore: number | null;
+  criteriaVersion: number;
+  expectedSignature: string;
 }
 
 export function redisEngine(options: RedisEngineOptions): RedisQueryEngine {
@@ -143,41 +394,52 @@ export function redisEngine(options: RedisEngineOptions): RedisQueryEngine {
       return structuredClone(record.doc);
     },
 
-    async create(collection, key, doc, indexes) {
-      const createdAt = await nextCreatedAt(client, keyPrefix, collection);
-      const result = await evalScript(
+    async create(collection, key, doc, indexes, _options, migrationMetadata) {
+      const result = await upsertDocument(
         client,
-        CREATE_DOCUMENT_SCRIPT,
-        [documentHashKey(keyPrefix, collection, key), collectionOrderKey(keyPrefix, collection)],
-        [String(createdAt), serializeDocument(doc), serializeIndexes(indexes), key],
+        keyPrefix,
+        collection,
+        key,
+        doc,
+        indexes,
+        "create",
+        undefined,
+        migrationMetadata,
       );
 
-      if (parseInteger(result, "Redis returned an invalid create result") !== 1) {
+      if (result.status !== "applied") {
         throw new EngineDocumentAlreadyExistsError(collection, key);
       }
     },
 
-    async put(collection, key, doc, indexes) {
-      const createdAt = await nextCreatedAt(client, keyPrefix, collection);
-      const result = await evalScript(
+    async put(collection, key, doc, indexes, _options, migrationMetadata) {
+      await upsertDocument(
         client,
-        PUT_DOCUMENT_SCRIPT,
-        [documentHashKey(keyPrefix, collection, key), collectionOrderKey(keyPrefix, collection)],
-        [String(createdAt), serializeDocument(doc), serializeIndexes(indexes), key],
+        keyPrefix,
+        collection,
+        key,
+        doc,
+        indexes,
+        "put",
+        undefined,
+        migrationMetadata,
       );
-
-      parseInteger(result, "Redis returned an invalid put result");
     },
 
-    async update(collection, key, doc, indexes) {
-      const result = await evalScript(
+    async update(collection, key, doc, indexes, _options, migrationMetadata) {
+      const result = await upsertDocument(
         client,
-        UPDATE_DOCUMENT_SCRIPT,
-        [documentHashKey(keyPrefix, collection, key), collectionOrderKey(keyPrefix, collection)],
-        [serializeDocument(doc), serializeIndexes(indexes), key],
+        keyPrefix,
+        collection,
+        key,
+        doc,
+        indexes,
+        "update",
+        undefined,
+        migrationMetadata,
       );
 
-      if (parseInteger(result, "Redis returned an invalid update result") !== 1) {
+      if (result.status !== "applied") {
         throw new EngineDocumentNotFoundError(collection, key);
       }
     },
@@ -186,8 +448,12 @@ export function redisEngine(options: RedisEngineOptions): RedisQueryEngine {
       const result = await evalScript(
         client,
         DELETE_DOCUMENT_SCRIPT,
-        [documentHashKey(keyPrefix, collection, key), collectionOrderKey(keyPrefix, collection)],
-        [key],
+        [
+          documentHashKey(keyPrefix, collection, key),
+          collectionOrderKey(keyPrefix, collection),
+          migrationTargetVersionSetKey(keyPrefix, collection),
+        ],
+        [keyPrefix, collection, key],
       );
 
       parseInteger(result, "Redis returned an invalid delete result");
@@ -232,24 +498,59 @@ export function redisEngine(options: RedisEngineOptions): RedisQueryEngine {
 
     async batchSet(collection, items) {
       for (const item of items) {
-        const createdAt = await nextCreatedAt(client, keyPrefix, collection);
-        const result = await evalScript(
+        await upsertDocument(
           client,
-          PUT_DOCUMENT_SCRIPT,
-          [
-            documentHashKey(keyPrefix, collection, item.key),
-            collectionOrderKey(keyPrefix, collection),
-          ],
-          [
-            String(createdAt),
-            serializeDocument(item.doc),
-            serializeIndexes(item.indexes),
-            item.key,
-          ],
+          keyPrefix,
+          collection,
+          item.key,
+          item.doc,
+          item.indexes,
+          "put",
+          undefined,
+          item.migrationMetadata,
+        );
+      }
+    },
+
+    async batchSetWithResult(collection, items) {
+      const persistedKeys: string[] = [];
+      const conflictedKeys: string[] = [];
+
+      for (const item of items) {
+        const expectedWriteVersion =
+          item.expectedWriteToken === undefined
+            ? undefined
+            : parseWriteToken(item.expectedWriteToken);
+        const mode: UpsertMode = expectedWriteVersion === undefined ? "put" : "conditional";
+        const result = await upsertDocument(
+          client,
+          keyPrefix,
+          collection,
+          item.key,
+          item.doc,
+          item.indexes,
+          mode,
+          expectedWriteVersion,
+          item.migrationMetadata,
         );
 
-        parseInteger(result, "Redis returned an invalid batchSet result");
+        if (result.status === "conflict") {
+          conflictedKeys.push(item.key);
+          continue;
+        }
+
+        if (result.status === "missing") {
+          conflictedKeys.push(item.key);
+          continue;
+        }
+
+        persistedKeys.push(item.key);
       }
+
+      return {
+        persistedKeys,
+        conflictedKeys,
+      } satisfies BatchSetResult;
     },
 
     async batchDelete(collection, keys) {
@@ -257,8 +558,12 @@ export function redisEngine(options: RedisEngineOptions): RedisQueryEngine {
         const result = await evalScript(
           client,
           DELETE_DOCUMENT_SCRIPT,
-          [documentHashKey(keyPrefix, collection, key), collectionOrderKey(keyPrefix, collection)],
-          [key],
+          [
+            documentHashKey(keyPrefix, collection, key),
+            collectionOrderKey(keyPrefix, collection),
+            migrationTargetVersionSetKey(keyPrefix, collection),
+          ],
+          [keyPrefix, collection, key],
         );
 
         parseInteger(result, "Redis returned an invalid batchDelete result");
@@ -311,21 +616,8 @@ export function redisEngine(options: RedisEngineOptions): RedisQueryEngine {
       },
 
       async getOutdated(collection, criteria, cursor) {
-        const records = await listCollectionDocuments(client, keyPrefix, collection);
-        const parseVersion = criteria.parseVersion ?? defaultParseVersion;
-        const compareVersions = criteria.compareVersions ?? defaultCompareVersions;
-        const outdated: StoredDocumentRecord[] = [];
-
-        for (const record of records) {
-          if (isOutdated(record.doc, criteria, parseVersion, compareVersions)) {
-            outdated.push(record);
-          }
-        }
-
-        return paginate(outdated, {
-          cursor,
-          limit: OUTDATED_PAGE_LIMIT,
-        });
+        await syncMigrationMetadataForCriteria(client, keyPrefix, collection, criteria);
+        return getOutdatedDocuments(client, keyPrefix, collection, criteria, cursor);
       },
 
       async saveCheckpoint(lock, cursor) {
@@ -414,6 +706,73 @@ async function nextCreatedAt(
   return parseInteger(raw, "Redis returned an invalid sequence value");
 }
 
+async function upsertDocument(
+  client: RedisClientLike,
+  keyPrefix: string,
+  collection: string,
+  key: string,
+  doc: unknown,
+  indexes: ResolvedIndexKeys,
+  mode: UpsertMode,
+  expectedWriteVersion: number | undefined,
+  migrationMetadata: MigrationDocumentMetadata | undefined,
+): Promise<{ status: "applied" | "missing" | "conflict"; writeVersion: number | null }> {
+  const createdAt = await nextCreatedAt(client, keyPrefix, collection);
+  const metadata =
+    normalizeMigrationMetadata(migrationMetadata) ?? deriveLegacyMetadataFromDocument(doc);
+  const result = await evalScript(
+    client,
+    CREATE_DOCUMENT_SCRIPT,
+    [
+      documentHashKey(keyPrefix, collection, key),
+      collectionOrderKey(keyPrefix, collection),
+      migrationTargetVersionSetKey(keyPrefix, collection),
+    ],
+    [
+      mode,
+      keyPrefix,
+      collection,
+      key,
+      String(createdAt),
+      serializeDocument(doc),
+      serializeIndexes(indexes),
+      String(metadata.targetVersion),
+      metadata.versionState,
+      metadata.indexSignature ?? NULL_INDEX_SIGNATURE,
+      migrationSignatureToken(metadata.indexSignature),
+      expectedWriteVersion === undefined ? "" : String(expectedWriteVersion),
+    ],
+  );
+  const [statusCode, writeVersionRaw] = parseIntegerTuple(
+    result,
+    2,
+    "Redis returned an invalid upsert result",
+  );
+
+  if (statusCode === 1) {
+    return {
+      status: "applied",
+      writeVersion: writeVersionRaw ?? null,
+    };
+  }
+
+  if (statusCode === 0) {
+    return {
+      status: mode === "update" ? "missing" : "conflict",
+      writeVersion: null,
+    };
+  }
+
+  if (statusCode === 2) {
+    return {
+      status: "conflict",
+      writeVersion: null,
+    };
+  }
+
+  throw new Error("Redis returned an invalid upsert result");
+}
+
 async function listCollectionDocuments(
   client: RedisClientLike,
   keyPrefix: string,
@@ -452,19 +811,300 @@ async function loadDocumentRecord(
   return parseStoredDocumentRecord(key, fields);
 }
 
+async function syncMigrationMetadataForCriteria(
+  client: RedisClientLike,
+  keyPrefix: string,
+  collection: string,
+  criteria: MigrationCriteria,
+): Promise<void> {
+  await syncMigrationMetadataPhase(client, keyPrefix, collection, criteria, "low");
+  await syncMigrationMetadataPhase(client, keyPrefix, collection, criteria, "high");
+}
+
+type SyncPhase = "low" | "high";
+
+async function syncMigrationMetadataPhase(
+  client: RedisClientLike,
+  keyPrefix: string,
+  collection: string,
+  criteria: MigrationCriteria,
+  phase: SyncPhase,
+): Promise<void> {
+  let loops = 0;
+
+  while (true) {
+    loops += 1;
+    if (loops > 2048) {
+      return;
+    }
+
+    const keysRaw = await evalScript(
+      client,
+      FETCH_TARGET_CANDIDATES_SCRIPT,
+      [migrationTargetVersionSetKey(keyPrefix, collection)],
+      [
+        phase === "low" ? "-inf" : `(${String(criteria.version)}`,
+        phase === "low" ? `(${String(criteria.version)}` : "+inf",
+        String(OUTDATED_SYNC_CHUNK_SIZE),
+      ],
+    );
+    const keys = parseStringArray(keysRaw, "migration sync key list");
+
+    if (keys.length === 0) {
+      return;
+    }
+
+    let changed = false;
+
+    for (const key of keys) {
+      const record = await loadDocumentRecord(client, keyPrefix, collection, key);
+
+      if (!record) {
+        await client.zRem(migrationTargetVersionSetKey(keyPrefix, collection), key);
+        changed = true;
+        continue;
+      }
+
+      const metadata = deriveMetadataForCriteria(record.doc, criteria);
+      const updateRaw = await evalScript(
+        client,
+        UPDATE_MIGRATION_METADATA_SCRIPT,
+        [
+          documentHashKey(keyPrefix, collection, key),
+          migrationTargetVersionSetKey(keyPrefix, collection),
+        ],
+        [
+          keyPrefix,
+          collection,
+          key,
+          String(metadata.targetVersion),
+          metadata.versionState,
+          metadata.indexSignature ?? NULL_INDEX_SIGNATURE,
+          migrationSignatureToken(metadata.indexSignature),
+          String(record.writeVersion),
+        ],
+      );
+      const status = parseInteger(updateRaw, "Redis returned an invalid metadata update result");
+
+      if (status === 1) {
+        changed = true;
+      }
+    }
+
+    if (!changed) {
+      return;
+    }
+  }
+}
+
+async function getOutdatedDocuments(
+  client: RedisClientLike,
+  keyPrefix: string,
+  collection: string,
+  criteria: MigrationCriteria,
+  cursor: string | undefined,
+): Promise<EngineQueryResult> {
+  const expectedSignature = computeIndexSignature(criteria.indexes);
+  const expectedSignatureToken = migrationSignatureToken(expectedSignature);
+  const mismatchKey = migrationMismatchTempKey(
+    keyPrefix,
+    collection,
+    criteria.version,
+    expectedSignatureToken,
+  );
+
+  await evalScript(
+    client,
+    BUILD_MISMATCH_SET_SCRIPT,
+    [
+      mismatchKey,
+      migrationCurrentAnySetKey(keyPrefix, collection, criteria.version),
+      migrationCurrentSignatureSetKey(
+        keyPrefix,
+        collection,
+        criteria.version,
+        expectedSignatureToken,
+      ),
+    ],
+    ["30"],
+  );
+
+  let state = decodeOutdatedCursor(cursor, criteria.version, expectedSignature);
+  const requested = OUTDATED_PAGE_LIMIT;
+  let remaining = requested;
+  const candidates: Array<{ key: string; source: "stale" | "mismatch" }> = [];
+  let nextCursor: string | null = null;
+  const staleSetKey = migrationStaleSetKey(keyPrefix, collection, criteria.version);
+
+  if (state.phase === "stale") {
+    const stale = await fetchZsetPageByScore(
+      client,
+      staleSetKey,
+      state.staleScore,
+      remaining + 1,
+      "outdated stale key list",
+    );
+
+    if (stale.length > remaining) {
+      const page = stale.slice(0, remaining);
+
+      for (const item of page) {
+        candidates.push({ key: item.key, source: "stale" });
+      }
+
+      const tail = page[page.length - 1];
+
+      nextCursor = encodeOutdatedCursor({
+        phase: "stale",
+        staleScore: tail ? tail.score : state.staleScore,
+        mismatchScore: state.mismatchScore,
+        criteriaVersion: criteria.version,
+        expectedSignature,
+      });
+      remaining = 0;
+    } else {
+      for (const item of stale) {
+        candidates.push({ key: item.key, source: "stale" });
+      }
+
+      remaining -= stale.length;
+      state = {
+        phase: "mismatch",
+        staleScore:
+          stale.length > 0
+            ? (stale[stale.length - 1]?.score ?? state.staleScore)
+            : state.staleScore,
+        mismatchScore: state.mismatchScore,
+        criteriaVersion: criteria.version,
+        expectedSignature,
+      };
+    }
+  }
+
+  if (remaining > 0 && state.phase === "mismatch") {
+    const mismatch = await fetchZsetPageByScore(
+      client,
+      mismatchKey,
+      state.mismatchScore,
+      remaining + 1,
+      "outdated mismatch key list",
+    );
+
+    if (mismatch.length > remaining) {
+      const page = mismatch.slice(0, remaining);
+
+      for (const item of page) {
+        candidates.push({ key: item.key, source: "mismatch" });
+      }
+
+      const tail = page[page.length - 1];
+
+      nextCursor = encodeOutdatedCursor({
+        phase: "mismatch",
+        staleScore: state.staleScore,
+        mismatchScore: tail ? tail.score : state.mismatchScore,
+        criteriaVersion: criteria.version,
+        expectedSignature,
+      });
+    } else {
+      for (const item of mismatch) {
+        candidates.push({ key: item.key, source: "mismatch" });
+      }
+
+      nextCursor = null;
+    }
+  }
+
+  const documents: KeyedDocument[] = [];
+
+  for (const candidate of candidates) {
+    const record = await loadDocumentRecord(client, keyPrefix, collection, candidate.key);
+
+    if (!record) {
+      if (candidate.source === "stale") {
+        await client.zRem(staleSetKey, candidate.key);
+      } else {
+        await client.zRem(mismatchKey, candidate.key);
+      }
+      continue;
+    }
+
+    if (!isRecordOutdatedForCriteria(record, criteria.version, expectedSignature)) {
+      continue;
+    }
+
+    documents.push({
+      key: candidate.key,
+      doc: structuredClone(record.doc),
+      writeToken: String(record.writeVersion),
+    });
+  }
+
+  return {
+    documents,
+    cursor: nextCursor,
+  };
+}
+
+async function fetchZsetPageByScore(
+  client: RedisClientLike,
+  key: string,
+  afterScore: number | null,
+  count: number,
+  context: string,
+): Promise<Array<{ key: string; score: number }>> {
+  const min = afterScore === null ? "-inf" : `(${String(afterScore)}`;
+  const raw = await evalScript(
+    client,
+    FETCH_ZSET_PAGE_BY_SCORE_SCRIPT,
+    [key],
+    [min, String(count)],
+  );
+
+  if (!Array.isArray(raw) || raw.length % 2 !== 0) {
+    throw new Error(`Redis returned an invalid ${context}`);
+  }
+
+  const results: Array<{ key: string; score: number }> = [];
+
+  for (let i = 0; i < raw.length; i += 2) {
+    const rawKey = raw[i];
+    const rawScore = raw[i + 1];
+
+    if (typeof rawKey !== "string") {
+      throw new Error(`Redis returned an invalid ${context}`);
+    }
+
+    const score = parseInteger(rawScore, `Redis returned an invalid ${context}`);
+    results.push({
+      key: rawKey,
+      score,
+    });
+  }
+
+  return results;
+}
+
 function parseStoredDocumentRecord(
   key: string,
   fields: Record<string, string>,
 ): StoredDocumentRecord {
   const createdAt = parseInteger(fields.createdAt, "Redis returned an invalid document record");
+  const writeVersion = parseWriteVersion(fields.writeVersion);
   const doc = parseDocument(fields.doc);
   const indexes = parseIndexes(fields.indexes);
+  const metadata = parseMigrationMetadataFields(fields, doc);
 
   return {
     key,
     createdAt,
+    writeVersion,
     doc,
     indexes,
+    migrationTargetVersion: metadata.targetVersion,
+    migrationVersionState: metadata.versionState,
+    migrationIndexSignature: metadata.indexSignature,
+    migrationIndexSignatureToken: migrationSignatureToken(metadata.indexSignature),
   };
 }
 
@@ -483,6 +1123,145 @@ function parseLockRecord(fields: Record<string, string>): LockRecord {
     lockId,
     acquiredAt,
   };
+}
+
+function parseWriteVersion(raw: string | undefined): number {
+  if (raw === undefined) {
+    return 1;
+  }
+
+  const value = parseInteger(raw, "Redis returned an invalid document record");
+
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error("Redis returned an invalid document record");
+  }
+
+  return value;
+}
+
+function parseMigrationMetadataFields(
+  fields: Record<string, string>,
+  doc: Record<string, unknown>,
+): MigrationMetadata {
+  const targetVersionRaw = fields.migrationTargetVersion;
+  const versionStateRaw = fields.migrationVersionState;
+  const indexSignatureRaw = fields.migrationIndexSignature;
+
+  if (
+    targetVersionRaw === undefined ||
+    versionStateRaw === undefined ||
+    indexSignatureRaw === undefined
+  ) {
+    return deriveLegacyMetadataFromDocument(doc);
+  }
+
+  const targetVersion = parseInteger(targetVersionRaw, "Redis returned an invalid document record");
+
+  if (
+    !Number.isInteger(targetVersion) ||
+    targetVersion < 0 ||
+    !isMigrationVersionState(versionStateRaw)
+  ) {
+    throw new Error("Redis returned an invalid document record");
+  }
+
+  if (typeof indexSignatureRaw !== "string") {
+    throw new Error("Redis returned an invalid document record");
+  }
+
+  return {
+    targetVersion,
+    versionState: versionStateRaw,
+    indexSignature: indexSignatureRaw === NULL_INDEX_SIGNATURE ? null : indexSignatureRaw,
+  };
+}
+
+function normalizeMigrationMetadata(
+  raw: MigrationDocumentMetadata | undefined,
+): MigrationMetadata | null {
+  if (!raw) {
+    return null;
+  }
+
+  if (
+    !Number.isFinite(raw.targetVersion) ||
+    Math.floor(raw.targetVersion) !== raw.targetVersion ||
+    raw.targetVersion < 0
+  ) {
+    throw new Error("Redis received invalid migration metadata target version");
+  }
+
+  if (!isMigrationVersionState(raw.versionState)) {
+    throw new Error("Redis received invalid migration metadata state");
+  }
+
+  if (raw.indexSignature !== null && typeof raw.indexSignature !== "string") {
+    throw new Error("Redis received invalid migration metadata index signature");
+  }
+
+  return {
+    targetVersion: raw.targetVersion,
+    versionState: raw.versionState,
+    indexSignature: raw.indexSignature,
+  };
+}
+
+function isMigrationVersionState(value: unknown): value is MigrationVersionState {
+  return value === "current" || value === "stale" || value === "ahead" || value === "unknown";
+}
+
+function deriveLegacyMetadataFromDocument(doc: unknown): MigrationMetadata {
+  if (!isRecord(doc)) {
+    return {
+      targetVersion: 0,
+      versionState: "unknown",
+      indexSignature: null,
+    };
+  }
+
+  const rawVersion = normalizeNumericVersionFromUnknown(doc.__v);
+
+  return {
+    targetVersion: rawVersion ?? 0,
+    versionState: rawVersion === null ? "unknown" : "current",
+    indexSignature: computeIndexSignatureFromUnknown(doc.__indexes),
+  };
+}
+
+function migrationSignatureToken(indexSignature: string | null): string {
+  if (indexSignature === null) {
+    return NULL_INDEX_SIGNATURE_TOKEN;
+  }
+
+  return Buffer.from(indexSignature, "utf8").toString("base64url");
+}
+
+function computeIndexSignature(indexes: readonly string[]): string {
+  return JSON.stringify(indexes);
+}
+
+function computeIndexSignatureFromUnknown(raw: unknown): string | null {
+  if (!Array.isArray(raw) || raw.some((value) => typeof value !== "string")) {
+    return null;
+  }
+
+  return computeIndexSignature(raw as string[]);
+}
+
+function normalizeNumericVersionFromUnknown(raw: unknown): number | null {
+  if (raw === undefined || raw === null) {
+    return null;
+  }
+
+  if (typeof raw === "number") {
+    return Number.isFinite(raw) ? raw : null;
+  }
+
+  if (typeof raw !== "string") {
+    return null;
+  }
+
+  return normalizeNumericVersion(raw);
 }
 
 function parseDocument(raw: unknown): Record<string, unknown> {
@@ -639,6 +1418,20 @@ function parseInteger(value: unknown, message: string): number {
   throw new Error(message);
 }
 
+function parseIntegerTuple(value: unknown, expectedLength: number, message: string): number[] {
+  if (!Array.isArray(value) || value.length < expectedLength) {
+    throw new Error(message);
+  }
+
+  const parsed: number[] = [];
+
+  for (let i = 0; i < expectedLength; i++) {
+    parsed.push(parseInteger(value[i], message));
+  }
+
+  return parsed;
+}
+
 function matchDocuments(
   records: StoredDocumentRecord[],
   params: QueryParams,
@@ -762,42 +1555,56 @@ function matchesCondition(value: string, condition: FieldCondition): boolean {
   return true;
 }
 
-function isOutdated(
-  doc: Record<string, unknown>,
-  criteria: MigrationCriteria,
-  parseVersion: (raw: unknown) => ComparableVersion | null,
-  compareVersions: (a: ComparableVersion, b: ComparableVersion) => number,
+function isRecordOutdatedForCriteria(
+  record: StoredDocumentRecord,
+  criteriaVersion: number,
+  expectedSignature: string,
 ): boolean {
-  const parsedVersion = parseVersion(doc[criteria.versionField]);
-  const storedIndexes = doc[criteria.indexesField];
-  const versionState = classifyVersionState(parsedVersion, criteria.version, compareVersions);
-
-  if (versionState === "stale") {
+  if (record.migrationTargetVersion < criteriaVersion) {
     return true;
   }
 
-  if (versionState !== "current") {
+  if (record.migrationTargetVersion > criteriaVersion) {
     return false;
   }
 
-  if (!Array.isArray(storedIndexes)) {
+  if (record.migrationVersionState === "stale") {
     return true;
   }
 
-  if (storedIndexes.length !== criteria.indexes.length) {
-    return true;
+  if (record.migrationVersionState !== "current") {
+    return false;
   }
 
-  return !storedIndexes.every((name, i) => name === criteria.indexes[i]);
+  return record.migrationIndexSignature !== expectedSignature;
 }
 
-type VersionState = "current" | "stale" | "ahead" | "unknown";
+function deriveMetadataForCriteria(doc: unknown, criteria: MigrationCriteria): MigrationMetadata {
+  if (!isRecord(doc)) {
+    return {
+      targetVersion: criteria.version,
+      versionState: "unknown",
+      indexSignature: null,
+    };
+  }
+
+  const parseVersion = criteria.parseVersion ?? defaultParseVersion;
+  const compareVersions = criteria.compareVersions ?? defaultCompareVersions;
+  const parsedVersion = parseVersion(doc[criteria.versionField]);
+  const versionState = classifyVersionState(parsedVersion, criteria.version, compareVersions);
+
+  return {
+    targetVersion: criteria.version,
+    versionState,
+    indexSignature: computeIndexSignatureFromUnknown(doc[criteria.indexesField]),
+  };
+}
 
 function classifyVersionState(
   parsedVersion: ComparableVersion | null,
   latest: number,
   compareVersions: (a: ComparableVersion, b: ComparableVersion) => number,
-): VersionState {
+): MigrationVersionState {
   if (parsedVersion === null) {
     return "unknown";
   }
@@ -916,6 +1723,78 @@ function normalizeLimit(limit: number | undefined): number | null {
   return Math.floor(limit);
 }
 
+function parseWriteToken(raw: string): number {
+  if (raw.trim().length === 0 || !/^\d+$/.test(raw)) {
+    throw new Error("Redis received an invalid expected write token");
+  }
+
+  const parsed = Number(raw);
+
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error("Redis received an invalid expected write token");
+  }
+
+  return parsed;
+}
+
+function encodeOutdatedCursor(state: OutdatedCursorState): string {
+  return Buffer.from(JSON.stringify(state), "utf8").toString("base64url");
+}
+
+function decodeOutdatedCursor(
+  cursor: string | undefined,
+  criteriaVersion: number,
+  expectedSignature: string,
+): OutdatedCursorState {
+  const fallback: OutdatedCursorState = {
+    phase: "stale",
+    staleScore: null,
+    mismatchScore: null,
+    criteriaVersion,
+    expectedSignature,
+  };
+
+  if (!cursor) {
+    return fallback;
+  }
+
+  try {
+    const parsed = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+
+    if (!isRecord(parsed)) {
+      return fallback;
+    }
+
+    if (
+      (parsed.phase !== "stale" && parsed.phase !== "mismatch") ||
+      parsed.criteriaVersion !== criteriaVersion ||
+      parsed.expectedSignature !== expectedSignature ||
+      !isNullableFiniteNumber(parsed.staleScore) ||
+      !isNullableFiniteNumber(parsed.mismatchScore)
+    ) {
+      return fallback;
+    }
+
+    return {
+      phase: parsed.phase,
+      staleScore: parsed.staleScore ?? null,
+      mismatchScore: parsed.mismatchScore ?? null,
+      criteriaVersion,
+      expectedSignature,
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+function isNullableFiniteNumber(value: unknown): value is number | null {
+  if (value === null) {
+    return true;
+  }
+
+  return typeof value === "number" && Number.isFinite(value);
+}
+
 function normalizePrefix(prefix: string): string {
   const normalized = prefix.trim();
 
@@ -936,6 +1815,40 @@ function collectionOrderKey(prefix: string, collection: string): string {
 
 function collectionSequenceKey(prefix: string, collection: string): string {
   return `${prefix}:sequence:${collection}`;
+}
+
+function migrationTargetVersionSetKey(prefix: string, collection: string): string {
+  return `${prefix}:migration:target:${collection}`;
+}
+
+function migrationStaleSetKey(prefix: string, collection: string, targetVersion: number): string {
+  return `${prefix}:migration:stale:${collection}:${String(targetVersion)}`;
+}
+
+function migrationCurrentAnySetKey(
+  prefix: string,
+  collection: string,
+  targetVersion: number,
+): string {
+  return `${prefix}:migration:current:any:${collection}:${String(targetVersion)}`;
+}
+
+function migrationCurrentSignatureSetKey(
+  prefix: string,
+  collection: string,
+  targetVersion: number,
+  signatureToken: string,
+): string {
+  return `${prefix}:migration:current:sig:${collection}:${String(targetVersion)}:${signatureToken}`;
+}
+
+function migrationMismatchTempKey(
+  prefix: string,
+  collection: string,
+  targetVersion: number,
+  signatureToken: string,
+): string {
+  return `${prefix}:migration:tmp:mismatch:${collection}:${String(targetVersion)}:${signatureToken}`;
 }
 
 function migrationLockKey(prefix: string, collection: string): string {
