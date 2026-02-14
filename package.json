@@ -74,6 +74,9 @@
       "require": "./dist/engines/postgres.js"
     }
   },
+  "publishConfig": {
+    "provenance": true
+  },
   "scripts": {
     "test": "bun test ./tests/unit/*.test.ts",
     "test:integration": "bun test ./tests/integration/*.test.ts",
