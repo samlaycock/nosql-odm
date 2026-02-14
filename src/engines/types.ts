@@ -8,11 +8,28 @@
  */
 export type ResolvedIndexKeys = Record<string, string>;
 export type ComparableVersion = string | number;
+export type MigrationVersionState = "current" | "stale" | "ahead" | "unknown";
+
+export interface MigrationDocumentMetadata {
+  /**
+   * The schema version this state was evaluated against.
+   */
+  targetVersion: number;
+  /**
+   * Version state relative to targetVersion.
+   */
+  versionState: MigrationVersionState;
+  /**
+   * Canonical signature of stored index names for the document.
+   */
+  indexSignature: string | null;
+}
 
 export interface BatchSetItem {
   key: string;
   doc: unknown;
   indexes: ResolvedIndexKeys;
+  migrationMetadata?: MigrationDocumentMetadata;
   /**
    * Optional optimistic-write token captured when the document was read.
    * Engines that support conditional writes can use this to avoid clobbering
@@ -179,6 +196,7 @@ export interface QueryEngine<TOptions = Record<string, unknown>> {
     doc: unknown,
     indexes: ResolvedIndexKeys,
     options?: TOptions,
+    migrationMetadata?: MigrationDocumentMetadata,
   ): Promise<void>;
 
   put(
@@ -187,6 +205,7 @@ export interface QueryEngine<TOptions = Record<string, unknown>> {
     doc: unknown,
     indexes: ResolvedIndexKeys,
     options?: TOptions,
+    migrationMetadata?: MigrationDocumentMetadata,
   ): Promise<void>;
 
   /**
@@ -199,6 +218,7 @@ export interface QueryEngine<TOptions = Record<string, unknown>> {
     doc: unknown,
     indexes: ResolvedIndexKeys,
     options?: TOptions,
+    migrationMetadata?: MigrationDocumentMetadata,
   ): Promise<void>;
 
   delete(collection: string, key: string, options?: TOptions): Promise<void>;
