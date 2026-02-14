@@ -1,12 +1,15 @@
 import {
+  type BatchSetResult,
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
   type ComparableVersion,
   type EngineQueryResult,
   type FieldCondition,
   type KeyedDocument,
+  type MigrationDocumentMetadata,
   type MigrationCriteria,
   type MigrationLock,
+  type MigrationVersionState,
   type QueryEngine,
   type QueryParams,
   type ResolvedIndexKeys,
@@ -16,6 +19,7 @@ import { DefaultMigrator } from "../migrator";
 const DEFAULT_DOCUMENTS_COLLECTION = "nosql_odm_documents";
 const DEFAULT_METADATA_COLLECTION = "nosql_odm_metadata";
 const OUTDATED_PAGE_LIMIT = 100;
+const OUTDATED_SYNC_CHUNK_SIZE = 100;
 
 interface FirestoreSetOptionsLike {
   merge?: boolean;
@@ -40,6 +44,7 @@ interface FirestoreDocumentReferenceLike {
 
 interface FirestoreQueryLike {
   where(fieldPath: string, opStr: string, value: unknown): FirestoreQueryLike;
+  limit(limit: number): FirestoreQueryLike;
   get(): Promise<unknown>;
 }
 
@@ -79,13 +84,26 @@ export interface FirestoreQueryEngine extends QueryEngine<never> {}
 interface StoredDocumentRecord {
   key: string;
   createdAt: number;
+  writeVersion: number;
   doc: Record<string, unknown>;
   indexes: ResolvedIndexKeys;
+  migrationTargetVersion: number;
+  migrationVersionState: MigrationVersionState;
+  migrationIndexSignature: string | null;
+  migrationNeedsMigration: boolean;
+  migrationOrderKey: string;
+  migrationPartition: string;
 }
 
 interface LockRecord {
   lockId: string;
   acquiredAt: number;
+}
+
+interface MigrationMetadata {
+  targetVersion: number;
+  versionState: MigrationVersionState;
+  indexSignature: string | null;
 }
 
 export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQueryEngine {
@@ -111,7 +129,7 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
       return structuredClone(record.doc);
     },
 
-    async create(collection, key, doc, indexes) {
+    async create(collection, key, doc, indexes, _options, migrationMetadata) {
       const record = await database.runTransaction(async (transaction) => {
         const ref = documentRef(documentsCollection, collection, key);
         const existingRaw = await transaction.get(ref);
@@ -122,7 +140,17 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
         }
 
         const createdAt = await nextCreatedAt(transaction, metadataCollection, collection);
-        const created = createStoredDocumentRecord(collection, key, createdAt, doc, indexes);
+        const resolved = resolveWriteMetadata(migrationMetadata, doc);
+        const created = createStoredDocumentRecord(
+          collection,
+          key,
+          createdAt,
+          1,
+          doc,
+          indexes,
+          resolved.metadata,
+          resolved.needsMigrationOverride,
+        );
 
         transaction.create(ref, created);
 
@@ -132,21 +160,35 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
       void record;
     },
 
-    async put(collection, key, doc, indexes) {
+    async put(collection, key, doc, indexes, _options, migrationMetadata) {
       await database.runTransaction(async (transaction) => {
         const ref = documentRef(documentsCollection, collection, key);
         const existingRaw = await transaction.get(ref);
         const existing = parseDocumentSnapshot(existingRaw, "document record");
-        const createdAt = existing.exists
-          ? parseStoredDocumentRecord(snapshotData(existing, "document record")).createdAt
+        const resolved = resolveWriteMetadata(migrationMetadata, doc);
+        const existingRecord = existing.exists
+          ? parseStoredDocumentRecord(snapshotData(existing, "document record"))
+          : null;
+        const createdAt = existingRecord?.createdAt
+          ? existingRecord.createdAt
           : await nextCreatedAt(transaction, metadataCollection, collection);
-        const updated = createStoredDocumentRecord(collection, key, createdAt, doc, indexes);
+        const writeVersion = existingRecord ? existingRecord.writeVersion + 1 : 1;
+        const updated = createStoredDocumentRecord(
+          collection,
+          key,
+          createdAt,
+          writeVersion,
+          doc,
+          indexes,
+          resolved.metadata,
+          resolved.needsMigrationOverride,
+        );
 
         transaction.set(ref, updated);
       });
     },
 
-    async update(collection, key, doc, indexes) {
+    async update(collection, key, doc, indexes, _options, migrationMetadata) {
       await database.runTransaction(async (transaction) => {
         const ref = documentRef(documentsCollection, collection, key);
         const existingRaw = await transaction.get(ref);
@@ -157,12 +199,16 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
         }
 
         const existingRecord = parseStoredDocumentRecord(snapshotData(existing, "document record"));
+        const resolved = resolveWriteMetadata(migrationMetadata, doc);
         const updated = createStoredDocumentRecord(
           collection,
           key,
           existingRecord.createdAt,
+          existingRecord.writeVersion + 1,
           doc,
           indexes,
+          resolved.metadata,
+          resolved.needsMigrationOverride,
         );
 
         transaction.set(ref, updated);
@@ -231,20 +277,94 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
           const ref = documentRef(documentsCollection, collection, item.key);
           const existingRaw = await transaction.get(ref);
           const existing = parseDocumentSnapshot(existingRaw, "document record");
-          const createdAt = existing.exists
-            ? parseStoredDocumentRecord(snapshotData(existing, "document record")).createdAt
+          const existingRecord = existing.exists
+            ? parseStoredDocumentRecord(snapshotData(existing, "document record"))
+            : null;
+          const createdAt = existingRecord
+            ? existingRecord.createdAt
             : await nextCreatedAt(transaction, metadataCollection, collection);
+          const writeVersion = existingRecord ? existingRecord.writeVersion + 1 : 1;
+          const resolved = resolveWriteMetadata(item.migrationMetadata, item.doc);
           const updated = createStoredDocumentRecord(
             collection,
             item.key,
             createdAt,
+            writeVersion,
             item.doc,
             item.indexes,
+            resolved.metadata,
+            resolved.needsMigrationOverride,
           );
 
           transaction.set(ref, updated);
         });
       }
+    },
+
+    async batchSetWithResult(collection, items) {
+      const persistedKeys: string[] = [];
+      const conflictedKeys: string[] = [];
+
+      for (const item of items) {
+        const expectedWriteVersion = parseExpectedWriteVersion(item.expectedWriteToken);
+        const resolved = resolveWriteMetadata(item.migrationMetadata, item.doc);
+
+        const result = await database.runTransaction(async (transaction) => {
+          const ref = documentRef(documentsCollection, collection, item.key);
+          const existingRaw = await transaction.get(ref);
+          const existing = parseDocumentSnapshot(existingRaw, "document record");
+          const existingRecord = existing.exists
+            ? parseStoredDocumentRecord(snapshotData(existing, "document record"))
+            : null;
+
+          if (expectedWriteVersion !== undefined) {
+            if (!existingRecord || existingRecord.writeVersion !== expectedWriteVersion) {
+              return "conflict" as const;
+            }
+
+            const updated = createStoredDocumentRecord(
+              collection,
+              item.key,
+              existingRecord.createdAt,
+              existingRecord.writeVersion + 1,
+              item.doc,
+              item.indexes,
+              resolved.metadata,
+              resolved.needsMigrationOverride,
+            );
+            transaction.set(ref, updated);
+            return "persisted" as const;
+          }
+
+          const createdAt = existingRecord
+            ? existingRecord.createdAt
+            : await nextCreatedAt(transaction, metadataCollection, collection);
+          const writeVersion = existingRecord ? existingRecord.writeVersion + 1 : 1;
+          const updated = createStoredDocumentRecord(
+            collection,
+            item.key,
+            createdAt,
+            writeVersion,
+            item.doc,
+            item.indexes,
+            resolved.metadata,
+            resolved.needsMigrationOverride,
+          );
+          transaction.set(ref, updated);
+          return "persisted" as const;
+        });
+
+        if (result === "persisted") {
+          persistedKeys.push(item.key);
+        } else {
+          conflictedKeys.push(item.key);
+        }
+      }
+
+      return {
+        persistedKeys,
+        conflictedKeys,
+      } satisfies BatchSetResult;
     },
 
     async batchDelete(collection, keys) {
@@ -323,21 +443,8 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
       },
 
       async getOutdated(collection, criteria, cursor) {
-        const records = await listCollectionDocuments(documentsCollection, collection);
-        const parseVersion = criteria.parseVersion ?? defaultParseVersion;
-        const compareVersions = criteria.compareVersions ?? defaultCompareVersions;
-        const outdated: StoredDocumentRecord[] = [];
-
-        for (const record of records) {
-          if (isOutdated(record.doc, criteria, parseVersion, compareVersions)) {
-            outdated.push(record);
-          }
-        }
-
-        return paginate(outdated, {
-          cursor,
-          limit: OUTDATED_PAGE_LIMIT,
-        });
+        await syncMigrationMetadataForCriteria(database, documentsCollection, collection, criteria);
+        return queryOutdatedDocuments(documentsCollection, collection, criteria, cursor);
       },
 
       async saveCheckpoint(lock, cursor) {
@@ -502,10 +609,178 @@ async function listCollectionDocuments(
   return records;
 }
 
+async function syncMigrationMetadataForCriteria(
+  database: FirestoreLike,
+  documentsCollection: FirestoreCollectionLike,
+  collection: string,
+  criteria: MigrationCriteria,
+): Promise<void> {
+  const expectedSignature = computeIndexSignature(criteria.indexes);
+
+  await syncMetadataPhase(
+    database,
+    documentsCollection,
+    collection,
+    {
+      field: "migrationTargetVersion",
+      op: "<",
+      value: criteria.version,
+    },
+    criteria,
+    expectedSignature,
+  );
+
+  await syncMetadataPhase(
+    database,
+    documentsCollection,
+    collection,
+    {
+      field: "migrationTargetVersion",
+      op: ">",
+      value: criteria.version,
+    },
+    criteria,
+    expectedSignature,
+  );
+
+  await syncMetadataPhase(
+    database,
+    documentsCollection,
+    collection,
+    {
+      field: "migrationTargetVersion",
+      op: "==",
+      value: null,
+    },
+    criteria,
+    expectedSignature,
+  );
+
+  await syncMetadataPhase(
+    database,
+    documentsCollection,
+    collection,
+    {
+      field: "migrationTargetVersion",
+      op: "==",
+      value: criteria.version,
+    },
+    criteria,
+    expectedSignature,
+    {
+      field: "migrationNeedsMigration",
+      op: "==",
+      value: null,
+    },
+  );
+}
+
+async function syncMetadataPhase(
+  database: FirestoreLike,
+  documentsCollection: FirestoreCollectionLike,
+  collection: string,
+  filter: { field: string; op: string; value: unknown },
+  criteria: MigrationCriteria,
+  expectedSignature: string,
+  extraFilter?: { field: string; op: string; value: unknown },
+): Promise<void> {
+  while (true) {
+    let query = documentsCollection
+      .where("collection", "==", collection)
+      .where(filter.field, filter.op, filter.value);
+
+    if (extraFilter) {
+      query = query.where(extraFilter.field, extraFilter.op, extraFilter.value);
+    }
+
+    const raw = await query.limit(OUTDATED_SYNC_CHUNK_SIZE).get();
+    const snapshot = parseQuerySnapshot(raw, "document record");
+
+    if (snapshot.docs.length === 0) {
+      return;
+    }
+
+    for (const doc of snapshot.docs) {
+      const record = parseStoredDocumentRecord(snapshotData(doc, "document record"));
+
+      await database.runTransaction(async (transaction) => {
+        const ref = documentRef(documentsCollection, collection, record.key);
+        const existingRaw = await transaction.get(ref);
+        const existing = parseDocumentSnapshot(existingRaw, "document record");
+
+        if (!existing.exists) {
+          return;
+        }
+
+        const current = parseStoredDocumentRecord(snapshotData(existing, "document record"));
+        const nextMetadata = deriveMetadataForCriteria(current.doc, criteria);
+        const nextNeedsMigration = computeNeedsMigration(nextMetadata, expectedSignature);
+
+        transaction.set(
+          ref,
+          {
+            migrationTargetVersion: nextMetadata.targetVersion,
+            migrationVersionState: nextMetadata.versionState,
+            migrationIndexSignature: nextMetadata.indexSignature,
+            migrationNeedsMigration: nextNeedsMigration,
+            migrationPartition: migrationPartitionKey(
+              collection,
+              nextMetadata.targetVersion,
+              nextNeedsMigration,
+            ),
+          },
+          { merge: true },
+        );
+      });
+    }
+
+    if (snapshot.docs.length < OUTDATED_SYNC_CHUNK_SIZE) {
+      return;
+    }
+  }
+}
+
+async function queryOutdatedDocuments(
+  documentsCollection: FirestoreCollectionLike,
+  collection: string,
+  criteria: MigrationCriteria,
+  cursor: string | undefined,
+): Promise<EngineQueryResult> {
+  const partition = migrationPartitionKey(collection, criteria.version, true);
+  let query = documentsCollection.where("migrationPartition", "==", partition);
+
+  if (typeof cursor === "string" && cursor.length > 0) {
+    query = query.where("migrationOrderKey", ">", cursor);
+  }
+
+  const raw = await query.limit(OUTDATED_PAGE_LIMIT + 1).get();
+  const snapshot = parseQuerySnapshot(raw, "document record");
+  const records = snapshot.docs
+    .map((doc) => parseStoredDocumentRecord(snapshotData(doc, "document record")))
+    .sort((a, b) => a.migrationOrderKey.localeCompare(b.migrationOrderKey));
+  const hasMore = records.length > OUTDATED_PAGE_LIMIT;
+  const pageRecords = hasMore ? records.slice(0, OUTDATED_PAGE_LIMIT) : records;
+  const documents: KeyedDocument[] = [];
+
+  for (const record of pageRecords) {
+    documents.push({
+      key: record.key,
+      doc: structuredClone(record.doc),
+      writeToken: String(record.writeVersion),
+    });
+  }
+
+  return {
+    documents,
+    cursor: hasMore ? (pageRecords[pageRecords.length - 1]?.migrationOrderKey ?? null) : null,
+  };
+}
+
 function parseStoredDocumentRecord(raw: unknown): StoredDocumentRecord {
   const record = parseRecord(raw, "document record");
   const key = readString(record, "key", "document record");
   const createdAt = readFiniteNumber(record, "createdAt", "document record");
+  const writeVersion = readWriteVersion(record);
   const docRaw = record.doc;
 
   if (!isRecord(docRaw)) {
@@ -513,12 +788,27 @@ function parseStoredDocumentRecord(raw: unknown): StoredDocumentRecord {
   }
 
   const indexes = parseIndexes(record.indexes);
+  const migrationMetadata = parseMigrationMetadataFields(record);
+  const migrationNeedsMigration = parseMigrationNeedsMigration(record, migrationMetadata);
+  const migrationOrder = parseMigrationOrderKey(record, createdAt, key);
+  const migrationPartition = parseMigrationPartition(
+    record,
+    migrationMetadata,
+    migrationNeedsMigration,
+  );
 
   return {
     key,
     createdAt,
+    writeVersion,
     doc: docRaw,
     indexes,
+    migrationTargetVersion: migrationMetadata.targetVersion,
+    migrationVersionState: migrationMetadata.versionState,
+    migrationIndexSignature: migrationMetadata.indexSignature,
+    migrationNeedsMigration,
+    migrationOrderKey: migrationOrder,
+    migrationPartition,
   };
 }
 
@@ -556,6 +846,107 @@ function parseIndexes(raw: unknown): ResolvedIndexKeys {
   return indexes;
 }
 
+function readWriteVersion(record: Record<string, unknown>): number {
+  const raw = record.writeVersion;
+
+  if (raw === undefined || raw === null) {
+    return 1;
+  }
+
+  const value = readFiniteNumber(record, "writeVersion", "document record");
+
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error("Firestore returned an invalid document record");
+  }
+
+  return value;
+}
+
+function parseMigrationMetadataFields(record: Record<string, unknown>): MigrationMetadata {
+  const targetVersionRaw = record.migrationTargetVersion;
+  const versionStateRaw = record.migrationVersionState;
+  const indexSignatureRaw = record.migrationIndexSignature;
+
+  if (
+    targetVersionRaw === undefined ||
+    versionStateRaw === undefined ||
+    indexSignatureRaw === undefined
+  ) {
+    return deriveLegacyMetadataFromDocument(record.doc);
+  }
+
+  if (
+    typeof targetVersionRaw !== "number" ||
+    !Number.isFinite(targetVersionRaw) ||
+    !Number.isInteger(targetVersionRaw) ||
+    targetVersionRaw < 0 ||
+    !isMigrationVersionState(versionStateRaw) ||
+    (indexSignatureRaw !== null && typeof indexSignatureRaw !== "string")
+  ) {
+    throw new Error("Firestore returned an invalid document record");
+  }
+
+  return {
+    targetVersion: targetVersionRaw,
+    versionState: versionStateRaw,
+    indexSignature: indexSignatureRaw,
+  };
+}
+
+function parseMigrationNeedsMigration(
+  record: Record<string, unknown>,
+  metadata: MigrationMetadata,
+): boolean {
+  const raw = record.migrationNeedsMigration;
+
+  if (raw === undefined || raw === null) {
+    return metadata.versionState === "stale" || metadata.indexSignature === null;
+  }
+
+  if (typeof raw !== "boolean") {
+    throw new Error("Firestore returned an invalid document record");
+  }
+
+  return raw;
+}
+
+function parseMigrationOrderKey(
+  record: Record<string, unknown>,
+  createdAt: number,
+  key: string,
+): string {
+  const raw = record.migrationOrderKey;
+
+  if (raw === undefined || raw === null) {
+    return migrationOrderKey(createdAt, key);
+  }
+
+  if (typeof raw !== "string") {
+    throw new Error("Firestore returned an invalid document record");
+  }
+
+  return raw;
+}
+
+function parseMigrationPartition(
+  record: Record<string, unknown>,
+  metadata: MigrationMetadata,
+  needsMigration: boolean,
+): string {
+  const raw = record.migrationPartition;
+
+  if (raw === undefined || raw === null) {
+    const collection = readString(record, "collection", "document record");
+    return migrationPartitionKey(collection, metadata.targetVersion, needsMigration);
+  }
+
+  if (typeof raw !== "string") {
+    throw new Error("Firestore returned an invalid document record");
+  }
+
+  return raw;
+}
+
 function normalizeDocument(doc: unknown): Record<string, unknown> {
   const cloned = structuredClone(doc);
 
@@ -584,15 +975,35 @@ function createStoredDocumentRecord(
   collection: string,
   key: string,
   createdAt: number,
+  writeVersion: number,
   doc: unknown,
   indexes: ResolvedIndexKeys,
+  metadata: MigrationMetadata,
+  needsMigrationOverride?: boolean | null,
 ): Record<string, unknown> {
+  const defaultNeedsMigration =
+    metadata.versionState === "stale" || metadata.indexSignature === null;
+  const needsMigration =
+    needsMigrationOverride === undefined ? defaultNeedsMigration : needsMigrationOverride;
+  const partitionNeedsMigration = needsMigration === true;
+
   return {
     collection,
     key,
     createdAt,
+    writeVersion,
     doc: normalizeDocument(doc),
     indexes: normalizeIndexes(indexes),
+    migrationTargetVersion: metadata.targetVersion,
+    migrationVersionState: metadata.versionState,
+    migrationIndexSignature: metadata.indexSignature,
+    migrationNeedsMigration: needsMigration,
+    migrationOrderKey: migrationOrderKey(createdAt, key),
+    migrationPartition: migrationPartitionKey(
+      collection,
+      metadata.targetVersion,
+      partitionNeedsMigration,
+    ),
   };
 }
 
@@ -817,42 +1228,11 @@ function matchesCondition(value: string, condition: FieldCondition): boolean {
   return true;
 }
 
-function isOutdated(
-  doc: Record<string, unknown>,
-  criteria: MigrationCriteria,
-  parseVersion: (raw: unknown) => ComparableVersion | null,
-  compareVersions: (a: ComparableVersion, b: ComparableVersion) => number,
-): boolean {
-  const parsedVersion = parseVersion(doc[criteria.versionField]);
-  const storedIndexes = doc[criteria.indexesField];
-  const versionState = classifyVersionState(parsedVersion, criteria.version, compareVersions);
-
-  if (versionState === "stale") {
-    return true;
-  }
-
-  if (versionState !== "current") {
-    return false;
-  }
-
-  if (!Array.isArray(storedIndexes)) {
-    return true;
-  }
-
-  if (storedIndexes.length !== criteria.indexes.length) {
-    return true;
-  }
-
-  return !storedIndexes.every((name, i) => name === criteria.indexes[i]);
-}
-
-type VersionState = "current" | "stale" | "ahead" | "unknown";
-
 function classifyVersionState(
   parsedVersion: ComparableVersion | null,
   latest: number,
   compareVersions: (a: ComparableVersion, b: ComparableVersion) => number,
-): VersionState {
+): MigrationVersionState {
   if (parsedVersion === null) {
     return "unknown";
   }
@@ -957,6 +1337,167 @@ function normalizeNumericVersion(value: string): number | null {
   const parsed = Number(match[1]);
 
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+function deriveMetadataForCriteria(doc: unknown, criteria: MigrationCriteria): MigrationMetadata {
+  if (!isRecord(doc)) {
+    return {
+      targetVersion: criteria.version,
+      versionState: "unknown",
+      indexSignature: null,
+    };
+  }
+
+  const parseVersion = criteria.parseVersion ?? defaultParseVersion;
+  const compareVersions = criteria.compareVersions ?? defaultCompareVersions;
+  const parsedVersion = parseVersion(doc[criteria.versionField]);
+  const versionState = classifyVersionState(parsedVersion, criteria.version, compareVersions);
+
+  return {
+    targetVersion: criteria.version,
+    versionState,
+    indexSignature: computeIndexSignatureFromUnknown(doc[criteria.indexesField]),
+  };
+}
+
+function normalizeMigrationMetadata(
+  raw: MigrationDocumentMetadata | undefined,
+): MigrationMetadata | null {
+  if (!raw) {
+    return null;
+  }
+
+  if (
+    !Number.isFinite(raw.targetVersion) ||
+    Math.floor(raw.targetVersion) !== raw.targetVersion ||
+    raw.targetVersion < 0
+  ) {
+    throw new Error("Firestore received invalid migration metadata target version");
+  }
+
+  if (!isMigrationVersionState(raw.versionState)) {
+    throw new Error("Firestore received invalid migration metadata state");
+  }
+
+  if (raw.indexSignature !== null && typeof raw.indexSignature !== "string") {
+    throw new Error("Firestore received invalid migration metadata index signature");
+  }
+
+  return {
+    targetVersion: raw.targetVersion,
+    versionState: raw.versionState,
+    indexSignature: raw.indexSignature,
+  };
+}
+
+function resolveWriteMetadata(
+  raw: MigrationDocumentMetadata | undefined,
+  doc: unknown,
+): { metadata: MigrationMetadata; needsMigrationOverride?: boolean | null } {
+  const normalized = normalizeMigrationMetadata(raw);
+
+  if (normalized) {
+    return { metadata: normalized };
+  }
+
+  return {
+    metadata: deriveLegacyMetadataFromDocument(doc),
+    // Derived metadata is relative to the stored document itself, not the
+    // current migration criteria, so force a one-time sync pass.
+    needsMigrationOverride: null,
+  };
+}
+
+function deriveLegacyMetadataFromDocument(doc: unknown): MigrationMetadata {
+  if (!isRecord(doc)) {
+    return {
+      targetVersion: 0,
+      versionState: "unknown",
+      indexSignature: null,
+    };
+  }
+
+  const rawVersion = normalizeNumericVersionFromUnknown(doc.__v);
+
+  return {
+    targetVersion: rawVersion ?? 0,
+    versionState: rawVersion === null ? "unknown" : "current",
+    indexSignature: computeIndexSignatureFromUnknown(doc.__indexes),
+  };
+}
+
+function isMigrationVersionState(value: unknown): value is MigrationVersionState {
+  return value === "current" || value === "stale" || value === "ahead" || value === "unknown";
+}
+
+function parseExpectedWriteVersion(raw: string | undefined): number | undefined {
+  if (raw === undefined) {
+    return undefined;
+  }
+
+  if (typeof raw !== "string" || raw.trim().length === 0 || !/^\d+$/.test(raw)) {
+    throw new Error("Firestore received an invalid expected write token");
+  }
+
+  const parsed = Number(raw);
+
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error("Firestore received an invalid expected write token");
+  }
+
+  return parsed;
+}
+
+function computeNeedsMigration(metadata: MigrationMetadata, expectedSignature: string): boolean {
+  if (metadata.versionState === "stale") {
+    return true;
+  }
+
+  if (metadata.versionState !== "current") {
+    return false;
+  }
+
+  return metadata.indexSignature !== expectedSignature;
+}
+
+function computeIndexSignature(indexes: readonly string[]): string {
+  return JSON.stringify(indexes);
+}
+
+function computeIndexSignatureFromUnknown(raw: unknown): string | null {
+  if (!Array.isArray(raw) || raw.some((value) => typeof value !== "string")) {
+    return null;
+  }
+
+  return computeIndexSignature(raw as string[]);
+}
+
+function normalizeNumericVersionFromUnknown(raw: unknown): number | null {
+  if (raw === undefined || raw === null) {
+    return null;
+  }
+
+  if (typeof raw === "number") {
+    return Number.isFinite(raw) ? raw : null;
+  }
+
+  if (typeof raw !== "string") {
+    return null;
+  }
+
+  return normalizeNumericVersion(raw);
+}
+
+function migrationPartitionKey(
+  collection: string,
+  targetVersion: number,
+  needsMigration: boolean,
+): string {
+  return `mig:${encodeIdPart(collection)}:${String(targetVersion)}:${needsMigration ? "1" : "0"}`;
+}
+
+function migrationOrderKey(createdAt: number, key: string): string {
+  return `${String(createdAt).padStart(16, "0")}#${encodeIdPart(key)}`;
 }
 
 function normalizeLimit(limit: number | undefined): number | null {
