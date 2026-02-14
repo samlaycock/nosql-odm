@@ -696,11 +696,11 @@ async function ensureSchema(client: PostgresQueryableLike, refs: TableRefs): Pro
   await session.query(`SELECT pg_advisory_lock($1)`, [lockKey]);
 
   try {
-  const documentsCollectionIdIndex = quoteIdentifier(
-    createIndexName(refs.documentsTable, "collection_id_idx"),
-  );
-  const indexesLookupIndex = quoteIdentifier(createIndexName(refs.indexesTable, "lookup_idx"));
-  const indexesScanIndex = quoteIdentifier(createIndexName(refs.indexesTable, "scan_idx"));
+    const documentsCollectionIdIndex = quoteIdentifier(
+      createIndexName(refs.documentsTable, "collection_id_idx"),
+    );
+    const indexesLookupIndex = quoteIdentifier(createIndexName(refs.indexesTable, "lookup_idx"));
+    const indexesScanIndex = quoteIdentifier(createIndexName(refs.indexesTable, "scan_idx"));
 
     await session.query(`CREATE SCHEMA IF NOT EXISTS ${refs.schema}`);
 
