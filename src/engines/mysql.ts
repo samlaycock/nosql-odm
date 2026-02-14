@@ -1,11 +1,15 @@
 import {
+  type BatchSetItem,
+  type BatchSetResult,
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
   type ComparableVersion,
   type EngineQueryResult,
   type FieldCondition,
   type KeyedDocument,
+  type MigrationDocumentMetadata,
   type MigrationCriteria,
+  type MigrationVersionState,
   type QueryEngine,
   type QueryParams,
   type ResolvedIndexKeys,
@@ -14,6 +18,7 @@ import { DefaultMigrator } from "../migrator";
 
 const DEFAULT_DOCUMENTS_TABLE = "nosql_odm_documents";
 const DEFAULT_INDEXES_TABLE = "nosql_odm_index_entries";
+const DEFAULT_MIGRATION_METADATA_TABLE = "nosql_odm_migration_metadata";
 const DEFAULT_MIGRATION_LOCKS_TABLE = "nosql_odm_migration_locks";
 const DEFAULT_MIGRATION_CHECKPOINTS_TABLE = "nosql_odm_migration_checkpoints";
 
@@ -41,6 +46,7 @@ export interface MySqlEngineOptions {
   database?: string;
   documentsTable?: string;
   indexesTable?: string;
+  migrationMetadataTable?: string;
   migrationLocksTable?: string;
   migrationCheckpointsTable?: string;
 }
@@ -65,6 +71,7 @@ interface LockRow {
 interface TableRefs {
   documentsTable: string;
   indexesTable: string;
+  migrationMetadataTable: string;
   migrationLocksTable: string;
   migrationCheckpointsTable: string;
 }
@@ -96,11 +103,12 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
       return parseQueryRow(row, collection).doc;
     },
 
-    async create(collection, key, doc, indexes) {
+    async create(collection, key, doc, indexes, _options, migrationMetadata) {
       await ready;
 
       const docJson = serializeDocument(doc);
       const normalizedIndexes = normalizeIndexes(indexes);
+      const metadata = normalizeMigrationMetadata(migrationMetadata) ?? deriveLegacyMetadata(doc);
 
       try {
         await withTransaction(client, async (tx) => {
@@ -113,6 +121,7 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
           );
 
           await replaceIndexes(tx, refs, collection, key, normalizedIndexes, false);
+          await upsertMigrationMetadata(tx, refs, collection, key, metadata);
         });
       } catch (error) {
         if (isMySqlDuplicateKeyError(error)) {
@@ -123,37 +132,44 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
       }
     },
 
-    async put(collection, key, doc, indexes) {
+    async put(collection, key, doc, indexes, _options, migrationMetadata) {
       await ready;
 
       const docJson = serializeDocument(doc);
       const normalizedIndexes = normalizeIndexes(indexes);
+      const metadata = normalizeMigrationMetadata(migrationMetadata) ?? deriveLegacyMetadata(doc);
 
       await withTransaction(client, async (tx) => {
         await tx.execute(
           `
             INSERT INTO ${refs.documentsTable} (collection, doc_key, doc_json)
             VALUES (?, ?, CAST(? AS JSON))
-            ON DUPLICATE KEY UPDATE doc_json = VALUES(doc_json)
+            ON DUPLICATE KEY UPDATE
+              doc_json = VALUES(doc_json),
+              write_version = write_version + 1
           `,
           [collection, key, docJson],
         );
 
         await replaceIndexes(tx, refs, collection, key, normalizedIndexes, true);
+        await upsertMigrationMetadata(tx, refs, collection, key, metadata);
       });
     },
 
-    async update(collection, key, doc, indexes) {
+    async update(collection, key, doc, indexes, _options, migrationMetadata) {
       await ready;
 
       const docJson = serializeDocument(doc);
       const normalizedIndexes = normalizeIndexes(indexes);
+      const metadata = normalizeMigrationMetadata(migrationMetadata) ?? deriveLegacyMetadata(doc);
 
       await withTransaction(client, async (tx) => {
         const [result] = await tx.execute(
           `
             UPDATE ${refs.documentsTable}
-            SET doc_json = CAST(? AS JSON)
+            SET
+              doc_json = CAST(? AS JSON),
+              write_version = write_version + 1
             WHERE collection = ? AND doc_key = ?
           `,
           [docJson, collection, key],
@@ -164,6 +180,7 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
         }
 
         await replaceIndexes(tx, refs, collection, key, normalizedIndexes, true);
+        await upsertMigrationMetadata(tx, refs, collection, key, metadata);
       });
     },
 
@@ -235,22 +252,14 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
       await ready;
 
       await withTransaction(client, async (tx) => {
-        for (const item of items) {
-          const docJson = serializeDocument(item.doc);
-          const normalizedIndexes = normalizeIndexes(item.indexes);
-
-          await tx.execute(
-            `
-              INSERT INTO ${refs.documentsTable} (collection, doc_key, doc_json)
-              VALUES (?, ?, CAST(? AS JSON))
-              ON DUPLICATE KEY UPDATE doc_json = VALUES(doc_json)
-            `,
-            [collection, item.key, docJson],
-          );
-
-          await replaceIndexes(tx, refs, collection, item.key, normalizedIndexes, true);
-        }
+        await applyBatchSet(tx, refs, collection, items);
       });
+    },
+
+    async batchSetWithResult(collection, items) {
+      await ready;
+
+      return withTransaction(client, async (tx) => applyBatchSet(tx, refs, collection, items));
     },
 
     async batchDelete(collection, keys) {
@@ -662,6 +671,177 @@ async function replaceIndexes(
   }
 }
 
+interface MigrationMetadata {
+  targetVersion: number;
+  versionState: MigrationVersionState;
+  indexSignature: string | null;
+}
+
+async function upsertMigrationMetadata(
+  client: MySqlQueryableLike,
+  refs: TableRefs,
+  collection: string,
+  key: string,
+  metadata: MigrationMetadata,
+): Promise<void> {
+  await client.execute(
+    `
+      INSERT INTO ${refs.migrationMetadataTable} (collection, doc_key, target_version, version_state, index_signature)
+      VALUES (?, ?, ?, ?, ?)
+      ON DUPLICATE KEY UPDATE
+        target_version = VALUES(target_version),
+        version_state = VALUES(version_state),
+        index_signature = VALUES(index_signature)
+    `,
+    [collection, key, metadata.targetVersion, metadata.versionState, metadata.indexSignature],
+  );
+}
+
+function normalizeMigrationMetadata(
+  raw: MigrationDocumentMetadata | undefined,
+): MigrationMetadata | null {
+  if (!raw) {
+    return null;
+  }
+
+  if (
+    !Number.isFinite(raw.targetVersion) ||
+    Math.floor(raw.targetVersion) !== raw.targetVersion ||
+    raw.targetVersion <= 0
+  ) {
+    throw new Error("MySQL received invalid migration metadata target version");
+  }
+
+  if (!isMigrationVersionState(raw.versionState)) {
+    throw new Error("MySQL received invalid migration metadata state");
+  }
+
+  if (raw.indexSignature !== null && typeof raw.indexSignature !== "string") {
+    throw new Error("MySQL received invalid migration metadata index signature");
+  }
+
+  return {
+    targetVersion: raw.targetVersion,
+    versionState: raw.versionState,
+    indexSignature: raw.indexSignature,
+  };
+}
+
+function isMigrationVersionState(value: unknown): value is MigrationVersionState {
+  return value === "current" || value === "stale" || value === "ahead" || value === "unknown";
+}
+
+function deriveLegacyMetadata(doc: unknown): MigrationMetadata {
+  if (!isRecord(doc)) {
+    return {
+      targetVersion: 0,
+      versionState: "unknown",
+      indexSignature: null,
+    };
+  }
+
+  const rawVersion = normalizeNumericVersionFromUnknown(doc.__v);
+
+  return {
+    targetVersion: rawVersion ?? 0,
+    versionState: rawVersion === null ? "unknown" : "current",
+    indexSignature: computeIndexSignatureFromUnknown(doc.__indexes),
+  };
+}
+
+function computeIndexSignatureFromUnknown(raw: unknown): string | null {
+  if (!Array.isArray(raw) || raw.some((value) => typeof value !== "string")) {
+    return null;
+  }
+
+  return computeIndexSignature(raw as string[]);
+}
+
+function computeIndexSignature(indexes: readonly string[]): string {
+  return JSON.stringify(indexes);
+}
+
+function normalizeNumericVersionFromUnknown(raw: unknown): number | null {
+  if (raw === undefined || raw === null) {
+    return null;
+  }
+
+  if (typeof raw === "number") {
+    return Number.isFinite(raw) ? raw : null;
+  }
+
+  if (typeof raw !== "string") {
+    return null;
+  }
+
+  return normalizeNumericVersion(raw);
+}
+
+async function applyBatchSet(
+  tx: MySqlConnectionLike,
+  refs: TableRefs,
+  collection: string,
+  items: BatchSetItem[],
+): Promise<BatchSetResult> {
+  const persistedKeys: string[] = [];
+  const conflictedKeys: string[] = [];
+
+  for (const item of items) {
+    const docJson = serializeDocument(item.doc);
+    const normalizedIndexes = normalizeIndexes(item.indexes);
+    const metadata =
+      normalizeMigrationMetadata(item.migrationMetadata) ?? deriveLegacyMetadata(item.doc);
+
+    if (item.expectedWriteToken !== undefined) {
+      const expectedWriteVersion = parseWriteToken(item.expectedWriteToken);
+      const [result] = await tx.execute(
+        `
+          UPDATE ${refs.documentsTable}
+          SET
+            doc_json = CAST(? AS JSON),
+            write_version = write_version + 1
+          WHERE collection = ?
+            AND doc_key = ?
+            AND write_version = ?
+        `,
+        [docJson, collection, item.key, expectedWriteVersion],
+      );
+
+      if (
+        readAffectedRows(result, "MySQL returned an invalid conditional batch-set result") === 0
+      ) {
+        conflictedKeys.push(item.key);
+        continue;
+      }
+
+      await replaceIndexes(tx, refs, collection, item.key, normalizedIndexes, true);
+      await upsertMigrationMetadata(tx, refs, collection, item.key, metadata);
+      persistedKeys.push(item.key);
+      continue;
+    }
+
+    await tx.execute(
+      `
+        INSERT INTO ${refs.documentsTable} (collection, doc_key, doc_json)
+        VALUES (?, ?, CAST(? AS JSON))
+        ON DUPLICATE KEY UPDATE
+          doc_json = VALUES(doc_json),
+          write_version = write_version + 1
+      `,
+      [collection, item.key, docJson],
+    );
+
+    await replaceIndexes(tx, refs, collection, item.key, normalizedIndexes, true);
+    await upsertMigrationMetadata(tx, refs, collection, item.key, metadata);
+    persistedKeys.push(item.key);
+  }
+
+  return {
+    persistedKeys,
+    conflictedKeys,
+  };
+}
+
 async function ensureSchema(client: MySqlQueryableLike, refs: TableRefs): Promise<void> {
   await client.query(`
     CREATE TABLE IF NOT EXISTS ${refs.documentsTable} (
@@ -669,11 +849,19 @@ async function ensureSchema(client: MySqlQueryableLike, refs: TableRefs): Promis
       collection VARCHAR(191) NOT NULL,
       doc_key VARCHAR(191) NOT NULL,
       doc_json JSON NOT NULL,
+      write_version BIGINT UNSIGNED NOT NULL DEFAULT 1,
       PRIMARY KEY (id),
       UNIQUE KEY uq_collection_doc_key (collection, doc_key),
       KEY idx_collection_id (collection, id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
   `);
+
+  await ensureColumn(
+    client,
+    refs.documentsTable,
+    "write_version",
+    "BIGINT UNSIGNED NOT NULL DEFAULT 1",
+  );
 
   await client.query(`
     CREATE TABLE IF NOT EXISTS ${refs.indexesTable} (
@@ -689,6 +877,40 @@ async function ensureSchema(client: MySqlQueryableLike, refs: TableRefs): Promis
       KEY idx_scan (collection, index_name, doc_key)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
   `);
+
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS ${refs.migrationMetadataTable} (
+      collection VARCHAR(191) NOT NULL,
+      doc_key VARCHAR(191) NOT NULL,
+      target_version INT NULL,
+      version_state VARCHAR(16) NULL,
+      index_signature TEXT NULL,
+      PRIMARY KEY (collection, doc_key),
+      FOREIGN KEY (collection, doc_key)
+        REFERENCES ${refs.documentsTable} (collection, doc_key)
+        ON DELETE CASCADE,
+      KEY idx_target_state_doc (collection, target_version, version_state, doc_key),
+      KEY idx_target_state_signature (collection, target_version, version_state, index_signature(191), doc_key)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
+  `);
+
+  await ensureColumn(client, refs.migrationMetadataTable, "target_version", "INT NULL");
+  await ensureColumn(client, refs.migrationMetadataTable, "version_state", "VARCHAR(16) NULL");
+  await ensureColumn(client, refs.migrationMetadataTable, "index_signature", "TEXT NULL");
+
+  await ensureIndex(
+    client,
+    refs.migrationMetadataTable,
+    "idx_target_state_doc",
+    "(collection, target_version, version_state, doc_key)",
+  );
+
+  await ensureIndex(
+    client,
+    refs.migrationMetadataTable,
+    "idx_target_state_signature",
+    "(collection, target_version, version_state, index_signature(191), doc_key)",
+  );
 
   await client.query(`
     CREATE TABLE IF NOT EXISTS ${refs.migrationLocksTable} (
@@ -732,6 +954,44 @@ async function withTransaction<T>(
     throw error;
   } finally {
     tx.release();
+  }
+}
+
+async function ensureIndex(
+  client: MySqlQueryableLike,
+  tableName: string,
+  indexName: string,
+  columnsSql: string,
+): Promise<void> {
+  try {
+    await client.query(
+      `ALTER TABLE ${tableName} ADD INDEX ${quoteIdentifier(indexName)} ${columnsSql}`,
+    );
+  } catch (error) {
+    if (isMySqlDuplicateIndexError(error)) {
+      return;
+    }
+
+    throw error;
+  }
+}
+
+async function ensureColumn(
+  client: MySqlQueryableLike,
+  tableName: string,
+  columnName: string,
+  definitionSql: string,
+): Promise<void> {
+  try {
+    await client.query(
+      `ALTER TABLE ${tableName} ADD COLUMN ${quoteIdentifier(columnName)} ${definitionSql}`,
+    );
+  } catch (error) {
+    if (isMySqlDuplicateColumnError(error)) {
+      return;
+    }
+
+    throw error;
   }
 }
 
@@ -980,151 +1240,138 @@ async function getOutdatedDocuments(
   criteria: MigrationCriteria,
   cursor?: string,
 ): Promise<EngineQueryResult> {
-  const parseVersion = criteria.parseVersion ?? defaultParseVersion;
-  const compareVersions = criteria.compareVersions ?? defaultCompareVersions;
-  const startId = await resolveCursorId(client, refs, collection, cursor);
-
-  const outdated: KeyedDocument[] = [];
-  let scanCursorId = startId;
-
-  while (outdated.length < OUTDATED_PAGE_LIMIT) {
-    const rows = await fetchRows(client, {
-      sql: `
-        SELECT id, doc_key AS \`key\`, doc_json
-        FROM ${refs.documentsTable}
-        WHERE collection = ? AND id > ?
-        ORDER BY id ASC
-        LIMIT ?
-      `,
-      params: [collection, scanCursorId, OUTDATED_SCAN_CHUNK_SIZE],
-      errorMessage: "MySQL returned an invalid outdated query result",
-    });
-
-    if (rows.length === 0) {
-      break;
-    }
-
-    for (const row of rows) {
-      const id = readFiniteInteger(row, "id", "MySQL returned an invalid outdated query result");
-      const key = readStringField(row, "key", "MySQL returned an invalid outdated query result");
-      const doc = parseStoredDocument(row.doc_json, collection, key);
-
-      scanCursorId = id;
-
-      if (isOutdated(doc, criteria, parseVersion, compareVersions)) {
-        outdated.push({
-          key,
-          doc: structuredClone(doc),
-        });
-      }
-
-      if (outdated.length >= OUTDATED_PAGE_LIMIT) {
-        break;
-      }
-    }
-
-    if (rows.length < OUTDATED_SCAN_CHUNK_SIZE) {
-      break;
-    }
-  }
-
-  if (outdated.length < OUTDATED_PAGE_LIMIT) {
-    return {
-      documents: outdated,
-      cursor: null,
-    };
-  }
-
-  const hasMore = await hasAdditionalOutdatedAfter(
-    client,
-    refs,
-    collection,
-    scanCursorId,
-    criteria,
-    parseVersion,
-    compareVersions,
-  );
-
-  return {
-    documents: outdated,
-    cursor: hasMore ? (outdated[outdated.length - 1]?.key ?? null) : null,
-  };
+  await syncMissingMigrationMetadata(client as MySqlPoolLike, refs, collection, criteria);
+  return getOutdatedDocumentsByMetadata(client, refs, collection, criteria, cursor);
 }
 
-async function hasAdditionalOutdatedAfter(
+async function getOutdatedDocumentsByMetadata(
   client: MySqlQueryableLike,
   refs: TableRefs,
   collection: string,
-  startId: number,
   criteria: MigrationCriteria,
-  parseVersion: (raw: unknown) => ComparableVersion | null,
-  compareVersions: (a: ComparableVersion, b: ComparableVersion) => number,
-): Promise<boolean> {
-  let cursorId = startId;
+  cursor?: string,
+): Promise<EngineQueryResult> {
+  const startKey = cursor ?? "";
+  const expectedSignature = computeIndexSignature(criteria.indexes);
+  const rows = await fetchRows(client, {
+    sql: `
+      SELECT d.doc_key AS \`key\`, d.doc_json, d.write_version
+      FROM ${refs.migrationMetadataTable} m
+      INNER JOIN ${refs.documentsTable} d
+        ON d.collection = m.collection
+       AND d.doc_key = m.doc_key
+      WHERE m.collection = ?
+        AND m.doc_key > ?
+        AND (
+          m.version_state = 'stale'
+          OR (
+            m.version_state = 'current'
+            AND (m.index_signature IS NULL OR m.index_signature <> ?)
+          )
+        )
+        AND m.target_version = ?
+      ORDER BY m.doc_key ASC
+      LIMIT ?
+    `,
+    params: [collection, startKey, expectedSignature, criteria.version, OUTDATED_PAGE_LIMIT + 1],
+    errorMessage: "MySQL returned an invalid outdated query result",
+  });
 
+  const hasMore = rows.length > OUTDATED_PAGE_LIMIT;
+  const pageRows = hasMore ? rows.slice(0, OUTDATED_PAGE_LIMIT) : rows;
+  const documents: KeyedDocument[] = [];
+
+  for (const row of pageRows) {
+    const key = readStringField(row, "key", "MySQL returned an invalid outdated query result");
+    const writeVersion = readFiniteInteger(
+      row,
+      "write_version",
+      "MySQL returned an invalid outdated query result",
+    );
+    const doc = parseStoredDocument(row.doc_json, collection, key);
+
+    documents.push({
+      key,
+      doc: structuredClone(doc),
+      writeToken: String(writeVersion),
+    });
+  }
+
+  return {
+    documents,
+    cursor: hasMore ? (documents[documents.length - 1]?.key ?? null) : null,
+  };
+}
+
+async function syncMissingMigrationMetadata(
+  client: MySqlPoolLike,
+  refs: TableRefs,
+  collection: string,
+  criteria: MigrationCriteria,
+): Promise<void> {
   while (true) {
     const rows = await fetchRows(client, {
       sql: `
-        SELECT id, doc_key AS \`key\`, doc_json
-        FROM ${refs.documentsTable}
-        WHERE collection = ? AND id > ?
-        ORDER BY id ASC
+        SELECT d.doc_key AS \`key\`, d.doc_json
+        FROM ${refs.documentsTable} d
+        LEFT JOIN ${refs.migrationMetadataTable} m
+          ON m.collection = d.collection
+         AND m.doc_key = d.doc_key
+        WHERE d.collection = ?
+          AND (
+            m.doc_key IS NULL
+            OR m.target_version IS NULL
+            OR m.target_version <> ?
+          )
+        ORDER BY d.id ASC
         LIMIT ?
       `,
-      params: [collection, cursorId, OUTDATED_SCAN_CHUNK_SIZE],
-      errorMessage: "MySQL returned an invalid outdated query result",
+      params: [collection, criteria.version, OUTDATED_SCAN_CHUNK_SIZE],
+      errorMessage: "MySQL returned an invalid migration metadata sync result",
     });
 
     if (rows.length === 0) {
-      return false;
+      return;
     }
 
-    for (const row of rows) {
-      cursorId = readFiniteInteger(row, "id", "MySQL returned an invalid outdated query result");
-      const key = readStringField(row, "key", "MySQL returned an invalid outdated query result");
-      const doc = parseStoredDocument(row.doc_json, collection, key);
+    await withTransaction(client, async (tx) => {
+      for (const row of rows) {
+        const key = readStringField(
+          row,
+          "key",
+          "MySQL returned an invalid migration metadata sync result",
+        );
+        const doc = parseStoredDocument(row.doc_json, collection, key);
 
-      if (isOutdated(doc, criteria, parseVersion, compareVersions)) {
-        return true;
+        await upsertMigrationMetadata(
+          tx,
+          refs,
+          collection,
+          key,
+          deriveMetadataForCriteria(doc, criteria),
+        );
       }
-    }
+    });
 
     if (rows.length < OUTDATED_SCAN_CHUNK_SIZE) {
-      return false;
+      return;
     }
   }
 }
 
-function isOutdated(
+function deriveMetadataForCriteria(
   doc: Record<string, unknown>,
   criteria: MigrationCriteria,
-  parseVersion: (raw: unknown) => ComparableVersion | null,
-  compareVersions: (a: ComparableVersion, b: ComparableVersion) => number,
-): boolean {
+): MigrationMetadata {
+  const parseVersion = criteria.parseVersion ?? defaultParseVersion;
+  const compareVersions = criteria.compareVersions ?? defaultCompareVersions;
   const parsedVersion = parseVersion(doc[criteria.versionField]);
-  const versionState = classifyVersionState(parsedVersion, criteria.version, compareVersions);
 
-  if (versionState === "stale") {
-    return true;
-  }
-
-  if (versionState !== "current") {
-    return false;
-  }
-
-  const storedIndexes = doc[criteria.indexesField];
-
-  if (!Array.isArray(storedIndexes) || storedIndexes.length !== criteria.indexes.length) {
-    return true;
-  }
-
-  for (let i = 0; i < criteria.indexes.length; i++) {
-    if (storedIndexes[i] !== criteria.indexes[i]) {
-      return true;
-    }
-  }
-
-  return false;
+  return {
+    targetVersion: criteria.version,
+    versionState: classifyVersionState(parsedVersion, criteria.version, compareVersions),
+    indexSignature: computeIndexSignatureFromUnknown(doc[criteria.indexesField]),
+  };
 }
 
 type VersionState = "current" | "stale" | "ahead" | "unknown";
@@ -1307,6 +1554,16 @@ function parseLockRow(row: Record<string, unknown>, message: string): LockRow {
   };
 }
 
+function parseWriteToken(raw: string): number {
+  const value = Number(raw);
+
+  if (!Number.isFinite(value) || Math.floor(value) !== value || value <= 0) {
+    throw new Error("MySQL received an invalid write token");
+  }
+
+  return value;
+}
+
 function readAffectedRows(result: unknown, message: string): number {
   if (!isRecord(result)) {
     throw new Error(message);
@@ -1371,6 +1628,10 @@ function buildTableRefs(options: MySqlEngineOptions): TableRefs {
   return {
     documentsTable: qualifyTableName(database, options.documentsTable ?? DEFAULT_DOCUMENTS_TABLE),
     indexesTable: qualifyTableName(database, options.indexesTable ?? DEFAULT_INDEXES_TABLE),
+    migrationMetadataTable: qualifyTableName(
+      database,
+      options.migrationMetadataTable ?? DEFAULT_MIGRATION_METADATA_TABLE,
+    ),
     migrationLocksTable: qualifyTableName(
       database,
       options.migrationLocksTable ?? DEFAULT_MIGRATION_LOCKS_TABLE,
@@ -1388,6 +1649,22 @@ function isMySqlDuplicateKeyError(error: unknown): boolean {
   }
 
   return error.code === "ER_DUP_ENTRY" || error.errno === 1062;
+}
+
+function isMySqlDuplicateIndexError(error: unknown): boolean {
+  if (!isRecord(error)) {
+    return false;
+  }
+
+  return error.code === "ER_DUP_KEYNAME" || error.errno === 1061;
+}
+
+function isMySqlDuplicateColumnError(error: unknown): boolean {
+  if (!isRecord(error)) {
+    return false;
+  }
+
+  return error.code === "ER_DUP_FIELDNAME" || error.errno === 1060;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

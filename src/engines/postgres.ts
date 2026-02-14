@@ -1,4 +1,5 @@
 import {
+  type BatchSetItem,
   type BatchSetResult,
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
@@ -6,7 +7,9 @@ import {
   type EngineQueryResult,
   type FieldCondition,
   type KeyedDocument,
+  type MigrationDocumentMetadata,
   type MigrationCriteria,
+  type MigrationVersionState,
   type QueryEngine,
   type QueryParams,
   type ResolvedIndexKeys,
@@ -16,6 +19,7 @@ import { DefaultMigrator } from "../migrator";
 const DEFAULT_SCHEMA = "public";
 const DEFAULT_DOCUMENTS_TABLE = "nosql_odm_documents";
 const DEFAULT_INDEXES_TABLE = "nosql_odm_index_entries";
+const DEFAULT_MIGRATION_METADATA_TABLE = "nosql_odm_migration_metadata";
 const DEFAULT_MIGRATION_LOCKS_TABLE = "nosql_odm_migration_locks";
 const DEFAULT_MIGRATION_CHECKPOINTS_TABLE = "nosql_odm_migration_checkpoints";
 const OUTDATED_PAGE_LIMIT = 100;
@@ -43,6 +47,7 @@ export interface PostgresEngineOptions {
   schema?: string;
   documentsTable?: string;
   indexesTable?: string;
+  migrationMetadataTable?: string;
   migrationLocksTable?: string;
   migrationCheckpointsTable?: string;
 }
@@ -68,6 +73,7 @@ interface TableRefs {
   schema: string;
   documentsTable: string;
   indexesTable: string;
+  migrationMetadataTable: string;
   migrationLocksTable: string;
   migrationCheckpointsTable: string;
 }
@@ -85,6 +91,11 @@ export function postgresEngine(options: PostgresEngineOptions): PostgresQueryEng
       options.schema ?? DEFAULT_SCHEMA,
       options.indexesTable ?? DEFAULT_INDEXES_TABLE,
       "indexesTable",
+    ),
+    migrationMetadataTable: qualifyTableName(
+      options.schema ?? DEFAULT_SCHEMA,
+      options.migrationMetadataTable ?? DEFAULT_MIGRATION_METADATA_TABLE,
+      "migrationMetadataTable",
     ),
     migrationLocksTable: qualifyTableName(
       options.schema ?? DEFAULT_SCHEMA,
@@ -122,11 +133,12 @@ export function postgresEngine(options: PostgresEngineOptions): PostgresQueryEng
       return parseQueryRow(row, collection).doc;
     },
 
-    async create(collection, key, doc, indexes) {
+    async create(collection, key, doc, indexes, _options, migrationMetadata) {
       await ready;
 
       const docJson = serializeDocument(doc);
       const normalizedIndexes = normalizeIndexes(indexes);
+      const metadata = normalizeMigrationMetadata(migrationMetadata) ?? deriveLegacyMetadata(doc);
 
       try {
         await withTransaction(client, async (tx) => {
@@ -136,6 +148,7 @@ export function postgresEngine(options: PostgresEngineOptions): PostgresQueryEng
           );
 
           await replaceIndexes(tx, refs, collection, key, normalizedIndexes, false);
+          await upsertMigrationMetadata(tx, refs, collection, key, metadata);
         });
       } catch (error) {
         if (isPostgresUniqueViolation(error)) {
@@ -146,11 +159,12 @@ export function postgresEngine(options: PostgresEngineOptions): PostgresQueryEng
       }
     },
 
-    async put(collection, key, doc, indexes) {
+    async put(collection, key, doc, indexes, _options, migrationMetadata) {
       await ready;
 
       const docJson = serializeDocument(doc);
       const normalizedIndexes = normalizeIndexes(indexes);
+      const metadata = normalizeMigrationMetadata(migrationMetadata) ?? deriveLegacyMetadata(doc);
 
       await withTransaction(client, async (tx) => {
         await tx.query(
@@ -166,14 +180,16 @@ export function postgresEngine(options: PostgresEngineOptions): PostgresQueryEng
         );
 
         await replaceIndexes(tx, refs, collection, key, normalizedIndexes, true);
+        await upsertMigrationMetadata(tx, refs, collection, key, metadata);
       });
     },
 
-    async update(collection, key, doc, indexes) {
+    async update(collection, key, doc, indexes, _options, migrationMetadata) {
       await ready;
 
       const docJson = serializeDocument(doc);
       const normalizedIndexes = normalizeIndexes(indexes);
+      const metadata = normalizeMigrationMetadata(migrationMetadata) ?? deriveLegacyMetadata(doc);
 
       await withTransaction(client, async (tx) => {
         const updateResult = await tx.query(
@@ -192,6 +208,7 @@ export function postgresEngine(options: PostgresEngineOptions): PostgresQueryEng
         }
 
         await replaceIndexes(tx, refs, collection, key, normalizedIndexes, true);
+        await upsertMigrationMetadata(tx, refs, collection, key, metadata);
       });
     },
 
@@ -683,6 +700,119 @@ async function replaceIndexes(
   }
 }
 
+interface MigrationMetadata {
+  targetVersion: number;
+  versionState: MigrationVersionState;
+  indexSignature: string | null;
+}
+
+async function upsertMigrationMetadata(
+  client: PostgresQueryableLike,
+  refs: TableRefs,
+  collection: string,
+  key: string,
+  metadata: MigrationMetadata,
+): Promise<void> {
+  await client.query(
+    `
+      INSERT INTO ${refs.migrationMetadataTable} (
+        collection,
+        doc_key,
+        target_version,
+        version_state,
+        index_signature
+      )
+      VALUES ($1, $2, $3, $4, $5)
+      ON CONFLICT (collection, doc_key)
+      DO UPDATE SET
+        target_version = EXCLUDED.target_version,
+        version_state = EXCLUDED.version_state,
+        index_signature = EXCLUDED.index_signature
+    `,
+    [collection, key, metadata.targetVersion, metadata.versionState, metadata.indexSignature],
+  );
+}
+
+function normalizeMigrationMetadata(
+  raw: MigrationDocumentMetadata | undefined,
+): MigrationMetadata | null {
+  if (!raw) {
+    return null;
+  }
+
+  if (
+    !Number.isFinite(raw.targetVersion) ||
+    Math.floor(raw.targetVersion) !== raw.targetVersion ||
+    raw.targetVersion <= 0
+  ) {
+    throw new Error("Postgres received invalid migration metadata target version");
+  }
+
+  if (!isMigrationVersionState(raw.versionState)) {
+    throw new Error("Postgres received invalid migration metadata state");
+  }
+
+  if (raw.indexSignature !== null && typeof raw.indexSignature !== "string") {
+    throw new Error("Postgres received invalid migration metadata index signature");
+  }
+
+  return {
+    targetVersion: raw.targetVersion,
+    versionState: raw.versionState,
+    indexSignature: raw.indexSignature,
+  };
+}
+
+function isMigrationVersionState(value: unknown): value is MigrationVersionState {
+  return value === "current" || value === "stale" || value === "ahead" || value === "unknown";
+}
+
+function deriveLegacyMetadata(doc: unknown): MigrationMetadata {
+  if (!isRecord(doc)) {
+    return {
+      targetVersion: 0,
+      versionState: "unknown",
+      indexSignature: null,
+    };
+  }
+
+  const rawVersion = normalizeNumericVersionFromUnknown(doc.__v);
+
+  return {
+    targetVersion: rawVersion ?? 0,
+    versionState: rawVersion === null ? "unknown" : "current",
+    indexSignature: computeIndexSignatureFromUnknown(doc.__indexes),
+  };
+}
+
+function computeIndexSignatureFromUnknown(raw: unknown): string | null {
+  if (!Array.isArray(raw) || raw.some((value) => typeof value !== "string")) {
+    return null;
+  }
+
+  return computeIndexSignature(raw as string[]);
+}
+
+function computeIndexSignature(indexes: readonly string[]): string {
+  return JSON.stringify(indexes);
+}
+
+function normalizeNumericVersionFromUnknown(raw: unknown): number | null {
+  if (raw === undefined || raw === null) {
+    return null;
+  }
+
+  if (typeof raw === "number") {
+    return Number.isFinite(raw) ? raw : null;
+  }
+
+  if (typeof raw !== "string") {
+    return null;
+  }
+
+  return normalizeNumericVersion(raw);
+}
+
 async function applyBatchSet(
   tx: PostgresSessionLike,
   refs: TableRefs,
@@ -695,6 +825,8 @@ async function applyBatchSet(
   for (const item of items) {
     const docJson = serializeDocument(item.doc);
     const normalizedIndexes = normalizeIndexes(item.indexes);
+    const metadata =
+      normalizeMigrationMetadata(item.migrationMetadata) ?? deriveLegacyMetadata(item.doc);
 
     if (item.expectedWriteToken !== undefined) {
       const expectedWriteVersion = parseWriteToken(item.expectedWriteToken);
@@ -720,6 +852,7 @@ async function applyBatchSet(
       }
 
       await replaceIndexes(tx, refs, collection, item.key, normalizedIndexes, true);
+      await upsertMigrationMetadata(tx, refs, collection, item.key, metadata);
       persistedKeys.push(item.key);
       continue;
     }
@@ -737,6 +870,7 @@ async function applyBatchSet(
     );
 
     await replaceIndexes(tx, refs, collection, item.key, normalizedIndexes, true);
+    await upsertMigrationMetadata(tx, refs, collection, item.key, metadata);
     persistedKeys.push(item.key);
   }
 
@@ -749,7 +883,7 @@ async function applyBatchSet(
 async function ensureSchema(client: PostgresQueryableLike, refs: TableRefs): Promise<void> {
   const session = await acquireSession(client);
   const lockKey = toAdvisoryLockKey(
-    `${refs.schema}|${refs.documentsTable}|${refs.indexesTable}|${refs.migrationLocksTable}|${refs.migrationCheckpointsTable}`,
+    `${refs.schema}|${refs.documentsTable}|${refs.indexesTable}|${refs.migrationMetadataTable}|${refs.migrationLocksTable}|${refs.migrationCheckpointsTable}`,
   );
 
   await session.query(`SELECT pg_advisory_lock($1)`, [lockKey]);
@@ -760,6 +894,12 @@ async function ensureSchema(client: PostgresQueryableLike, refs: TableRefs): Pro
     );
     const indexesLookupIndex = quoteIdentifier(createIndexName(refs.indexesTable, "lookup_idx"));
     const indexesScanIndex = quoteIdentifier(createIndexName(refs.indexesTable, "scan_idx"));
+    const migrationMetadataTargetStateDocIndex = quoteIdentifier(
+      createIndexName(refs.migrationMetadataTable, "target_state_doc_idx"),
+    );
+    const migrationMetadataTargetStateSignatureIndex = quoteIdentifier(
+      createIndexName(refs.migrationMetadataTable, "target_state_signature_idx"),
+    );
 
     await session.query(`CREATE SCHEMA IF NOT EXISTS ${refs.schema}`);
 
@@ -800,6 +940,37 @@ async function ensureSchema(client: PostgresQueryableLike, refs: TableRefs): Pro
     );
     await session.query(
       `CREATE INDEX IF NOT EXISTS ${indexesScanIndex} ON ${refs.indexesTable} (collection, index_name, doc_key)`,
+    );
+
+    await session.query(`
+    CREATE TABLE IF NOT EXISTS ${refs.migrationMetadataTable} (
+      collection TEXT NOT NULL,
+      doc_key TEXT NOT NULL,
+      target_version INTEGER NULL,
+      version_state TEXT NULL,
+      index_signature TEXT NULL,
+      PRIMARY KEY (collection, doc_key),
+      FOREIGN KEY (collection, doc_key)
+        REFERENCES ${refs.documentsTable} (collection, doc_key)
+        ON DELETE CASCADE
+    )
+  `);
+
+    await session.query(
+      `ALTER TABLE ${refs.migrationMetadataTable} ADD COLUMN IF NOT EXISTS target_version INTEGER NULL`,
+    );
+    await session.query(
+      `ALTER TABLE ${refs.migrationMetadataTable} ADD COLUMN IF NOT EXISTS version_state TEXT NULL`,
+    );
+    await session.query(
+      `ALTER TABLE ${refs.migrationMetadataTable} ADD COLUMN IF NOT EXISTS index_signature TEXT NULL`,
+    );
+
+    await session.query(
+      `CREATE INDEX IF NOT EXISTS ${migrationMetadataTargetStateDocIndex} ON ${refs.migrationMetadataTable} (collection, target_version, version_state, doc_key)`,
+    );
+    await session.query(
+      `CREATE INDEX IF NOT EXISTS ${migrationMetadataTargetStateSignatureIndex} ON ${refs.migrationMetadataTable} (collection, target_version, version_state, index_signature, doc_key)`,
     );
 
     await session.query(`
@@ -1111,157 +1282,137 @@ async function getOutdatedDocuments(
   criteria: MigrationCriteria,
   cursor?: string,
 ): Promise<EngineQueryResult> {
-  const parseVersion = criteria.parseVersion ?? defaultParseVersion;
-  const compareVersions = criteria.compareVersions ?? defaultCompareVersions;
-  const startId = await resolveCursorId(client, refs, collection, cursor);
-
-  const outdated: KeyedDocument[] = [];
-  let scanCursorId = startId;
-
-  while (outdated.length < OUTDATED_PAGE_LIMIT) {
-    const rows = await fetchRows(client, {
-      sql: `
-        SELECT id, doc_key AS key, doc_json, write_version
-        FROM ${refs.documentsTable}
-        WHERE collection = $1 AND id > $2
-        ORDER BY id ASC
-        LIMIT $3
-      `,
-      params: [collection, scanCursorId, OUTDATED_SCAN_CHUNK_SIZE],
-      errorMessage: "Postgres returned an invalid outdated query result",
-    });
-
-    if (rows.length === 0) {
-      break;
-    }
-
-    for (const row of rows) {
-      const id = readFiniteInteger(row, "id", "Postgres returned an invalid outdated query result");
-      const key = readStringField(row, "key", "Postgres returned an invalid outdated query result");
-      const writeVersion = readFiniteInteger(
-        row,
-        "write_version",
-        "Postgres returned an invalid outdated query result",
-      );
-      const doc = parseStoredDocument(row.doc_json, collection, key);
-
-      scanCursorId = id;
-
-      if (isOutdated(doc, criteria, parseVersion, compareVersions)) {
-        outdated.push({
-          key,
-          doc: structuredClone(doc),
-          writeToken: String(writeVersion),
-        });
-      }
-
-      if (outdated.length >= OUTDATED_PAGE_LIMIT) {
-        break;
-      }
-    }
-
-    if (rows.length < OUTDATED_SCAN_CHUNK_SIZE) {
-      break;
-    }
-  }
-
-  if (outdated.length < OUTDATED_PAGE_LIMIT) {
-    return {
-      documents: outdated,
-      cursor: null,
-    };
-  }
-
-  const hasMore = await hasAdditionalOutdatedAfter(
-    client,
-    refs,
-    collection,
-    scanCursorId,
-    criteria,
-    parseVersion,
-    compareVersions,
-  );
-
-  return {
-    documents: outdated,
-    cursor: hasMore ? (outdated[outdated.length - 1]?.key ?? null) : null,
-  };
+  await syncMissingMigrationMetadata(client, refs, collection, criteria);
+  return getOutdatedDocumentsByMetadata(client, refs, collection, criteria, cursor);
 }
 
-async function hasAdditionalOutdatedAfter(
+async function getOutdatedDocumentsByMetadata(
   client: PostgresQueryableLike,
   refs: TableRefs,
   collection: string,
-  startId: number,
   criteria: MigrationCriteria,
-  parseVersion: (raw: unknown) => ComparableVersion | null,
-  compareVersions: (a: ComparableVersion, b: ComparableVersion) => number,
-): Promise<boolean> {
-  let cursorId = startId;
+  cursor?: string,
+): Promise<EngineQueryResult> {
+  const startId = await resolveCursorId(client, refs, collection, cursor);
+  const expectedSignature = computeIndexSignature(criteria.indexes);
+  const rows = await fetchRows(client, {
+    sql: `
+      SELECT d.id, d.doc_key AS key, d.doc_json, d.write_version
+      FROM ${refs.migrationMetadataTable} m
+      INNER JOIN ${refs.documentsTable} d
+        ON d.collection = m.collection
+       AND d.doc_key = m.doc_key
+      WHERE m.collection = $1
+        AND d.id > $2
+        AND (
+          m.version_state = 'stale'
+          OR (
+            m.version_state = 'current'
+            AND m.index_signature IS DISTINCT FROM $3
+          )
+        )
+        AND m.target_version = $4
+      ORDER BY d.id ASC
+      LIMIT $5
+    `,
+    params: [collection, startId, expectedSignature, criteria.version, OUTDATED_PAGE_LIMIT + 1],
+    errorMessage: "Postgres returned an invalid outdated query result",
+  });
+  const hasMore = rows.length > OUTDATED_PAGE_LIMIT;
+  const pageRows = hasMore ? rows.slice(0, OUTDATED_PAGE_LIMIT) : rows;
+  const documents: KeyedDocument[] = [];
 
+  for (const row of pageRows) {
+    const key = readStringField(row, "key", "Postgres returned an invalid outdated query result");
+    const writeVersion = readFiniteInteger(
+      row,
+      "write_version",
+      "Postgres returned an invalid outdated query result",
+    );
+    const doc = parseStoredDocument(row.doc_json, collection, key);
+
+    documents.push({
+      key,
+      doc: structuredClone(doc),
+      writeToken: String(writeVersion),
+    });
+  }
+
+  return {
+    documents,
+    cursor: hasMore ? (documents[documents.length - 1]?.key ?? null) : null,
+  };
+}
+
+async function syncMissingMigrationMetadata(
+  client: PostgresQueryableLike,
+  refs: TableRefs,
+  collection: string,
+  criteria: MigrationCriteria,
+): Promise<void> {
   while (true) {
     const rows = await fetchRows(client, {
       sql: `
-        SELECT id, doc_key AS key, doc_json
-        FROM ${refs.documentsTable}
-        WHERE collection = $1 AND id > $2
-        ORDER BY id ASC
+        SELECT d.doc_key AS key, d.doc_json
+        FROM ${refs.documentsTable} d
+        LEFT JOIN ${refs.migrationMetadataTable} m
+          ON m.collection = d.collection
+         AND m.doc_key = d.doc_key
+        WHERE d.collection = $1
+          AND (
+            m.doc_key IS NULL
+            OR m.target_version IS NULL
+            OR m.target_version <> $2
+          )
+        ORDER BY d.id ASC
         LIMIT $3
       `,
-      params: [collection, cursorId, OUTDATED_SCAN_CHUNK_SIZE],
-      errorMessage: "Postgres returned an invalid outdated query result",
+      params: [collection, criteria.version, OUTDATED_SCAN_CHUNK_SIZE],
+      errorMessage: "Postgres returned an invalid migration metadata sync result",
     });
 
     if (rows.length === 0) {
-      return false;
+      return;
     }
 
-    for (const row of rows) {
-      cursorId = readFiniteInteger(row, "id", "Postgres returned an invalid outdated query result");
-      const key = readStringField(row, "key", "Postgres returned an invalid outdated query result");
-      const doc = parseStoredDocument(row.doc_json, collection, key);
+    await withTransaction(client, async (tx) => {
+      for (const row of rows) {
+        const key = readStringField(
+          row,
+          "key",
+          "Postgres returned an invalid migration metadata sync result",
+        );
+        const doc = parseStoredDocument(row.doc_json, collection, key);
 
-      if (isOutdated(doc, criteria, parseVersion, compareVersions)) {
-        return true;
+        await upsertMigrationMetadata(
+          tx,
+          refs,
+          collection,
+          key,
+          deriveMetadataForCriteria(doc, criteria),
+        );
       }
-    }
+    });
 
     if (rows.length < OUTDATED_SCAN_CHUNK_SIZE) {
-      return false;
+      return;
     }
   }
 }
 
-function isOutdated(
+function deriveMetadataForCriteria(
   doc: Record<string, unknown>,
   criteria: MigrationCriteria,
-  parseVersion: (raw: unknown) => ComparableVersion | null,
-  compareVersions: (a: ComparableVersion, b: ComparableVersion) => number,
-): boolean {
+): MigrationMetadata {
+  const parseVersion = criteria.parseVersion ?? defaultParseVersion;
+  const compareVersions = criteria.compareVersions ?? defaultCompareVersions;
   const parsedVersion = parseVersion(doc[criteria.versionField]);
-  const versionState = classifyVersionState(parsedVersion, criteria.version, compareVersions);
 
-  if (versionState === "stale") {
-    return true;
-  }
-
-  if (versionState !== "current") {
-    return false;
-  }
-
-  const storedIndexes = doc[criteria.indexesField];
-
-  if (!Array.isArray(storedIndexes) || storedIndexes.length !== criteria.indexes.length) {
-    return true;
-  }
-
-  for (let i = 0; i < criteria.indexes.length; i++) {
-    if (storedIndexes[i] !== criteria.indexes[i]) {
-      return true;
-    }
-  }
-
-  return false;
+  return {
+    targetVersion: criteria.version,
+    versionState: classifyVersionState(parsedVersion, criteria.version, compareVersions),
+    indexSignature: computeIndexSignatureFromUnknown(doc[criteria.indexesField]),
+  };
 }
 
 type VersionState = "current" | "stale" | "ahead" | "unknown";

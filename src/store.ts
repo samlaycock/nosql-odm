@@ -1,6 +1,7 @@
 import {
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
+  type MigrationDocumentMetadata,
   type QueryEngine,
   type QueryParams,
   type QueryFilter,
@@ -345,9 +346,10 @@ class BoundModelImpl<
     const validated = await this.model.validate(data);
     const doc = this.stamp(validated as object, key);
     const indexes = this.model.resolveIndexKeys(validated);
+    const migrationMetadata = this.currentMigrationMetadata();
 
     try {
-      await this.engine.create(this.model.name, key, doc, indexes, options);
+      await this.engine.create(this.model.name, key, doc, indexes, options, migrationMetadata);
     } catch (error) {
       if (error instanceof EngineDocumentAlreadyExistsError) {
         throw new DocumentAlreadyExistsError(this.model.name, key);
@@ -382,9 +384,10 @@ class BoundModelImpl<
     const validated = await this.model.validate(merged);
     const doc = this.stamp(validated as object, key);
     const indexes = this.model.resolveIndexKeys(validated);
+    const migrationMetadata = this.currentMigrationMetadata();
 
     try {
-      await this.engine.update(this.model.name, key, doc, indexes, options);
+      await this.engine.update(this.model.name, key, doc, indexes, options, migrationMetadata);
     } catch (error) {
       if (error instanceof EngineDocumentNotFoundError) {
         throw new Error(`Document "${key}" not found in model "${this.model.name}"`);
@@ -430,6 +433,7 @@ class BoundModelImpl<
       validated: T;
       doc: object;
       indexes: Record<string, string>;
+      migrationMetadata: MigrationDocumentMetadata;
     }[] = [];
 
     for (const item of items) {
@@ -444,6 +448,7 @@ class BoundModelImpl<
         validated,
         doc: this.stamp(validated as object, item.key),
         indexes: this.model.resolveIndexKeys(validated),
+        migrationMetadata: this.currentMigrationMetadata(),
       });
     }
 
@@ -453,6 +458,7 @@ class BoundModelImpl<
         key: item.key,
         doc: item.doc,
         indexes: item.indexes,
+        migrationMetadata: item.migrationMetadata,
       })),
       options,
     );
@@ -543,6 +549,18 @@ class BoundModelImpl<
     return ensureJsonCompatibleDocument(stamped, this.model.name, key);
   }
 
+  private currentMigrationMetadata(): MigrationDocumentMetadata {
+    return {
+      targetVersion: this.model.latestVersion,
+      versionState: "current",
+      indexSignature: this.computeIndexSignature(this.model.indexNames),
+    };
+  }
+
+  private computeIndexSignature(indexes: readonly string[]): string {
+    return JSON.stringify(indexes);
+  }
+
   // Writes migrated documents back to the engine so future reads don't need
   // to re-migrate. Skipped in "readonly" and "eager" modes — readonly because
   // writes are not permitted, eager because migration is expected to happen
@@ -563,6 +581,7 @@ class BoundModelImpl<
       key: item.key,
       doc: this.stamp(item.value as object, item.key),
       indexes: this.model.resolveIndexKeys(item.value),
+      migrationMetadata: this.currentMigrationMetadata(),
     }));
 
     await this.engine.batchSet(this.model.name, prepared, options);
@@ -588,6 +607,7 @@ class BoundModelImpl<
         key,
         doc: this.stamp(value as object, key),
         indexes: this.model.resolveIndexKeys(value as T),
+        migrationMetadata: this.currentMigrationMetadata(),
       }),
       persist: (items) =>
         this.engine.batchSetWithResult

@@ -160,6 +160,7 @@ describe("postgresEngine integration", () => {
       schema: schemaName,
       documentsTable: "custom_documents",
       indexesTable: "custom_indexes",
+      migrationMetadataTable: "custom_migration_metadata",
       migrationLocksTable: "custom_locks",
       migrationCheckpointsTable: "custom_checkpoints",
     });
