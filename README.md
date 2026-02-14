@@ -203,6 +203,11 @@ const client = DynamoDBDocumentClient.from(baseClient);
 const engine = dynamoDbEngine({
   client,
   tableName: "nosql_odm",
+  // Optional overrides (defaults shown):
+  // hashKeyName: "pk",
+  // sortKeyName: "sk",
+  // migrationOutdatedIndexName: "migration_outdated_idx",
+  // migrationSyncIndexName: "migration_sync_idx",
 });
 
 const store = createStore(engine, [User]);
@@ -210,10 +215,21 @@ const store = createStore(engine, [User]);
 
 The DynamoDB adapter expects a table with:
 
-- Partition key `pk` (string)
-- Sort key `sk` (string)
+- Partition key `pk` (string) by default, or your configured `hashKeyName`
+- Sort key `sk` (string) by default, or your configured `sortKeyName`
+- Global secondary index `migration_outdated_idx`
+  - Partition key `migrationOutdatedPk` (string)
+  - Sort key `migrationOutdatedSk` (string)
+- Global secondary index `migration_sync_idx`
+  - Partition key `migrationSyncPk` (string)
+  - Sort key `migrationSyncSk` (number)
+
+If you configure custom metadata index names, use those names instead of the defaults above.
 
 It stores both model documents and migration metadata in that table using prefixed keys.
+
+`migration_outdated_idx` is used to page only migration-eligible documents (version-behind and/or index-signature mismatch).
+`migration_sync_idx` is used to find metadata rows that are stale for the current migration target version.
 
 ## Cassandra Engine (`cassandra-driver`)
 
@@ -867,6 +883,7 @@ Important workflow properties:
 - page boundaries are checkpointed, so retries resume from saved cursor boundaries
 - crashes mid-page can re-scan that page on retry (already-migrated docs are naturally filtered as up-to-date)
 - lock is released in `finally`, including error paths
+- when an engine supports conditional batch writes, docs changed concurrently after page fetch are skipped with `concurrent_write` instead of being overwritten
 
 ### 7. Full-run helpers: `migrateAll()`
 
@@ -931,6 +948,7 @@ Current reason keys:
 - `version_compare_error`
 - `migration_error`
 - `validation_error`
+- `concurrent_write`
 
 Read-path handling for skipped docs:
 
@@ -1060,6 +1078,12 @@ Optional but recommended:
 - `migration.getStatus(collection)` for lock/checkpoint inspection
 
 `getOutdated()` must return docs that are version-behind and/or missing expected indexes, plus a cursor for pagination.
+Engines may run internal metadata maintenance before page selection (for example, syncing per-document migration metadata to the current target criteria), but returned page documents should still be migration-eligible only.
+
+For robust concurrent migration safety, engines should also support:
+
+- returning a per-document optimistic write token in `getOutdated()` results (`KeyedDocument.writeToken`)
+- honoring `expectedWriteToken` in `batchSetWithResult` so stale migration writes are reported as conflicts, not persisted
 
 ### 14. Recommended production patterns
 

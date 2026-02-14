@@ -90,10 +90,36 @@ async function createTableForTests(): Promise<void> {
         AttributeDefinitions: [
           { AttributeName: "pk", AttributeType: "S" },
           { AttributeName: "sk", AttributeType: "S" },
+          { AttributeName: "migrationOutdatedPk", AttributeType: "S" },
+          { AttributeName: "migrationOutdatedSk", AttributeType: "S" },
+          { AttributeName: "migrationSyncPk", AttributeType: "S" },
+          { AttributeName: "migrationSyncSk", AttributeType: "N" },
         ],
         KeySchema: [
           { AttributeName: "pk", KeyType: "HASH" },
           { AttributeName: "sk", KeyType: "RANGE" },
+        ],
+        GlobalSecondaryIndexes: [
+          {
+            IndexName: "migration_outdated_idx",
+            KeySchema: [
+              { AttributeName: "migrationOutdatedPk", KeyType: "HASH" },
+              { AttributeName: "migrationOutdatedSk", KeyType: "RANGE" },
+            ],
+            Projection: {
+              ProjectionType: "ALL",
+            },
+          },
+          {
+            IndexName: "migration_sync_idx",
+            KeySchema: [
+              { AttributeName: "migrationSyncPk", KeyType: "HASH" },
+              { AttributeName: "migrationSyncSk", KeyType: "RANGE" },
+            ],
+            Projection: {
+              ProjectionType: "ALL",
+            },
+          },
         ],
         BillingMode: "PAY_PER_REQUEST",
       }),
@@ -302,6 +328,70 @@ describe("dynamoDbEngine integration", () => {
     expect(await engine.get(collection, "u1")).toBeNull();
     expect(await engine.get(collection, "u2")).toEqual({ id: "u2", name: "B" });
     expect(await engine.get(collection, "u3")).toBeNull();
+  });
+
+  test("batchSetWithResult skips stale migration writes when a document changed concurrently", async () => {
+    await engine.put(
+      collection,
+      "u1",
+      {
+        __v: 1,
+        __indexes: ["primary"],
+        id: "u1",
+        name: "Before",
+        email: "before@example.com",
+      },
+      { primary: "u1" },
+    );
+
+    const outdated = await engine.migration.getOutdated(collection, {
+      version: 2,
+      versionField: "__v",
+      indexes: ["primary"],
+      indexesField: "__indexes",
+    });
+    const token = outdated.documents[0]?.writeToken;
+
+    expect(typeof token).toBe("string");
+
+    await engine.update(
+      collection,
+      "u1",
+      {
+        __v: 1,
+        __indexes: ["primary"],
+        id: "u1",
+        name: "Concurrent",
+        email: "concurrent@example.com",
+      },
+      { primary: "u1" },
+    );
+
+    const result = await engine.batchSetWithResult!(collection, [
+      {
+        key: "u1",
+        doc: {
+          __v: 2,
+          __indexes: ["primary"],
+          id: "u1",
+          firstName: "Before",
+          lastName: "",
+          email: "before@example.com",
+        },
+        indexes: { primary: "u1" },
+        expectedWriteToken: token,
+      },
+    ]);
+
+    expect(result.persistedKeys).toEqual([]);
+    expect(result.conflictedKeys).toEqual(["u1"]);
+    expect(await engine.get(collection, "u1")).toEqual({
+      __v: 1,
+      __indexes: ["primary"],
+      id: "u1",
+      name: "Concurrent",
+      email: "concurrent@example.com",
+    });
   });
 
   test("batchGet preserves request order and duplicates", async () => {
@@ -638,6 +728,106 @@ describe("dynamoDbEngine integration", () => {
     });
 
     expect(page.documents.map((item) => item.key)).toEqual(["old"]);
+  });
+
+  test("supports custom key attributes and metadata GSI names", async () => {
+    const customTableName = createTestResourceName("nosql_odm_custom");
+
+    await baseClient.send(
+      new CreateTableCommand({
+        TableName: customTableName,
+        AttributeDefinitions: [
+          { AttributeName: "hk", AttributeType: "S" },
+          { AttributeName: "rk", AttributeType: "S" },
+          { AttributeName: "migrationOutdatedPk", AttributeType: "S" },
+          { AttributeName: "migrationOutdatedSk", AttributeType: "S" },
+          { AttributeName: "migrationSyncPk", AttributeType: "S" },
+          { AttributeName: "migrationSyncSk", AttributeType: "N" },
+        ],
+        KeySchema: [
+          { AttributeName: "hk", KeyType: "HASH" },
+          { AttributeName: "rk", KeyType: "RANGE" },
+        ],
+        GlobalSecondaryIndexes: [
+          {
+            IndexName: "custom_outdated_idx",
+            KeySchema: [
+              { AttributeName: "migrationOutdatedPk", KeyType: "HASH" },
+              { AttributeName: "migrationOutdatedSk", KeyType: "RANGE" },
+            ],
+            Projection: {
+              ProjectionType: "ALL",
+            },
+          },
+          {
+            IndexName: "custom_sync_idx",
+            KeySchema: [
+              { AttributeName: "migrationSyncPk", KeyType: "HASH" },
+              { AttributeName: "migrationSyncSk", KeyType: "RANGE" },
+            ],
+            Projection: {
+              ProjectionType: "ALL",
+            },
+          },
+        ],
+        BillingMode: "PAY_PER_REQUEST",
+      }),
+    );
+
+    await waitUntilTableExists(
+      {
+        client: baseClient,
+        minDelay: 1,
+        maxWaitTime: migrationTableWaitMaxSeconds,
+      },
+      {
+        TableName: customTableName,
+      },
+    );
+
+    const customEngine = dynamoDbEngine({
+      client: documentClient,
+      tableName: customTableName,
+      hashKeyName: "hk",
+      sortKeyName: "rk",
+      migrationOutdatedIndexName: "custom_outdated_idx",
+      migrationSyncIndexName: "custom_sync_idx",
+    });
+
+    try {
+      await customEngine.put(
+        collection,
+        "legacy",
+        { __v: 1, __indexes: ["primary"], id: "legacy" },
+        { primary: "legacy" },
+      );
+
+      const page = await customEngine.migration.getOutdated(collection, {
+        version: 2,
+        versionField: "__v",
+        indexesField: "__indexes",
+        indexes: ["byEmail", "primary"],
+      });
+
+      expect(page.documents.map((item) => item.key)).toEqual(["legacy"]);
+    } finally {
+      await baseClient.send(
+        new DeleteTableCommand({
+          TableName: customTableName,
+        }),
+      );
+
+      await waitUntilTableNotExists(
+        {
+          client: baseClient,
+          minDelay: 1,
+          maxWaitTime: migrationTableWaitMaxSeconds,
+        },
+        {
+          TableName: customTableName,
+        },
+      );
+    }
   });
 
   test("get throws for invalid stored document item", async () => {
