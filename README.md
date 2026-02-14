@@ -298,10 +298,14 @@ const engine = mongoDbEngine({
 const store = createStore(engine, [User]);
 ```
 
-The MongoDB adapter stores model documents and migration metadata in two collections:
+The MongoDB adapter stores model documents in one collection and migration run state in another:
 
 - `nosql_odm_documents`
 - `nosql_odm_metadata`
+
+Document migration metadata used for outdated-page queries is co-located with each document row in
+`nosql_odm_documents` (for atomic document + metadata updates).
+`nosql_odm_metadata` stores migration lock/checkpoint/sequence state.
 
 You can override collection names with `documentsCollection` / `metadataCollection`.
 
