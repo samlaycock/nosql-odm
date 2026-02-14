@@ -243,6 +243,70 @@ describe("cassandraEngine integration", () => {
     expect(await engine.get(collection, "u3")).toBeNull();
   });
 
+  test("batchSetWithResult skips stale migration writes when a document changed concurrently", async () => {
+    await engine.put(
+      collection,
+      "u1",
+      {
+        __v: 1,
+        __indexes: ["primary"],
+        id: "u1",
+        name: "Before",
+        email: "before@example.com",
+      },
+      { primary: "u1" },
+    );
+
+    const outdated = await engine.migration.getOutdated(collection, {
+      version: 2,
+      versionField: "__v",
+      indexes: ["primary"],
+      indexesField: "__indexes",
+    });
+    const token = outdated.documents[0]?.writeToken;
+
+    expect(typeof token).toBe("string");
+
+    await engine.update(
+      collection,
+      "u1",
+      {
+        __v: 1,
+        __indexes: ["primary"],
+        id: "u1",
+        name: "Concurrent",
+        email: "concurrent@example.com",
+      },
+      { primary: "u1" },
+    );
+
+    const result = await engine.batchSetWithResult!(collection, [
+      {
+        key: "u1",
+        doc: {
+          __v: 2,
+          __indexes: ["primary"],
+          id: "u1",
+          firstName: "Before",
+          lastName: "",
+          email: "before@example.com",
+        },
+        indexes: { primary: "u1" },
+        expectedWriteToken: token,
+      },
+    ]);
+
+    expect(result.persistedKeys).toEqual([]);
+    expect(result.conflictedKeys).toEqual(["u1"]);
+    expect(await engine.get(collection, "u1")).toEqual({
+      __v: 1,
+      __indexes: ["primary"],
+      id: "u1",
+      name: "Concurrent",
+      email: "concurrent@example.com",
+    });
+  });
+
   test("batchGet preserves request order and duplicates", async () => {
     await engine.put(collection, "u1", { id: "u1", nested: { value: 1 } }, { primary: "u1" });
 
