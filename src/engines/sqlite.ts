@@ -1,5 +1,6 @@
 import type Database from "better-sqlite3";
 import {
+  type BatchSetResult,
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
   type AcquireLockOptions,
@@ -7,15 +8,17 @@ import {
   type EngineQueryResult,
   type FieldCondition,
   type KeyedDocument,
+  type MigrationDocumentMetadata,
   type MigrationCriteria,
   type MigrationLock,
+  type MigrationVersionState,
   type QueryEngine,
   type QueryParams,
   type ResolvedIndexKeys,
 } from "./types";
 import { DefaultMigrator } from "../migrator";
 
-const LATEST_SCHEMA_VERSION = 1;
+const LATEST_SCHEMA_VERSION = 2;
 const OUTDATED_PAGE_LIMIT = 100;
 const OUTDATED_SCAN_CHUNK_SIZE = 256;
 
@@ -23,6 +26,7 @@ interface DocumentRow {
   id: number;
   doc_key: string;
   doc_json: string;
+  write_version: number;
 }
 
 interface QueryRow {
@@ -50,6 +54,12 @@ interface StatusRow {
   cursor: string | null;
 }
 
+interface MigrationMetadata {
+  targetVersion: number;
+  versionState: MigrationVersionState;
+  indexSignature: string | null;
+}
+
 export interface SqliteEngineOptions {
   database: Database.Database;
 }
@@ -73,7 +83,8 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
     INSERT INTO documents (collection, doc_key, doc_json)
     VALUES (?, ?, ?)
     ON CONFLICT (collection, doc_key) DO UPDATE SET
-      doc_json = excluded.doc_json
+      doc_json = excluded.doc_json,
+      write_version = documents.write_version + 1
   `);
 
   const insertDocumentStmt = db.prepare<[string, string, string]>(
@@ -86,8 +97,20 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
 
   const updateDocumentStmt = db.prepare<[string, string, string]>(`
     UPDATE documents
-    SET doc_json = ?
+    SET
+      doc_json = ?,
+      write_version = write_version + 1
     WHERE collection = ? AND doc_key = ?
+  `);
+
+  const updateDocumentWithTokenStmt = db.prepare<[string, string, string, number]>(`
+    UPDATE documents
+    SET
+      doc_json = ?,
+      write_version = write_version + 1
+    WHERE collection = ?
+      AND doc_key = ?
+      AND write_version = ?
   `);
 
   const deleteIndexesForDocumentStmt = db.prepare<[string, string]>(
@@ -156,27 +179,96 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
     WHERE l.collection = ?
   `);
 
-  const scanOutdatedChunkStmt = db.prepare<[string, number, number], DocumentRow>(`
-    SELECT id, doc_key, doc_json
-    FROM documents
-    WHERE collection = ? AND id > ?
-    ORDER BY id ASC
+  const upsertMigrationMetadataStmt = db.prepare<[string, string, number, string, string | null]>(`
+    INSERT INTO migration_metadata (
+      collection,
+      doc_key,
+      target_version,
+      version_state,
+      index_signature
+    )
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT (collection, doc_key) DO UPDATE SET
+      target_version = excluded.target_version,
+      version_state = excluded.version_state,
+      index_signature = excluded.index_signature
+  `);
+
+  const queryOutdatedByMetadataStmt = db.prepare<
+    [string, number, string, number, number],
+    DocumentRow
+  >(`
+    SELECT d.id, d.doc_key, d.doc_json, d.write_version
+    FROM migration_metadata m
+    INNER JOIN documents d
+      ON d.collection = m.collection
+     AND d.doc_key = m.doc_key
+    WHERE m.collection = ?
+      AND d.id > ?
+      AND (
+        m.version_state = 'stale'
+        OR (
+          m.version_state = 'current'
+          AND (m.index_signature IS NULL OR m.index_signature <> ?)
+        )
+      )
+      AND m.target_version = ?
+    ORDER BY d.id ASC
+    LIMIT ?
+  `);
+
+  const scanMissingMetadataStmt = db.prepare<
+    [string, number, number],
+    Pick<DocumentRow, "doc_key" | "doc_json">
+  >(`
+    SELECT d.doc_key, d.doc_json
+    FROM documents d
+    LEFT JOIN migration_metadata m
+      ON m.collection = d.collection
+     AND m.doc_key = d.doc_key
+    WHERE d.collection = ?
+      AND (
+        m.doc_key IS NULL
+        OR m.target_version IS NULL
+        OR m.target_version <> ?
+      )
+    ORDER BY d.id ASC
     LIMIT ?
   `);
 
   const putTxn = db.transaction(
-    (collection: string, key: string, docJson: string, indexes: ResolvedIndexKeys) => {
+    (
+      collection: string,
+      key: string,
+      docJson: string,
+      indexes: ResolvedIndexKeys,
+      metadata: MigrationMetadata,
+    ) => {
       upsertDocumentStmt.run(collection, key, docJson);
       deleteIndexesForDocumentStmt.run(collection, key);
 
       for (const [indexName, indexValue] of Object.entries(indexes)) {
         insertIndexStmt.run(collection, key, indexName, String(indexValue));
       }
+
+      upsertMigrationMetadataStmt.run(
+        collection,
+        key,
+        metadata.targetVersion,
+        metadata.versionState,
+        metadata.indexSignature,
+      );
     },
   );
 
   const updateTxn = db.transaction(
-    (collection: string, key: string, docJson: string, indexes: ResolvedIndexKeys) => {
+    (
+      collection: string,
+      key: string,
+      docJson: string,
+      indexes: ResolvedIndexKeys,
+      metadata: MigrationMetadata,
+    ) => {
       const result = updateDocumentStmt.run(docJson, collection, key) as { changes?: unknown };
       const changes = Number(result?.changes ?? 0);
 
@@ -189,23 +281,50 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
       for (const [indexName, indexValue] of Object.entries(indexes)) {
         insertIndexStmt.run(collection, key, indexName, String(indexValue));
       }
+
+      upsertMigrationMetadataStmt.run(
+        collection,
+        key,
+        metadata.targetVersion,
+        metadata.versionState,
+        metadata.indexSignature,
+      );
     },
   );
 
   const createTxn = db.transaction(
-    (collection: string, key: string, docJson: string, indexes: ResolvedIndexKeys) => {
+    (
+      collection: string,
+      key: string,
+      docJson: string,
+      indexes: ResolvedIndexKeys,
+      metadata: MigrationMetadata,
+    ) => {
       insertDocumentStmt.run(collection, key, docJson);
 
       for (const [indexName, indexValue] of Object.entries(indexes)) {
         insertIndexStmt.run(collection, key, indexName, String(indexValue));
       }
+
+      upsertMigrationMetadataStmt.run(
+        collection,
+        key,
+        metadata.targetVersion,
+        metadata.versionState,
+        metadata.indexSignature,
+      );
     },
   );
 
   const batchSetTxn = db.transaction(
     (
       collection: string,
-      items: { key: string; docJson: string; indexes: ResolvedIndexKeys }[],
+      items: {
+        key: string;
+        docJson: string;
+        indexes: ResolvedIndexKeys;
+        metadata: MigrationMetadata;
+      }[],
     ): void => {
       for (const item of items) {
         upsertDocumentStmt.run(collection, item.key, item.docJson);
@@ -214,7 +333,71 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
         for (const [indexName, indexValue] of Object.entries(item.indexes)) {
           insertIndexStmt.run(collection, item.key, indexName, String(indexValue));
         }
+
+        upsertMigrationMetadataStmt.run(
+          collection,
+          item.key,
+          item.metadata.targetVersion,
+          item.metadata.versionState,
+          item.metadata.indexSignature,
+        );
       }
+    },
+  );
+
+  const batchSetWithResultTxn = db.transaction(
+    (
+      collection: string,
+      items: {
+        key: string;
+        docJson: string;
+        indexes: ResolvedIndexKeys;
+        metadata: MigrationMetadata;
+        expectedWriteToken?: string;
+      }[],
+    ): BatchSetResult => {
+      const persistedKeys: string[] = [];
+      const conflictedKeys: string[] = [];
+
+      for (const item of items) {
+        if (item.expectedWriteToken !== undefined) {
+          const expectedWriteVersion = parseWriteToken(item.expectedWriteToken);
+          const result = updateDocumentWithTokenStmt.run(
+            item.docJson,
+            collection,
+            item.key,
+            expectedWriteVersion,
+          ) as { changes?: unknown };
+          const changes = Number(result?.changes ?? 0);
+
+          if (!Number.isFinite(changes) || changes < 1) {
+            conflictedKeys.push(item.key);
+            continue;
+          }
+        } else {
+          upsertDocumentStmt.run(collection, item.key, item.docJson);
+        }
+
+        deleteIndexesForDocumentStmt.run(collection, item.key);
+
+        for (const [indexName, indexValue] of Object.entries(item.indexes)) {
+          insertIndexStmt.run(collection, item.key, indexName, String(indexValue));
+        }
+
+        upsertMigrationMetadataStmt.run(
+          collection,
+          item.key,
+          item.metadata.targetVersion,
+          item.metadata.versionState,
+          item.metadata.indexSignature,
+        );
+        persistedKeys.push(item.key);
+      }
+
+      return {
+        persistedKeys,
+        conflictedKeys,
+      };
     },
   );
 
@@ -270,11 +453,12 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
       return parseStoredDocument(row.doc_json, collection, key);
     },
 
-    async create(collection, key, doc, indexes) {
+    async create(collection, key, doc, indexes, _options, migrationMetadata) {
       const docJson = serializeDocument(doc, collection, key);
+      const metadata = normalizeMigrationMetadata(migrationMetadata) ?? deriveLegacyMetadata(doc);
 
       try {
-        createTxn(collection, key, docJson, indexes);
+        createTxn(collection, key, docJson, indexes, metadata);
       } catch (error) {
         if (isSqliteUniqueConstraintError(error)) {
           throw new EngineDocumentAlreadyExistsError(collection, key);
@@ -284,15 +468,17 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
       }
     },
 
-    async put(collection, key, doc, indexes) {
+    async put(collection, key, doc, indexes, _options, migrationMetadata) {
       const docJson = serializeDocument(doc, collection, key);
+      const metadata = normalizeMigrationMetadata(migrationMetadata) ?? deriveLegacyMetadata(doc);
 
-      putTxn(collection, key, docJson, indexes);
+      putTxn(collection, key, docJson, indexes, metadata);
     },
 
-    async update(collection, key, doc, indexes) {
+    async update(collection, key, doc, indexes, _options, migrationMetadata) {
       const docJson = serializeDocument(doc, collection, key);
-      updateTxn(collection, key, docJson, indexes);
+      const metadata = normalizeMigrationMetadata(migrationMetadata) ?? deriveLegacyMetadata(doc);
+      updateTxn(collection, key, docJson, indexes, metadata);
     },
 
     async delete(collection, key) {
@@ -331,9 +517,24 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
         key: item.key,
         docJson: serializeDocument(item.doc, collection, item.key),
         indexes: item.indexes,
+        metadata:
+          normalizeMigrationMetadata(item.migrationMetadata) ?? deriveLegacyMetadata(item.doc),
       }));
 
       batchSetTxn(collection, prepared);
+    },
+
+    async batchSetWithResult(collection, items) {
+      const prepared = items.map((item) => ({
+        key: item.key,
+        docJson: serializeDocument(item.doc, collection, item.key),
+        indexes: item.indexes,
+        metadata:
+          normalizeMigrationMetadata(item.migrationMetadata) ?? deriveLegacyMetadata(item.doc),
+        expectedWriteToken: item.expectedWriteToken,
+      }));
+
+      return batchSetWithResultTxn(collection, prepared);
     },
 
     async batchDelete(collection, keys) {
@@ -352,7 +553,9 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
       async getOutdated(collection, criteria, cursor) {
         return getOutdatedDocuments(
           db,
-          scanOutdatedChunkStmt,
+          scanMissingMetadataStmt,
+          upsertMigrationMetadataStmt,
+          queryOutdatedByMetadataStmt,
           selectDocumentIdByKeyStmt,
           collection,
           criteria,
@@ -547,6 +750,7 @@ function runMigrations(db: Database.Database): void {
           collection TEXT NOT NULL,
           doc_key TEXT NOT NULL,
           doc_json TEXT NOT NULL,
+          write_version INTEGER NOT NULL DEFAULT 1,
           UNIQUE (collection, doc_key)
         );
 
@@ -581,6 +785,13 @@ function runMigrations(db: Database.Database): void {
           cursor TEXT NOT NULL
         );
       `);
+
+      ensureMigrationMetadataSchema(db);
+    }
+
+    if (fromVersion < 2) {
+      ensureColumn(db, "documents", "write_version", "INTEGER NOT NULL DEFAULT 1");
+      ensureMigrationMetadataSchema(db);
     }
 
     setUserVersion(db, LATEST_SCHEMA_VERSION);
@@ -764,135 +975,256 @@ function randomId(): string {
 
 function getOutdatedDocuments(
   db: Database.Database,
-  scanOutdatedChunkStmt: Database.Statement<[string, number, number], DocumentRow>,
+  scanMissingMetadataStmt: Database.Statement<
+    [string, number, number],
+    Pick<DocumentRow, "doc_key" | "doc_json">
+  >,
+  upsertMigrationMetadataStmt: Database.Statement<[string, string, number, string, string | null]>,
+  queryOutdatedByMetadataStmt: Database.Statement<
+    [string, number, string, number, number],
+    DocumentRow
+  >,
   selectDocumentIdByKeyStmt: Database.Statement<[string, string], { id: number } | undefined>,
   collection: string,
   criteria: MigrationCriteria,
   cursor?: string,
 ): EngineQueryResult {
-  const parseVersion = criteria.parseVersion ?? defaultParseVersion;
-  const compareVersions = criteria.compareVersions ?? defaultCompareVersions;
-  const startId = resolveCursorId(collection, cursor, selectDocumentIdByKeyStmt);
-
-  const outdated: KeyedDocument[] = [];
-  let scanCursorId = startId;
-
-  while (outdated.length < OUTDATED_PAGE_LIMIT) {
-    const rows = scanOutdatedChunkStmt.all(collection, scanCursorId, OUTDATED_SCAN_CHUNK_SIZE);
-
-    if (rows.length === 0) {
-      break;
-    }
-
-    for (const row of rows) {
-      scanCursorId = row.id;
-
-      const doc = parseStoredDocument(row.doc_json, collection, row.doc_key) as Record<
-        string,
-        unknown
-      >;
-
-      if (isOutdated(doc, criteria, parseVersion, compareVersions)) {
-        outdated.push({
-          key: row.doc_key,
-          doc,
-        });
-      }
-
-      if (outdated.length >= OUTDATED_PAGE_LIMIT) {
-        break;
-      }
-    }
-
-    if (rows.length < OUTDATED_SCAN_CHUNK_SIZE) {
-      break;
-    }
-  }
-
-  if (outdated.length < OUTDATED_PAGE_LIMIT) {
-    return {
-      documents: outdated,
-      cursor: null,
-    };
-  }
-
-  const hasMore = hasAdditionalOutdatedAfter(
-    scanOutdatedChunkStmt,
+  syncMissingMigrationMetadata(
+    db,
+    scanMissingMetadataStmt,
+    upsertMigrationMetadataStmt,
     collection,
-    scanCursorId,
     criteria,
-    parseVersion,
-    compareVersions,
   );
+  const startId = resolveCursorId(collection, cursor, selectDocumentIdByKeyStmt);
+  const expectedSignature = computeIndexSignature(criteria.indexes);
+  const rows = queryOutdatedByMetadataStmt.all(
+    collection,
+    startId,
+    expectedSignature,
+    criteria.version,
+    OUTDATED_PAGE_LIMIT + 1,
+  );
+  const hasMore = rows.length > OUTDATED_PAGE_LIMIT;
+  const pageRows = hasMore ? rows.slice(0, OUTDATED_PAGE_LIMIT) : rows;
+  const documents: KeyedDocument[] = pageRows.map((row) => ({
+    key: row.doc_key,
+    doc: parseStoredDocument(row.doc_json, collection, row.doc_key),
+    writeToken: String(row.write_version),
+  }));
 
   return {
-    documents: outdated,
-    cursor: hasMore ? (outdated[outdated.length - 1]?.key ?? null) : null,
+    documents,
+    cursor: hasMore ? (documents[documents.length - 1]?.key ?? null) : null,
   };
 }
 
-function hasAdditionalOutdatedAfter(
-  scanOutdatedChunkStmt: Database.Statement<[string, number, number], DocumentRow>,
+function syncMissingMigrationMetadata(
+  db: Database.Database,
+  scanMissingMetadataStmt: Database.Statement<
+    [string, number, number],
+    Pick<DocumentRow, "doc_key" | "doc_json">
+  >,
+  upsertMigrationMetadataStmt: Database.Statement<[string, string, number, string, string | null]>,
   collection: string,
-  startId: number,
   criteria: MigrationCriteria,
-  parseVersion: (raw: unknown) => ComparableVersion | null,
-  compareVersions: (a: ComparableVersion, b: ComparableVersion) => number,
-): boolean {
-  let cursor = startId;
-
+): void {
   while (true) {
-    const rows = scanOutdatedChunkStmt.all(collection, cursor, OUTDATED_SCAN_CHUNK_SIZE);
+    const rows = scanMissingMetadataStmt.all(
+      collection,
+      criteria.version,
+      OUTDATED_SCAN_CHUNK_SIZE,
+    );
 
     if (rows.length === 0) {
-      return false;
+      return;
     }
 
-    for (const row of rows) {
-      cursor = row.id;
-      const doc = JSON.parse(row.doc_json) as Record<string, unknown>;
+    const syncTxn = db.transaction(
+      (
+        pending: Pick<DocumentRow, "doc_key" | "doc_json">[],
+        targetCollection: string,
+        targetCriteria: MigrationCriteria,
+      ) => {
+        for (const row of pending) {
+          const doc = parseStoredDocument(row.doc_json, targetCollection, row.doc_key);
+          const metadata = deriveMetadataForCriteria(doc, targetCriteria);
+          upsertMigrationMetadataStmt.run(
+            targetCollection,
+            row.doc_key,
+            metadata.targetVersion,
+            metadata.versionState,
+            metadata.indexSignature,
+          );
+        }
+      },
+    );
 
-      if (isOutdated(doc, criteria, parseVersion, compareVersions)) {
-        return true;
-      }
-    }
+    syncTxn.immediate(rows, collection, criteria);
 
     if (rows.length < OUTDATED_SCAN_CHUNK_SIZE) {
-      return false;
+      return;
     }
   }
 }
 
-function isOutdated(
-  doc: Record<string, unknown>,
-  criteria: MigrationCriteria,
-  parseVersion: (raw: unknown) => ComparableVersion | null,
-  compareVersions: (a: ComparableVersion, b: ComparableVersion) => number,
-): boolean {
+function deriveMetadataForCriteria(doc: unknown, criteria: MigrationCriteria): MigrationMetadata {
+  if (!isRecord(doc)) {
+    return {
+      targetVersion: criteria.version,
+      versionState: "unknown",
+      indexSignature: null,
+    };
+  }
+
+  const parseVersion = criteria.parseVersion ?? defaultParseVersion;
+  const compareVersions = criteria.compareVersions ?? defaultCompareVersions;
   const parsedVersion = parseVersion(doc[criteria.versionField]);
-  const versionState = classifyVersionState(parsedVersion, criteria.version, compareVersions);
 
-  if (versionState === "stale") {
-    return true;
+  return {
+    targetVersion: criteria.version,
+    versionState: classifyVersionState(parsedVersion, criteria.version, compareVersions),
+    indexSignature: computeIndexSignatureFromUnknown(doc[criteria.indexesField]),
+  };
+}
+
+function normalizeMigrationMetadata(
+  raw: MigrationDocumentMetadata | undefined,
+): MigrationMetadata | null {
+  if (!raw) {
+    return null;
   }
 
-  if (versionState !== "current") {
-    return false;
+  if (
+    !Number.isFinite(raw.targetVersion) ||
+    Math.floor(raw.targetVersion) !== raw.targetVersion ||
+    raw.targetVersion <= 0
+  ) {
+    throw new Error("SQLite received invalid migration metadata target version");
   }
 
-  const storedIndexes = doc[criteria.indexesField];
-
-  if (!Array.isArray(storedIndexes) || storedIndexes.length !== criteria.indexes.length) {
-    return true;
+  if (!isMigrationVersionState(raw.versionState)) {
+    throw new Error("SQLite received invalid migration metadata state");
   }
 
-  for (let i = 0; i < criteria.indexes.length; i++) {
-    if (storedIndexes[i] !== criteria.indexes[i]) {
-      return true;
-    }
+  if (raw.indexSignature !== null && typeof raw.indexSignature !== "string") {
+    throw new Error("SQLite received invalid migration metadata index signature");
   }
 
-  return false;
+  return {
+    targetVersion: raw.targetVersion,
+    versionState: raw.versionState,
+    indexSignature: raw.indexSignature,
+  };
+}
+
+function isMigrationVersionState(value: unknown): value is MigrationVersionState {
+  return value === "current" || value === "stale" || value === "ahead" || value === "unknown";
+}
+
+function deriveLegacyMetadata(doc: unknown): MigrationMetadata {
+  if (!isRecord(doc)) {
+    return {
+      targetVersion: 0,
+      versionState: "unknown",
+      indexSignature: null,
+    };
+  }
+
+  const rawVersion = normalizeNumericVersionFromUnknown(doc.__v);
+
+  return {
+    targetVersion: rawVersion ?? 0,
+    versionState: rawVersion === null ? "unknown" : "current",
+    indexSignature: computeIndexSignatureFromUnknown(doc.__indexes),
+  };
+}
+
+function computeIndexSignatureFromUnknown(raw: unknown): string | null {
+  if (!Array.isArray(raw) || raw.some((value) => typeof value !== "string")) {
+    return null;
+  }
+
+  return computeIndexSignature(raw as string[]);
+}
+
+function computeIndexSignature(indexes: readonly string[]): string {
+  return JSON.stringify(indexes);
+}
+
+function normalizeNumericVersionFromUnknown(raw: unknown): number | null {
+  if (raw === undefined || raw === null) {
+    return null;
+  }
+
+  if (typeof raw === "number") {
+    return Number.isFinite(raw) ? raw : null;
+  }
+
+  if (typeof raw !== "string") {
+    return null;
+  }
+
+  return normalizeNumericVersion(raw);
+}
+
+function parseWriteToken(raw: string): number {
+  const value = Number(raw);
+
+  if (!Number.isFinite(value) || Math.floor(value) !== value || value <= 0) {
+    throw new Error("SQLite received an invalid write token");
+  }
+
+  return value;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasColumn(db: Database.Database, table: string, column: string): boolean {
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all() as { name?: unknown }[];
+
+  return rows.some((row) => row.name === column);
+}
+
+function ensureColumn(
+  db: Database.Database,
+  table: string,
+  column: string,
+  definitionSql: string,
+): void {
+  if (hasColumn(db, table, column)) {
+    return;
+  }
+
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definitionSql}`);
+}
+
+function ensureMigrationMetadataSchema(db: Database.Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS migration_metadata (
+      collection TEXT NOT NULL,
+      doc_key TEXT NOT NULL,
+      target_version INTEGER NULL,
+      version_state TEXT NULL,
+      index_signature TEXT NULL,
+      PRIMARY KEY (collection, doc_key),
+      FOREIGN KEY (collection, doc_key)
+        REFERENCES documents (collection, doc_key)
+        ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_migration_metadata_target_state_doc
+      ON migration_metadata (collection, target_version, version_state, doc_key);
+
+    CREATE INDEX IF NOT EXISTS idx_migration_metadata_target_state_signature
+      ON migration_metadata (collection, target_version, version_state, index_signature, doc_key);
+  `);
+
+  ensureColumn(db, "migration_metadata", "target_version", "INTEGER NULL");
+  ensureColumn(db, "migration_metadata", "version_state", "TEXT NULL");
+  ensureColumn(db, "migration_metadata", "index_signature", "TEXT NULL");
 }
 
 type VersionState = "current" | "stale" | "ahead" | "unknown";
