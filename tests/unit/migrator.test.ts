@@ -133,6 +133,20 @@ describe("migrator scope conflicts", () => {
 
     expect(store.migrateAll()).rejects.toThrow(MigrationScopeConflictError);
   });
+
+  test("model migrateNextPage cannot start while a store migration run exists", async () => {
+    const store = createStore(engine, [buildUserV2(), buildPostV2()]);
+    await store.getOrCreateMigration();
+
+    await expectReject(store.user.migrateNextPage(), MigrationScopeConflictError);
+  });
+
+  test("store migrateNextPage cannot start while a model migration run exists", async () => {
+    const store = createStore(engine, [buildUserV2(), buildPostV2()]);
+    await store.user.getOrCreateMigration();
+
+    await expectReject(store.migrateNextPage(), MigrationScopeConflictError);
+  });
 });
 
 describe("paged migration API", () => {
@@ -183,5 +197,60 @@ describe("missing migrator", () => {
 
     await expectReject(store.user.migrateAll(), MissingMigratorError);
     await expectReject(store.user.migrateNextPage(), MissingMigratorError);
+  });
+});
+
+describe("persisted migration run validation", () => {
+  test("rejects array-shaped progressByModel in persisted run state", async () => {
+    const lock = await engine.migration.acquireLock("user");
+    expect(lock).not.toBeNull();
+
+    await engine.migration.saveCheckpoint!(
+      lock!,
+      JSON.stringify({
+        id: "run-1",
+        scope: "model",
+        models: ["user"],
+        modelIndex: 0,
+        cursor: null,
+        startedAt: Date.now(),
+        updatedAt: Date.now(),
+        progressByModel: [],
+      }),
+    );
+    await engine.migration.releaseLock(lock!);
+
+    const store = createStore(engine, [buildUserV2()]);
+    await expectReject(store.user.getMigrationProgress(), /invalid model progress/i);
+  });
+
+  test("rejects array-shaped skipReasons in persisted run state", async () => {
+    const lock = await engine.migration.acquireLock("user");
+    expect(lock).not.toBeNull();
+
+    await engine.migration.saveCheckpoint!(
+      lock!,
+      JSON.stringify({
+        id: "run-2",
+        scope: "model",
+        models: ["user"],
+        modelIndex: 0,
+        cursor: null,
+        startedAt: Date.now(),
+        updatedAt: Date.now(),
+        progressByModel: {
+          user: {
+            migrated: 0,
+            skipped: 0,
+            pages: 0,
+            skipReasons: [],
+          },
+        },
+      }),
+    );
+    await engine.migration.releaseLock(lock!);
+
+    const store = createStore(engine, [buildUserV2()]);
+    await expectReject(store.user.getMigrationProgress(), /invalid skip reasons/i);
   });
 });

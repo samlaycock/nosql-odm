@@ -985,7 +985,7 @@ Migrator resolution order:
 3. none -> migration APIs throw `MissingMigratorError`
 
 If you pass `migrationHooks` and do not pass a `migrator`, the store uses a `DefaultMigrator` with those hooks.
-If you pass a custom `migrator`, that instance is used as-is (your migrator controls hook behavior).
+If you pass a custom `migrator`, do not also pass `migrationHooks` — `createStore` throws when both are provided.
 
 ### 12. Implementing a custom migrator
 
