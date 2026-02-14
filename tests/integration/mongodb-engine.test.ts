@@ -18,8 +18,9 @@ import { createCollectionNameFactory, createTestResourceName, expectReject } fro
 import { runMigrationIntegrationSuite } from "./migration-suite";
 
 const mongoUrl = process.env.MONGODB_URL ?? "mongodb://127.0.0.1:27017";
-const connectAttemptsRaw = Number(process.env.MONGODB_CONNECT_ATTEMPTS ?? "60");
-const connectDelayMsRaw = Number(process.env.MONGODB_CONNECT_DELAY_MS ?? "1000");
+const isCi = process.env.CI === "true";
+const connectAttemptsRaw = Number(process.env.MONGODB_CONNECT_ATTEMPTS ?? (isCi ? "180" : "60"));
+const connectDelayMsRaw = Number(process.env.MONGODB_CONNECT_DELAY_MS ?? (isCi ? "1500" : "1000"));
 const databaseName = process.env.MONGODB_TEST_DATABASE ?? createTestResourceName("nosql_odm_test");
 
 const documentsCollectionName = "nosql_odm_documents";
@@ -31,7 +32,7 @@ let engine: MongoDbQueryEngine;
 let collection = "";
 const nextCollection = createCollectionNameFactory();
 
-setDefaultTimeout(120_000);
+setDefaultTimeout(isCi ? 300_000 : 120_000);
 
 function normalizePositiveInteger(value: number, fallback: number): number {
   if (!Number.isFinite(value) || value <= 0) {

@@ -20,8 +20,11 @@ import { runMigrationIntegrationSuite } from "./migration-suite";
 
 const emulatorHost = process.env.FIRESTORE_EMULATOR_HOST ?? "127.0.0.1:8080";
 const projectId = process.env.FIRESTORE_PROJECT_ID ?? createFirestoreProjectId();
-const connectAttemptsRaw = Number(process.env.FIRESTORE_CONNECT_ATTEMPTS ?? "60");
-const connectDelayMsRaw = Number(process.env.FIRESTORE_CONNECT_DELAY_MS ?? "1000");
+const isCi = process.env.CI === "true";
+const connectAttemptsRaw = Number(process.env.FIRESTORE_CONNECT_ATTEMPTS ?? (isCi ? "180" : "60"));
+const connectDelayMsRaw = Number(
+  process.env.FIRESTORE_CONNECT_DELAY_MS ?? (isCi ? "1500" : "1000"),
+);
 const emulatorCredentials = createEmulatorCredentials();
 
 const documentsCollectionName = "nosql_odm_documents";
@@ -33,7 +36,7 @@ let collection = "";
 let previousEmulatorHost: string | undefined;
 const nextCollection = createCollectionNameFactory();
 
-setDefaultTimeout(120_000);
+setDefaultTimeout(isCi ? 300_000 : 120_000);
 
 function normalizePositiveInteger(value: number, fallback: number): number {
   if (!Number.isFinite(value) || value <= 0) {

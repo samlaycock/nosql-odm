@@ -1,4 +1,12 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import {
+  afterAll,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  setDefaultTimeout,
+  test,
+} from "bun:test";
 import {
   CreateTableCommand,
   DeleteTableCommand,
@@ -19,6 +27,8 @@ import { runMigrationIntegrationSuite } from "./migration-suite";
 const endpoint = process.env.DYNAMODB_ENDPOINT ?? "http://127.0.0.1:8000";
 const region = process.env.AWS_REGION ?? "us-east-1";
 const tableName = process.env.DYNAMODB_TEST_TABLE ?? createTestResourceName("nosql_odm_test");
+const isCi = process.env.CI === "true";
+const migrationTableWaitMaxSeconds = isCi ? 90 : 20;
 
 let baseClient: DynamoDBClient;
 let documentClient: DynamoDBDocumentClient;
@@ -26,6 +36,8 @@ let engine: DynamoDbQueryEngine;
 let collection = "";
 let createdTable = false;
 const nextCollection = createCollectionNameFactory();
+
+setDefaultTimeout(isCi ? 300_000 : 120_000);
 
 async function createTableForTests(): Promise<void> {
   try {
@@ -48,7 +60,7 @@ async function createTableForTests(): Promise<void> {
       {
         client: baseClient,
         minDelay: 1,
-        maxWaitTime: 20,
+        maxWaitTime: migrationTableWaitMaxSeconds,
       },
       {
         TableName: tableName,
@@ -108,7 +120,7 @@ describe("dynamoDbEngine integration", () => {
           {
             client: baseClient,
             minDelay: 1,
-            maxWaitTime: 20,
+            maxWaitTime: migrationTableWaitMaxSeconds,
           },
           {
             TableName: tableName,
