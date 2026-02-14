@@ -715,7 +715,14 @@ const User = model("user")
 
 ## Migrations
 
-### Defining version chains
+Migrations are designed around resumable, lock-coordinated runs, so they work in both:
+
+- horizontally scaled app fleets where many nodes may attempt to start migration at boot
+- durable workflows/job runners that process migration in ordered pages and recover after failures
+
+### 1. Version chain and projection rules
+
+Define schemas as an ordered chain. Each step migrates from the immediately previous version:
 
 ```ts
 const User = model("user")
@@ -762,12 +769,19 @@ const User = model("user")
       },
     },
   )
+  .index({ name: "primary", value: "id" })
+  .index({ name: "byEmail", value: "email" })
   .build();
 ```
 
-Migrations run stepwise (`v1 -> v2 -> v3`), not as one jump.
+Migration is stepwise (`v1 -> v2 -> v3`), never a single jump. A document is considered outdated when:
 
-### Migration modes
+- its stored version is behind the latest model version, or
+- its stored index-name list does not match the current model index names
+
+That means `migrateAll()` also functions as a reindex backfill.
+
+### 2. Read-path migration modes
 
 Default mode is `lazy`:
 
@@ -779,87 +793,303 @@ const User = model("user", { migration: "lazy" }) // default
 
 Modes:
 
-- `lazy`: read paths (`findByKey`, `query`, `batchGet`) migrate stale docs and write back.
-- `readonly`: read paths migrate in memory but do not write back.
-- `eager`: same read behavior as `readonly`; use `migrateAll()` for persisted upgrades.
+- `lazy`: read APIs (`findByKey`, `query`, `batchGet`) project stale docs to latest and persist the write-back.
+- `readonly`: read APIs project in-memory but do not persist migration write-backs.
+- `eager`: same read behavior as `readonly`; use explicit migration jobs (`migrateAll` / paged APIs) for persistence.
 
-### Running migrations explicitly
+### 3. Migration scopes and conflict rules
 
-One model:
+There are two run scopes:
+
+- model scope: `store.user.*migration*()` operates only on `user`
+- store scope: `store.*migration*()` operates on all registered models in deterministic order
+
+Scope conflict protection is built in:
+
+- if a store-scope run is active, starting a model-scope run for any covered model throws `MigrationScopeConflictError`
+- if a model-scope run is active for a model, starting a store-scope run that includes that model throws `MigrationScopeConflictError`
+
+This prevents overlapping runs that would duplicate work or fight over checkpoints.
+
+### 4. Migration APIs
+
+Model-level APIs:
+
+- `await store.user.getOrCreateMigration(options?)`
+- `await store.user.migrateNextPage(options?)`
+- `await store.user.getMigrationProgress()`
+- `await store.user.migrateAll(options?)`
+- `await store.user.getMigrationStatus()`
+
+Store-level APIs:
+
+- `await store.getOrCreateMigration(options?)`
+- `await store.migrateNextPage(options?)`
+- `await store.getMigrationProgress()`
+- `await store.migrateAll(options?)`
+
+Options:
+
+- `lockTtlMs?: number`
+
+`lockTtlMs` enables stale lock recovery. Engines should treat a lock as stale when `Date.now() - lock.acquiredAt >= lockTtlMs`, then allow takeover.
+
+### 5. `getOrCreateMigration()` semantics
+
+`getOrCreateMigration()` is safe to call from many workers:
+
+- if no run exists, it creates one and returns progress
+- if a run already exists, it returns existing progress (resume semantics)
+- if another worker holds the lock during this call, it still attempts to return existing progress
+
+Use this to initialize orchestration state without needing a separate "create if missing" primitive.
+
+### 6. `migrateNextPage()` semantics (durable workflow primitive)
+
+`migrateNextPage()` processes at most one page and returns:
+
+- `status: "busy"`: another worker currently holds the migration lock
+- `status: "processed"`: one page was processed and more work remains
+- `status: "completed"`: the run is finished and cleared
+
+Returned shape:
+
+- `model`: model processed in this step (`null` for some completed/no-op paths)
+- `migrated`: number of documents successfully moved/reindexed in this page
+- `skipped`: number of documents skipped in this page
+- `skipReasons`: optional per-reason counts for skipped docs
+- `completed`: whether the run finished in this call
+- `hasMore`: whether more work remains
+- `progress`: current run progress snapshot, or `null` when completed
+
+Important workflow properties:
+
+- page boundaries are checkpointed, so retries resume from saved cursor boundaries
+- crashes mid-page can re-scan that page on retry (already-migrated docs are naturally filtered as up-to-date)
+- lock is released in `finally`, including error paths
+
+### 7. Full-run helpers: `migrateAll()`
+
+Model scope:
 
 ```ts
-const result = await store.user.migrateAll();
+const result = await store.user.migrateAll({ lockTtlMs: 30_000 });
+console.log(result.model, result.status, result.migrated, result.skipped, result.skipReasons);
+```
 
-if (result.status === "completed") {
-  console.log(result.migrated, result.skipped, result.skipReasons);
+Store scope:
+
+```ts
+const results = await store.migrateAll({ lockTtlMs: 30_000 });
+for (const r of results) {
+  console.log(r.model, r.status, r.migrated, r.skipped, r.skipReasons);
 }
 ```
 
-All models in a store:
+`migrateAll()` is a loop over `migrateNextPage()`. If it receives `status: "busy"` mid-run, it throws `MigrationAlreadyRunningError`.
+
+### 8. Progress and status introspection
+
+`getMigrationProgress()` returns durable run progress (if a run exists):
 
 ```ts
-const results = await store.migrateAll();
+const progress = await store.getMigrationProgress();
+```
 
-for (const result of results) {
-  if (result.status === "completed") {
-    console.log(result.model, result.migrated, result.skipped);
-  } else {
-    // typically already running for a locked model
-    console.log(result.model, result.status, result.reason);
+Progress includes:
+
+- `id`: run ID
+- `scope`: `"model" | "store"`
+- `models`: included model names
+- `modelIndex`: current model position for store-scope runs
+- `cursor`: current page cursor for current model
+- `startedAt`, `updatedAt`
+- `running`
+- `totals`: aggregate migrated/skipped
+- `progressByModel[model]`: `{ migrated, skipped, pages, skipReasons }`
+
+`getMigrationStatus()` (model API only) returns raw engine migration status for that collection lock/checkpoint:
+
+```ts
+const status = await store.user.getMigrationStatus();
+```
+
+Use `getMigrationProgress()` for user-facing run progress. Use `getMigrationStatus()` for low-level lock/checkpoint inspection.
+
+### 9. Skip behavior and reasons
+
+Migration is intentionally ignore-first per document:
+
+- bad/incompatible docs do not fail the whole run
+- skipped documents are counted and surfaced in `skipReasons`
+
+Current reason keys:
+
+- `invalid_version`
+- `ahead_of_latest`
+- `unknown_source_version`
+- `version_compare_error`
+- `migration_error`
+- `validation_error`
+
+Read-path handling for skipped docs:
+
+- `findByKey()` returns `null`
+- `query()` and `batchGet()` omit them
+
+### 10. Event hooks
+
+Pass hooks via `createStore(..., { migrationHooks })`:
+
+```ts
+const store = createStore(engine, [User], {
+  migrationHooks: {
+    onMigrationCreated: ({ progress }) => {
+      console.log("created", progress.id);
+    },
+    onDocumentMigrated: ({ runId, model, key }) => {
+      console.log("migrated", runId, model, key);
+    },
+    onDocumentSkipped: ({ runId, model, key, reason, error }) => {
+      console.warn("skipped", runId, model, key, reason, error);
+    },
+    onMigrationCompleted: ({ progress }) => {
+      console.log("completed", progress.id, progress.totals);
+    },
+    onMigrationFailed: ({ runId, error, progress }) => {
+      console.error("failed", runId, error, progress);
+    },
+  },
+});
+```
+
+Available hooks:
+
+- `onMigrationCreated`
+- `onMigrationResumed`
+- `onPageClaimed`
+- `onDocumentMigrated`
+- `onDocumentSkipped`
+- `onPageCommitted`
+- `onMigrationCompleted`
+- `onMigrationFailed`
+
+Hook errors are intentionally swallowed so observability code cannot break migration execution.
+
+### 11. Migrator selection and overriding
+
+Migrator resolution order:
+
+1. `createStore(..., { migrator })` (highest priority)
+2. `engine.migrator`
+3. none -> migration APIs throw `MissingMigratorError`
+
+If you pass `migrationHooks` and do not pass a `migrator`, the store uses a `DefaultMigrator` with those hooks.
+If you pass a custom `migrator`, that instance is used as-is (your migrator controls hook behavior).
+
+### 12. Implementing a custom migrator
+
+Implement the `Migrator` interface:
+
+```ts
+import type {
+  Migrator,
+  MigrationRunOptions,
+  MigrationNextPageResult,
+  MigrationRunProgress,
+} from "nosql-odm";
+
+type MigrationScope = Parameters<Migrator["getOrCreateRun"]>[0];
+type MigrationContexts = Parameters<Migrator["getOrCreateRun"]>[1];
+type MigrationGetOrCreateResult = Awaited<ReturnType<Migrator["getOrCreateRun"]>>;
+
+class MyMigrator implements Migrator {
+  async getOrCreateRun(
+    scope: MigrationScope,
+    contexts: MigrationContexts,
+    options?: MigrationRunOptions,
+  ): Promise<MigrationGetOrCreateResult> {
+    // create-or-resume run metadata in your own durable store
+    // enforce scope overlap rules
+    // return current progress
+    throw new Error("not implemented");
+  }
+
+  async migrateNextPage(
+    scope: MigrationScope,
+    contexts: MigrationContexts,
+    options?: MigrationRunOptions,
+  ): Promise<MigrationNextPageResult> {
+    // claim lock/work unit, read one page, call context.project(),
+    // persist with context.persist(), update checkpoints, return page result
+    throw new Error("not implemented");
+  }
+
+  async getProgress(scope: MigrationScope): Promise<MigrationRunProgress | null> {
+    // return progress snapshot or null if no run exists
+    throw new Error("not implemented");
   }
 }
 ```
 
-Optional lock TTL in ms for stale-lock recovery:
+Practical recommendations for custom migrators:
+
+- keep run metadata durable (run id, scope, model order, model index, cursor, per-model totals)
+- use short critical sections around lock acquisition and checkpoint writes
+- keep page processing idempotent (safe to replay after crash)
+- checkpoint only after page commit
+- treat hook/telemetry side effects as non-critical
+- normalize model order deterministically for store-scope runs
+
+### 13. Engine requirements for migration support
+
+Every engine must provide:
+
+- `migration.acquireLock(collection, { ttl? })`
+- `migration.releaseLock(lock)`
+- `migration.getOutdated(collection, criteria, cursor?)`
+
+For `DefaultMigrator` support, engines must also provide:
+
+- `migration.saveCheckpoint(lock, cursor)`
+- `migration.loadCheckpoint(collection)`
+- `migration.clearCheckpoint(collection)`
+
+Optional but recommended:
+
+- `migration.getStatus(collection)` for lock/checkpoint inspection
+
+`getOutdated()` must return docs that are version-behind and/or missing expected indexes, plus a cursor for pagination.
+
+### 14. Recommended production patterns
+
+Boot-time horizontally scaled workers:
 
 ```ts
-await store.user.migrateAll({ lockTtlMs: 30_000 });
-await store.migrateAll({ lockTtlMs: 30_000 });
-```
-
-`migrateAll()` returns a summary including:
-
-- `migrated`: documents migrated to newer schema versions
-- `skipped`: documents ignored because they could not be safely projected to the latest schema
-- `skipReasons`: per-reason skip counts (for documents the engine returned to the migrator)
-
-Typical `skipReasons` keys:
-
-- `unknown_source_version`
-- `migration_error`
-- `validation_error`
-- `invalid_version`
-- `ahead_of_latest`
-- `version_compare_error`
-
-### Ignore-first policy
-
-- Documents with versions ahead of the latest schema are ignored.
-- Documents with invalid/unrecognized versions are ignored.
-- Migration function errors and post-migration validation failures are ignored per-document.
-- `findByKey` returns `null` for ignored documents.
-- `query` and `batchGet` omit ignored documents from results.
-
-### Migration observability
-
-Inspect migration lock/checkpoint state per model:
-
-```ts
-const status = await store.user.getMigrationStatus();
-
-if (status) {
-  console.log(status.lock.id, status.lock.acquiredAt, status.cursor);
+await store.getOrCreateMigration({ lockTtlMs: 30_000 });
+while (true) {
+  const page = await store.migrateNextPage({ lockTtlMs: 30_000 });
+  if (page.status === "busy") break;
+  if (page.completed) break;
 }
 ```
 
-### Recommended migration rollout patterns
+Durable workflow/orchestrator tick:
 
-1. `lazy` first, `migrateAll` later:
-   Deploy code with new schemas in `lazy` mode, let hot data self-heal on reads, then run `migrateAll()` to backfill.
-2. `readonly` for safety checks:
-   Use `readonly` if you want migrated reads without persistence while validating new schema behavior.
-3. `eager` for controlled maintenance windows:
-   Use `eager` + scheduled `migrateAll()` when writes during read paths should stay minimal/predictable.
+```ts
+await store.getOrCreateMigration();
+const page = await store.migrateNextPage();
+
+if (page.status === "busy") {
+  // re-enqueue with backoff
+} else if (!page.completed) {
+  // enqueue next chunk
+} else {
+  // done
+}
+```
+
+This gives strict page-by-page advancement, resumability, and safe multi-worker coordination.
 
 ## Custom Metadata Fields
 
@@ -928,10 +1158,16 @@ Required batch methods:
 
 - `batchGet`, `batchSet`, `batchDelete`
 
-Optional methods:
+Required for default `Migrator` support:
 
 - Migration checkpoints: `saveCheckpoint`, `loadCheckpoint`, `clearCheckpoint`
 - Migration status: `getStatus`
+
+Engine migrator:
+
+- Expose `engine.migrator` (built-ins do this automatically).
+- If an engine does not expose a migrator and none is passed via `createStore(..., { migrator })`,
+  migration methods throw `MissingMigratorError`.
 
 Behavioral requirements:
 

@@ -1,0 +1,41 @@
+name: 🧪 MongoDB Integration
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/engines/mongodb.ts"
+      - "tests/integration/mongodb-engine.test.ts"
+      - "docker-compose.yml"
+      - ".github/workflows/integration-mongodb.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-mongodb:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Start MongoDB
+        run: bun run services:up:mongodb
+
+      - name: Run MongoDB integration tests
+        run: bun run test:integration:mongodb
+
+      - name: Stop MongoDB
+        if: always()
+        run: bun run services:down:mongodb

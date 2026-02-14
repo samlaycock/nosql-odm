@@ -10,10 +10,10 @@
     "odm",
     "querying"
   ],
+  "license": "MIT",
   "repository": {
     "url": "https://github.com/samlaycock/nosql-odm"
   },
-  "license": "MIT",
   "files": [
     "dist"
   ],

@@ -226,4 +226,6 @@ export interface QueryEngine<TOptions = Record<string, unknown>> {
      */
     getStatus?(collection: string): Promise<MigrationStatus | null>;
   };
+
+  migrator?: import("../migrator").Migrator<TOptions>;
 }

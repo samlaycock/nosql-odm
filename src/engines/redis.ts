@@ -11,6 +11,7 @@ import {
   type QueryParams,
   type ResolvedIndexKeys,
 } from "./types";
+import { DefaultMigrator } from "../migrator";
 
 const DEFAULT_KEY_PREFIX = "nosql_odm";
 const OUTDATED_PAGE_LIMIT = 100;
@@ -385,6 +386,8 @@ export function redisEngine(options: RedisEngineOptions): RedisQueryEngine {
       },
     },
   };
+
+  engine.migrator = new DefaultMigrator(engine);
 
   return engine;
 }

@@ -15,6 +15,7 @@ import {
   type ComparableVersion,
 } from "../../src/engines/types";
 import { createCollectionNameFactory, createTestResourceName, expectReject } from "./helpers";
+import { runMigrationIntegrationSuite } from "./migration-suite";
 
 const contactPoints = (process.env.CASSANDRA_CONTACT_POINTS ?? "127.0.0.1")
   .split(",")
@@ -99,6 +100,12 @@ describe("cassandraEngine integration", () => {
       client,
       keyspace,
     });
+  });
+
+  runMigrationIntegrationSuite({
+    engineName: "cassandraEngine integration",
+    getEngine: () => engine,
+    nextCollection,
   });
 
   afterAll(async () => {

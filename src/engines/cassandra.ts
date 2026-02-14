@@ -11,6 +11,7 @@ import {
   type QueryParams,
   type ResolvedIndexKeys,
 } from "./types";
+import { DefaultMigrator } from "../migrator";
 
 const DEFAULT_DOCUMENTS_TABLE = "nosql_odm_documents";
 const DEFAULT_METADATA_TABLE = "nosql_odm_metadata";
@@ -366,6 +367,8 @@ export function cassandraEngine(options: CassandraEngineOptions): CassandraQuery
       },
     },
   };
+
+  engine.migrator = new DefaultMigrator(engine);
 
   return engine;
 }

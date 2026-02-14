@@ -24,14 +24,23 @@ export {
   createStore,
   DocumentAlreadyExistsError,
   MigrationAlreadyRunningError,
+  MissingMigratorError,
+  MigrationScopeConflictError,
   type QueryResult,
   type BatchSetInputItem,
   type MigrationResult,
   type MigrationSkipReasons,
   type MigrationRunOptions,
+  type MigrationRunProgress,
+  type MigrationNextPageResult,
+  type CreateStoreOptions,
+  type Migrator,
+  type MigrationHooks,
   type BoundModel,
   type Store,
 } from "./store";
+
+export { DefaultMigrator } from "./migrator";
 
 export { EngineDocumentAlreadyExistsError, EngineDocumentNotFoundError } from "./engines/types";
 

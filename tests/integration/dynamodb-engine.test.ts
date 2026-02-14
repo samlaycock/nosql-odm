@@ -14,6 +14,7 @@ import {
   type ComparableVersion,
 } from "../../src/engines/types";
 import { createCollectionNameFactory, createTestResourceName, expectReject } from "./helpers";
+import { runMigrationIntegrationSuite } from "./migration-suite";
 
 const endpoint = process.env.DYNAMODB_ENDPOINT ?? "http://127.0.0.1:8000";
 const region = process.env.AWS_REGION ?? "us-east-1";
@@ -86,6 +87,12 @@ describe("dynamoDbEngine integration", () => {
       client: documentClient,
       tableName,
     });
+  });
+
+  runMigrationIntegrationSuite({
+    engineName: "dynamoDbEngine integration",
+    getEngine: () => engine,
+    nextCollection,
   });
 
   afterAll(async () => {

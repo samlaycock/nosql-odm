@@ -15,6 +15,7 @@ import {
   type ComparableVersion,
 } from "../../src/engines/types";
 import { createCollectionNameFactory, createTestResourceName, expectReject } from "./helpers";
+import { runMigrationIntegrationSuite } from "./migration-suite";
 
 const redisUrl = process.env.REDIS_URL ?? "redis://127.0.0.1:6379";
 const connectAttemptsRaw = Number(process.env.REDIS_CONNECT_ATTEMPTS ?? "60");
@@ -114,6 +115,12 @@ describe("redisEngine integration", () => {
       client,
       keyPrefix,
     });
+  });
+
+  runMigrationIntegrationSuite({
+    engineName: "redisEngine integration",
+    getEngine: () => engine,
+    nextCollection,
   });
 
   afterAll(async () => {

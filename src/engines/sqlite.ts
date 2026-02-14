@@ -13,6 +13,7 @@ import {
   type QueryParams,
   type ResolvedIndexKeys,
 } from "./types";
+import { DefaultMigrator } from "../migrator";
 
 const LATEST_SCHEMA_VERSION = 1;
 const OUTDATED_PAGE_LIMIT = 100;
@@ -510,6 +511,8 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
       cursor: hasMore ? (pageRows[pageRows.length - 1]?.key ?? null) : null,
     };
   }
+
+  engine.migrator = new DefaultMigrator(engine);
 
   return engine;
 }

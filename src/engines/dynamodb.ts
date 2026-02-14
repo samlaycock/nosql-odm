@@ -23,6 +23,7 @@ import {
   type QueryParams,
   type ResolvedIndexKeys,
 } from "./types";
+import { DefaultMigrator } from "../migrator";
 
 const MAX_BATCH_WRITE = 25;
 const MAX_BATCH_GET = 100;
@@ -407,6 +408,8 @@ export function dynamoDbEngine(options: DynamoDbEngineOptions): DynamoDbQueryEng
       },
     },
   };
+
+  engine.migrator = new DefaultMigrator(engine);
 
   return engine;
 }
