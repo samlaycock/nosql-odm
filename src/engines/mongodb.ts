@@ -1,12 +1,15 @@
 import {
+  type BatchSetResult,
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
   type ComparableVersion,
   type EngineQueryResult,
   type FieldCondition,
   type KeyedDocument,
+  type MigrationDocumentMetadata,
   type MigrationCriteria,
   type MigrationLock,
+  type MigrationVersionState,
   type QueryEngine,
   type QueryParams,
   type ResolvedIndexKeys,
@@ -16,6 +19,7 @@ import { DefaultMigrator } from "../migrator";
 const DEFAULT_DOCUMENTS_COLLECTION = "nosql_odm_documents";
 const DEFAULT_METADATA_COLLECTION = "nosql_odm_metadata";
 const OUTDATED_PAGE_LIMIT = 100;
+const OUTDATED_SYNC_CHUNK_SIZE = 100;
 
 interface MongoFindOneAndUpdateOptionsLike {
   upsert?: boolean;
@@ -28,6 +32,7 @@ interface MongoUpdateResultLike {
 
 interface MongoCursorLike {
   sort(sort: Record<string, 1 | -1>): MongoCursorLike;
+  limit(value: number): MongoCursorLike;
   toArray(): Promise<unknown[]>;
 }
 
@@ -64,13 +69,43 @@ export interface MongoDbQueryEngine extends QueryEngine<never> {}
 interface StoredDocumentRecord {
   key: string;
   createdAt: number;
+  writeVersion: number;
   doc: Record<string, unknown>;
   indexes: ResolvedIndexKeys;
+  migrationTargetVersion: number;
+  migrationVersionState: MigrationVersionState;
+  migrationIndexSignature: string | null;
 }
 
 interface LockRecord {
   lockId: string;
   acquiredAt: number;
+}
+
+interface MigrationMetadata {
+  targetVersion: number;
+  versionState: MigrationVersionState;
+  indexSignature: string | null;
+}
+
+interface OutdatedCursorState {
+  phase: "stale" | "current-low" | "current-high";
+  stale?: {
+    createdAt: number;
+    key: string;
+  };
+  currentLow?: {
+    indexSignature: string | null;
+    createdAt: number;
+    key: string;
+  };
+  currentHigh?: {
+    indexSignature: string | null;
+    createdAt: number;
+    key: string;
+  };
+  criteriaVersion: number;
+  expectedSignature: string;
 }
 
 export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine {
@@ -102,11 +137,21 @@ export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine
       return structuredClone(record.doc);
     },
 
-    async create(collection, key, doc, indexes) {
+    async create(collection, key, doc, indexes, _options, migrationMetadata) {
       await ready;
 
       const createdAt = await nextCreatedAt(metadataCollection, collection);
-      const record = createStoredDocumentRecord(collection, key, createdAt, doc, indexes);
+      const metadata =
+        normalizeMigrationMetadata(migrationMetadata) ?? deriveLegacyMetadataFromDocument(doc);
+      const record = createStoredDocumentRecord(
+        collection,
+        key,
+        createdAt,
+        1,
+        doc,
+        indexes,
+        metadata,
+      );
 
       try {
         await documentsCollection.insertOne(record);
@@ -119,12 +164,14 @@ export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine
       }
     },
 
-    async put(collection, key, doc, indexes) {
+    async put(collection, key, doc, indexes, _options, migrationMetadata) {
       await ready;
 
       const createdAt = await nextCreatedAt(metadataCollection, collection);
       const normalizedDoc = normalizeDocument(doc);
       const normalizedIndexes = normalizeIndexes(indexes);
+      const metadata =
+        normalizeMigrationMetadata(migrationMetadata) ?? deriveLegacyMetadataFromDocument(doc);
 
       await documentsCollection.updateOne(
         {
@@ -135,11 +182,17 @@ export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine
           $set: {
             doc: normalizedDoc,
             indexes: normalizedIndexes,
+            migrationTargetVersion: metadata.targetVersion,
+            migrationVersionState: metadata.versionState,
+            migrationIndexSignature: metadata.indexSignature,
           },
           $setOnInsert: {
             collection,
             key,
             createdAt,
+          },
+          $inc: {
+            writeVersion: 1,
           },
         },
         {
@@ -148,11 +201,13 @@ export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine
       );
     },
 
-    async update(collection, key, doc, indexes) {
+    async update(collection, key, doc, indexes, _options, migrationMetadata) {
       await ready;
 
       const normalizedDoc = normalizeDocument(doc);
       const normalizedIndexes = normalizeIndexes(indexes);
+      const metadata =
+        normalizeMigrationMetadata(migrationMetadata) ?? deriveLegacyMetadataFromDocument(doc);
       const result = await documentsCollection.updateOne(
         {
           collection,
@@ -162,6 +217,12 @@ export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine
           $set: {
             doc: normalizedDoc,
             indexes: normalizedIndexes,
+            migrationTargetVersion: metadata.targetVersion,
+            migrationVersionState: metadata.versionState,
+            migrationIndexSignature: metadata.indexSignature,
+          },
+          $inc: {
+            writeVersion: 1,
           },
         },
       );
@@ -239,6 +300,9 @@ export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine
         const createdAt = await nextCreatedAt(metadataCollection, collection);
         const normalizedDoc = normalizeDocument(item.doc);
         const normalizedIndexes = normalizeIndexes(item.indexes);
+        const metadata =
+          normalizeMigrationMetadata(item.migrationMetadata) ??
+          deriveLegacyMetadataFromDocument(item.doc);
 
         await documentsCollection.updateOne(
           {
@@ -249,11 +313,17 @@ export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine
             $set: {
               doc: normalizedDoc,
               indexes: normalizedIndexes,
+              migrationTargetVersion: metadata.targetVersion,
+              migrationVersionState: metadata.versionState,
+              migrationIndexSignature: metadata.indexSignature,
             },
             $setOnInsert: {
               collection,
               key: item.key,
               createdAt,
+            },
+            $inc: {
+              writeVersion: 1,
             },
           },
           {
@@ -261,6 +331,92 @@ export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine
           },
         );
       }
+    },
+
+    async batchSetWithResult(collection, items) {
+      await ready;
+
+      const persistedKeys: string[] = [];
+      const conflictedKeys: string[] = [];
+
+      for (const item of items) {
+        const normalizedDoc = normalizeDocument(item.doc);
+        const normalizedIndexes = normalizeIndexes(item.indexes);
+        const metadata =
+          normalizeMigrationMetadata(item.migrationMetadata) ??
+          deriveLegacyMetadataFromDocument(item.doc);
+        const expectedWriteVersion = parseExpectedWriteVersion(item.expectedWriteToken);
+
+        if (expectedWriteVersion !== undefined) {
+          const result = await documentsCollection.updateOne(
+            {
+              collection,
+              key: item.key,
+              writeVersion: expectedWriteVersion,
+            },
+            {
+              $set: {
+                doc: normalizedDoc,
+                indexes: normalizedIndexes,
+                migrationTargetVersion: metadata.targetVersion,
+                migrationVersionState: metadata.versionState,
+                migrationIndexSignature: metadata.indexSignature,
+              },
+              $inc: {
+                writeVersion: 1,
+              },
+            },
+          );
+
+          if (
+            parseMatchedCount(
+              result,
+              "MongoDB returned an invalid conditional batch set result",
+            ) === 0
+          ) {
+            conflictedKeys.push(item.key);
+            continue;
+          }
+
+          persistedKeys.push(item.key);
+          continue;
+        }
+
+        const createdAt = await nextCreatedAt(metadataCollection, collection);
+        await documentsCollection.updateOne(
+          {
+            collection,
+            key: item.key,
+          },
+          {
+            $set: {
+              doc: normalizedDoc,
+              indexes: normalizedIndexes,
+              migrationTargetVersion: metadata.targetVersion,
+              migrationVersionState: metadata.versionState,
+              migrationIndexSignature: metadata.indexSignature,
+            },
+            $setOnInsert: {
+              collection,
+              key: item.key,
+              createdAt,
+            },
+            $inc: {
+              writeVersion: 1,
+            },
+          },
+          {
+            upsert: true,
+          },
+        );
+
+        persistedKeys.push(item.key);
+      }
+
+      return {
+        persistedKeys,
+        conflictedKeys,
+      } satisfies BatchSetResult;
     },
 
     async batchDelete(collection, keys) {
@@ -353,22 +509,8 @@ export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine
 
       async getOutdated(collection, criteria, cursor) {
         await ready;
-
-        const records = await listCollectionDocuments(documentsCollection, collection);
-        const parseVersion = criteria.parseVersion ?? defaultParseVersion;
-        const compareVersions = criteria.compareVersions ?? defaultCompareVersions;
-        const outdated: StoredDocumentRecord[] = [];
-
-        for (const record of records) {
-          if (isOutdated(record.doc, criteria, parseVersion, compareVersions)) {
-            outdated.push(record);
-          }
-        }
-
-        return paginate(outdated, {
-          cursor,
-          limit: OUTDATED_PAGE_LIMIT,
-        });
+        await syncMigrationMetadataForCriteria(documentsCollection, collection, criteria);
+        return getOutdatedDocuments(documentsCollection, collection, criteria, cursor);
       },
 
       async saveCheckpoint(lock, cursor) {
@@ -480,6 +622,36 @@ async function ensureSchema(
     },
   );
 
+  await documentsCollection.createIndex({
+    collection: 1,
+    createdAt: 1,
+    key: 1,
+  });
+
+  await documentsCollection.createIndex({
+    collection: 1,
+    migrationTargetVersion: 1,
+    migrationVersionState: 1,
+    createdAt: 1,
+    key: 1,
+  });
+
+  await documentsCollection.createIndex({
+    collection: 1,
+    migrationTargetVersion: 1,
+    migrationVersionState: 1,
+    migrationIndexSignature: 1,
+    createdAt: 1,
+    key: 1,
+  });
+
+  await documentsCollection.createIndex({
+    collection: 1,
+    migrationTargetVersion: 1,
+    createdAt: 1,
+    key: 1,
+  });
+
   await metadataCollection.createIndex(
     {
       collection: 1,
@@ -538,10 +710,344 @@ async function listCollectionDocuments(
   return raws.map(parseStoredDocumentRecord);
 }
 
+async function syncMigrationMetadataForCriteria(
+  documentsCollection: MongoCollectionLike,
+  collection: string,
+  criteria: MigrationCriteria,
+): Promise<void> {
+  await syncMetadataPhase(
+    documentsCollection,
+    collection,
+    {
+      migrationTargetVersion: {
+        $exists: false,
+      },
+    },
+    criteria,
+  );
+
+  await syncMetadataPhase(
+    documentsCollection,
+    collection,
+    {
+      migrationTargetVersion: {
+        $lt: criteria.version,
+      },
+    },
+    criteria,
+  );
+
+  await syncMetadataPhase(
+    documentsCollection,
+    collection,
+    {
+      migrationTargetVersion: {
+        $gt: criteria.version,
+      },
+    },
+    criteria,
+  );
+}
+
+async function syncMetadataPhase(
+  documentsCollection: MongoCollectionLike,
+  collection: string,
+  filter: Record<string, unknown>,
+  criteria: MigrationCriteria,
+): Promise<void> {
+  while (true) {
+    const raws = await documentsCollection
+      .find({
+        collection,
+        ...filter,
+      })
+      .sort({
+        createdAt: 1,
+        key: 1,
+      })
+      .limit(OUTDATED_SYNC_CHUNK_SIZE)
+      .toArray();
+
+    if (raws.length === 0) {
+      return;
+    }
+
+    for (const raw of raws) {
+      const record = parseStoredDocumentRecord(raw);
+      const metadata = deriveMetadataForCriteria(record.doc, criteria);
+
+      await documentsCollection.updateOne(
+        {
+          collection,
+          key: record.key,
+          migrationTargetVersion: {
+            $ne: criteria.version,
+          },
+        },
+        {
+          $set: {
+            migrationTargetVersion: metadata.targetVersion,
+            migrationVersionState: metadata.versionState,
+            migrationIndexSignature: metadata.indexSignature,
+          },
+        },
+      );
+    }
+
+    if (raws.length < OUTDATED_SYNC_CHUNK_SIZE) {
+      return;
+    }
+  }
+}
+
+async function getOutdatedDocuments(
+  documentsCollection: MongoCollectionLike,
+  collection: string,
+  criteria: MigrationCriteria,
+  cursor: string | undefined,
+): Promise<EngineQueryResult> {
+  const expectedSignature = computeIndexSignature(criteria.indexes);
+  const state = decodeOutdatedCursor(cursor, criteria.version, expectedSignature);
+  const documents: StoredDocumentRecord[] = [];
+  let remaining = OUTDATED_PAGE_LIMIT;
+  let nextCursor: string | null = null;
+
+  if (state.phase === "stale") {
+    const stale = await queryOutdatedStalePhase(
+      documentsCollection,
+      collection,
+      criteria.version,
+      state.stale,
+      remaining,
+    );
+    documents.push(...stale.records);
+    remaining -= stale.records.length;
+
+    if (remaining === 0) {
+      if (stale.last) {
+        nextCursor = encodeOutdatedCursor({
+          phase: stale.hasMore ? "stale" : "current-low",
+          stale: stale.hasMore ? stale.last : undefined,
+          criteriaVersion: criteria.version,
+          expectedSignature,
+        });
+      }
+    } else {
+      state.phase = "current-low";
+      state.currentLow = undefined;
+    }
+  }
+
+  if (nextCursor === null && remaining > 0 && state.phase === "current-low") {
+    const low = await queryOutdatedCurrentPhase(
+      documentsCollection,
+      collection,
+      criteria.version,
+      expectedSignature,
+      "$lt",
+      state.currentLow,
+      remaining,
+    );
+    documents.push(...low.records);
+    remaining -= low.records.length;
+
+    if (remaining === 0) {
+      if (low.last) {
+        nextCursor = encodeOutdatedCursor({
+          phase: low.hasMore ? "current-low" : "current-high",
+          currentLow: low.hasMore ? low.last : undefined,
+          criteriaVersion: criteria.version,
+          expectedSignature,
+        });
+      }
+    } else {
+      state.phase = "current-high";
+      state.currentHigh = undefined;
+    }
+  }
+
+  if (nextCursor === null && remaining > 0 && state.phase === "current-high") {
+    const high = await queryOutdatedCurrentPhase(
+      documentsCollection,
+      collection,
+      criteria.version,
+      expectedSignature,
+      "$gt",
+      state.currentHigh,
+      remaining,
+    );
+    documents.push(...high.records);
+    remaining -= high.records.length;
+
+    if (remaining === 0 && high.hasMore && high.last) {
+      nextCursor = encodeOutdatedCursor({
+        phase: "current-high",
+        currentHigh: high.last,
+        criteriaVersion: criteria.version,
+        expectedSignature,
+      });
+    }
+  }
+
+  return {
+    documents: documents.map((record) => ({
+      key: record.key,
+      doc: structuredClone(record.doc),
+      writeToken: String(record.writeVersion),
+    })),
+    cursor: nextCursor,
+  };
+}
+
+async function queryOutdatedStalePhase(
+  documentsCollection: MongoCollectionLike,
+  collection: string,
+  targetVersion: number,
+  cursor: OutdatedCursorState["stale"],
+  limit: number,
+): Promise<{
+  records: StoredDocumentRecord[];
+  hasMore: boolean;
+  last?: OutdatedCursorState["stale"];
+}> {
+  if (limit <= 0) {
+    return {
+      records: [],
+      hasMore: false,
+    };
+  }
+
+  const filter: Record<string, unknown> = {
+    collection,
+    migrationTargetVersion: targetVersion,
+    migrationVersionState: "stale",
+  };
+
+  if (cursor) {
+    filter.$or = [
+      {
+        createdAt: {
+          $gt: cursor.createdAt,
+        },
+      },
+      {
+        createdAt: cursor.createdAt,
+        key: {
+          $gt: cursor.key,
+        },
+      },
+    ];
+  }
+
+  const raws = await documentsCollection
+    .find(filter)
+    .sort({
+      createdAt: 1,
+      key: 1,
+    })
+    .limit(limit + 1)
+    .toArray();
+  const hasMore = raws.length > limit;
+  const pageRaws = hasMore ? raws.slice(0, limit) : raws;
+  const records = pageRaws.map(parseStoredDocumentRecord);
+  const last = records[records.length - 1];
+
+  return {
+    records,
+    hasMore,
+    last: last
+      ? {
+          createdAt: last.createdAt,
+          key: last.key,
+        }
+      : undefined,
+  };
+}
+
+async function queryOutdatedCurrentPhase(
+  documentsCollection: MongoCollectionLike,
+  collection: string,
+  targetVersion: number,
+  expectedSignature: string,
+  operator: "$lt" | "$gt",
+  cursor: OutdatedCursorState["currentLow"] | OutdatedCursorState["currentHigh"],
+  limit: number,
+): Promise<{
+  records: StoredDocumentRecord[];
+  hasMore: boolean;
+  last?: OutdatedCursorState["currentLow"];
+}> {
+  if (limit <= 0) {
+    return {
+      records: [],
+      hasMore: false,
+    };
+  }
+
+  const filter: Record<string, unknown> = {
+    collection,
+    migrationTargetVersion: targetVersion,
+    migrationVersionState: "current",
+    migrationIndexSignature: {
+      [operator]: expectedSignature,
+    },
+  };
+
+  if (cursor) {
+    filter.$or = [
+      {
+        migrationIndexSignature: {
+          $gt: cursor.indexSignature,
+        },
+      },
+      {
+        migrationIndexSignature: cursor.indexSignature,
+        createdAt: {
+          $gt: cursor.createdAt,
+        },
+      },
+      {
+        migrationIndexSignature: cursor.indexSignature,
+        createdAt: cursor.createdAt,
+        key: {
+          $gt: cursor.key,
+        },
+      },
+    ];
+  }
+
+  const raws = await documentsCollection
+    .find(filter)
+    .sort({
+      migrationIndexSignature: 1,
+      createdAt: 1,
+      key: 1,
+    })
+    .limit(limit + 1)
+    .toArray();
+  const hasMore = raws.length > limit;
+  const pageRaws = hasMore ? raws.slice(0, limit) : raws;
+  const records = pageRaws.map(parseStoredDocumentRecord);
+  const last = records[records.length - 1];
+
+  return {
+    records,
+    hasMore,
+    last: last
+      ? {
+          indexSignature: last.migrationIndexSignature,
+          createdAt: last.createdAt,
+          key: last.key,
+        }
+      : undefined,
+  };
+}
+
 function parseStoredDocumentRecord(raw: unknown): StoredDocumentRecord {
   const record = parseRecord(raw, "document record");
   const key = readString(record, "key", "document record");
   const createdAt = readFiniteNumber(record, "createdAt", "document record");
+  const writeVersion = readWriteVersion(record);
   const docRaw = record.doc;
 
   if (!isRecord(docRaw)) {
@@ -549,12 +1055,17 @@ function parseStoredDocumentRecord(raw: unknown): StoredDocumentRecord {
   }
 
   const indexes = parseIndexes(record.indexes);
+  const migrationMetadata = parseMigrationMetadataFields(record);
 
   return {
     key,
     createdAt,
+    writeVersion,
     doc: docRaw,
     indexes,
+    migrationTargetVersion: migrationMetadata.targetVersion,
+    migrationVersionState: migrationMetadata.versionState,
+    migrationIndexSignature: migrationMetadata.indexSignature,
   };
 }
 
@@ -625,6 +1136,53 @@ function parseIndexes(raw: unknown): ResolvedIndexKeys {
   return indexes;
 }
 
+function readWriteVersion(record: Record<string, unknown>): number {
+  const raw = record.writeVersion;
+
+  if (raw === undefined || raw === null) {
+    return 1;
+  }
+
+  const value = readFiniteNumber(record, "writeVersion", "document record");
+
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error("MongoDB returned an invalid document record");
+  }
+
+  return value;
+}
+
+function parseMigrationMetadataFields(record: Record<string, unknown>): MigrationMetadata {
+  const targetVersionRaw = record.migrationTargetVersion;
+  const versionStateRaw = record.migrationVersionState;
+  const indexSignatureRaw = record.migrationIndexSignature;
+
+  if (
+    targetVersionRaw === undefined ||
+    versionStateRaw === undefined ||
+    indexSignatureRaw === undefined
+  ) {
+    return deriveLegacyMetadataFromDocument(record.doc);
+  }
+
+  if (
+    typeof targetVersionRaw !== "number" ||
+    !Number.isFinite(targetVersionRaw) ||
+    !Number.isInteger(targetVersionRaw) ||
+    targetVersionRaw < 0 ||
+    !isMigrationVersionState(versionStateRaw) ||
+    (indexSignatureRaw !== null && typeof indexSignatureRaw !== "string")
+  ) {
+    throw new Error("MongoDB returned an invalid document record");
+  }
+
+  return {
+    targetVersion: targetVersionRaw,
+    versionState: versionStateRaw,
+    indexSignature: indexSignatureRaw,
+  };
+}
+
 function normalizeDocument(doc: unknown): Record<string, unknown> {
   const cloned = structuredClone(doc);
 
@@ -653,15 +1211,21 @@ function createStoredDocumentRecord(
   collection: string,
   key: string,
   createdAt: number,
+  writeVersion: number,
   doc: unknown,
   indexes: ResolvedIndexKeys,
+  metadata: MigrationMetadata,
 ): Record<string, unknown> {
   return {
     collection,
     key,
     createdAt,
+    writeVersion,
     doc: normalizeDocument(doc),
     indexes: normalizeIndexes(indexes),
+    migrationTargetVersion: metadata.targetVersion,
+    migrationVersionState: metadata.versionState,
+    migrationIndexSignature: metadata.indexSignature,
   };
 }
 
@@ -858,42 +1422,11 @@ function matchesCondition(value: string, condition: FieldCondition): boolean {
   return true;
 }
 
-function isOutdated(
-  doc: Record<string, unknown>,
-  criteria: MigrationCriteria,
-  parseVersion: (raw: unknown) => ComparableVersion | null,
-  compareVersions: (a: ComparableVersion, b: ComparableVersion) => number,
-): boolean {
-  const parsedVersion = parseVersion(doc[criteria.versionField]);
-  const storedIndexes = doc[criteria.indexesField];
-  const versionState = classifyVersionState(parsedVersion, criteria.version, compareVersions);
-
-  if (versionState === "stale") {
-    return true;
-  }
-
-  if (versionState !== "current") {
-    return false;
-  }
-
-  if (!Array.isArray(storedIndexes)) {
-    return true;
-  }
-
-  if (storedIndexes.length !== criteria.indexes.length) {
-    return true;
-  }
-
-  return !storedIndexes.every((name, i) => name === criteria.indexes[i]);
-}
-
-type VersionState = "current" | "stale" | "ahead" | "unknown";
-
 function classifyVersionState(
   parsedVersion: ComparableVersion | null,
   latest: number,
   compareVersions: (a: ComparableVersion, b: ComparableVersion) => number,
-): VersionState {
+): MigrationVersionState {
   if (parsedVersion === null) {
     return "unknown";
   }
@@ -998,6 +1531,223 @@ function normalizeNumericVersion(value: string): number | null {
   const parsed = Number(match[1]);
 
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+function deriveMetadataForCriteria(doc: unknown, criteria: MigrationCriteria): MigrationMetadata {
+  if (!isRecord(doc)) {
+    return {
+      targetVersion: criteria.version,
+      versionState: "unknown",
+      indexSignature: null,
+    };
+  }
+
+  const parseVersion = criteria.parseVersion ?? defaultParseVersion;
+  const compareVersions = criteria.compareVersions ?? defaultCompareVersions;
+  const parsedVersion = parseVersion(doc[criteria.versionField]);
+  const versionState = classifyVersionState(parsedVersion, criteria.version, compareVersions);
+
+  return {
+    targetVersion: criteria.version,
+    versionState,
+    indexSignature: computeIndexSignatureFromUnknown(doc[criteria.indexesField]),
+  };
+}
+
+function normalizeMigrationMetadata(
+  raw: MigrationDocumentMetadata | undefined,
+): MigrationMetadata | null {
+  if (!raw) {
+    return null;
+  }
+
+  if (
+    !Number.isFinite(raw.targetVersion) ||
+    Math.floor(raw.targetVersion) !== raw.targetVersion ||
+    raw.targetVersion < 0
+  ) {
+    throw new Error("MongoDB received invalid migration metadata target version");
+  }
+
+  if (!isMigrationVersionState(raw.versionState)) {
+    throw new Error("MongoDB received invalid migration metadata state");
+  }
+
+  if (raw.indexSignature !== null && typeof raw.indexSignature !== "string") {
+    throw new Error("MongoDB received invalid migration metadata index signature");
+  }
+
+  return {
+    targetVersion: raw.targetVersion,
+    versionState: raw.versionState,
+    indexSignature: raw.indexSignature,
+  };
+}
+
+function deriveLegacyMetadataFromDocument(doc: unknown): MigrationMetadata {
+  if (!isRecord(doc)) {
+    return {
+      targetVersion: 0,
+      versionState: "unknown",
+      indexSignature: null,
+    };
+  }
+
+  const rawVersion = normalizeNumericVersionFromUnknown(doc.__v);
+
+  return {
+    targetVersion: rawVersion ?? 0,
+    versionState: rawVersion === null ? "unknown" : "current",
+    indexSignature: computeIndexSignatureFromUnknown(doc.__indexes),
+  };
+}
+
+function isMigrationVersionState(value: unknown): value is MigrationVersionState {
+  return value === "current" || value === "stale" || value === "ahead" || value === "unknown";
+}
+
+function parseExpectedWriteVersion(raw: string | undefined): number | undefined {
+  if (raw === undefined) {
+    return undefined;
+  }
+
+  if (typeof raw !== "string" || raw.trim().length === 0 || !/^\d+$/.test(raw)) {
+    throw new Error("MongoDB received an invalid expected write token");
+  }
+
+  const parsed = Number(raw);
+
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error("MongoDB received an invalid expected write token");
+  }
+
+  return parsed;
+}
+
+function computeIndexSignature(indexes: readonly string[]): string {
+  return JSON.stringify(indexes);
+}
+
+function computeIndexSignatureFromUnknown(raw: unknown): string | null {
+  if (!Array.isArray(raw) || raw.some((value) => typeof value !== "string")) {
+    return null;
+  }
+
+  return computeIndexSignature(raw as string[]);
+}
+
+function normalizeNumericVersionFromUnknown(raw: unknown): number | null {
+  if (raw === undefined || raw === null) {
+    return null;
+  }
+
+  if (typeof raw === "number") {
+    return Number.isFinite(raw) ? raw : null;
+  }
+
+  if (typeof raw !== "string") {
+    return null;
+  }
+
+  return normalizeNumericVersion(raw);
+}
+
+function encodeOutdatedCursor(state: OutdatedCursorState): string {
+  return Buffer.from(JSON.stringify(state), "utf8").toString("base64url");
+}
+
+function decodeOutdatedCursor(
+  cursor: string | undefined,
+  criteriaVersion: number,
+  expectedSignature: string,
+): OutdatedCursorState {
+  const fallback: OutdatedCursorState = {
+    phase: "stale",
+    criteriaVersion,
+    expectedSignature,
+  };
+
+  if (!cursor) {
+    return fallback;
+  }
+
+  try {
+    const parsed = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+
+    if (!isRecord(parsed)) {
+      return fallback;
+    }
+
+    if (
+      (parsed.phase !== "stale" &&
+        parsed.phase !== "current-low" &&
+        parsed.phase !== "current-high") ||
+      parsed.criteriaVersion !== criteriaVersion ||
+      parsed.expectedSignature !== expectedSignature
+    ) {
+      return fallback;
+    }
+
+    return {
+      phase: parsed.phase,
+      stale: parseStaleCursorTuple(parsed.stale),
+      currentLow: parseCurrentCursorTuple(parsed.currentLow),
+      currentHigh: parseCurrentCursorTuple(parsed.currentHigh),
+      criteriaVersion,
+      expectedSignature,
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+function parseStaleCursorTuple(raw: unknown): OutdatedCursorState["stale"] {
+  if (!isRecord(raw)) {
+    return undefined;
+  }
+
+  const createdAt = raw.createdAt;
+  const key = raw.key;
+
+  if (
+    typeof createdAt !== "number" ||
+    !Number.isFinite(createdAt) ||
+    typeof key !== "string" ||
+    key.length === 0
+  ) {
+    return undefined;
+  }
+
+  return {
+    createdAt,
+    key,
+  };
+}
+
+function parseCurrentCursorTuple(raw: unknown): OutdatedCursorState["currentLow"] {
+  if (!isRecord(raw)) {
+    return undefined;
+  }
+
+  const indexSignature = raw.indexSignature;
+  const createdAt = raw.createdAt;
+  const key = raw.key;
+
+  if (
+    (indexSignature !== null && typeof indexSignature !== "string") ||
+    typeof createdAt !== "number" ||
+    !Number.isFinite(createdAt) ||
+    typeof key !== "string" ||
+    key.length === 0
+  ) {
+    return undefined;
+  }
+
+  return {
+    indexSignature: indexSignature ?? null,
+    createdAt,
+    key,
+  };
 }
 
 function normalizeLimit(limit: number | undefined): number | null {
