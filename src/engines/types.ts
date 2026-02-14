@@ -13,6 +13,17 @@ export interface BatchSetItem {
   key: string;
   doc: unknown;
   indexes: ResolvedIndexKeys;
+  /**
+   * Optional optimistic-write token captured when the document was read.
+   * Engines that support conditional writes can use this to avoid clobbering
+   * concurrent updates.
+   */
+  expectedWriteToken?: string;
+}
+
+export interface BatchSetResult {
+  persistedKeys: string[];
+  conflictedKeys: string[];
 }
 
 /**
@@ -95,6 +106,10 @@ export type WhereFilter = Record<string, string | number | FieldCondition>;
 export interface KeyedDocument {
   key: string;
   doc: unknown;
+  /**
+   * Optional engine-specific optimistic-write token for conditional updates.
+   */
+  writeToken?: string;
 }
 
 /**
@@ -192,6 +207,11 @@ export interface QueryEngine<TOptions = Record<string, unknown>> {
 
   batchGet(collection: string, keys: string[], options?: TOptions): Promise<KeyedDocument[]>;
   batchSet(collection: string, items: BatchSetItem[], options?: TOptions): Promise<void>;
+  batchSetWithResult?(
+    collection: string,
+    items: BatchSetItem[],
+    options?: TOptions,
+  ): Promise<BatchSetResult>;
   batchDelete(collection: string, keys: string[], options?: TOptions): Promise<void>;
 
   migration: {

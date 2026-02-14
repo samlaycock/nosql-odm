@@ -254,3 +254,50 @@ describe("persisted migration run validation", () => {
     await expectReject(store.user.getMigrationProgress(), /invalid skip reasons/i);
   });
 });
+
+describe("concurrent write conflicts", () => {
+  test("migrateNextPage skips documents when conditional migration writes conflict", async () => {
+    await engine.put(
+      "user",
+      "u1",
+      {
+        __v: 1,
+        __indexes: ["primary"],
+        id: "u1",
+        name: "Sam User",
+        email: "sam@example.com",
+      },
+      { primary: "u1" },
+    );
+
+    const originalGetOutdated = engine.migration.getOutdated.bind(engine.migration);
+    engine.migration.getOutdated = async (collection, criteria, cursor) => {
+      const page = await originalGetOutdated(collection, criteria, cursor);
+
+      return {
+        ...page,
+        documents: page.documents.map((entry) => ({
+          ...entry,
+          writeToken: "1",
+        })),
+      };
+    };
+
+    engine.batchSetWithResult = async (_collection, items) => ({
+      persistedKeys: [],
+      conflictedKeys: items.map((item) => item.key),
+    });
+
+    const store = createStore(engine, [buildUserV2()]);
+    const page = await store.user.migrateNextPage();
+
+    expect(page.completed).toBe(true);
+    expect(page.migrated).toBe(0);
+    expect(page.skipped).toBe(1);
+    expect(page.skipReasons).toEqual({ concurrent_write: 1 });
+
+    const stored = (await engine.get("user", "u1")) as Record<string, unknown>;
+    expect(stored.__v).toBe(1);
+    expect(stored.name).toBe("Sam User");
+  });
+});

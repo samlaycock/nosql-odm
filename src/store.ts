@@ -54,7 +54,8 @@ export interface MigrationResult {
   skipReasons?: MigrationSkipReasons;
 }
 
-export type MigrationSkipReasons = Partial<Record<ProjectionSkipReason, number>>;
+export type MigrationSkipReason = ProjectionSkipReason | "concurrent_write";
+export type MigrationSkipReasons = Partial<Record<MigrationSkipReason, number>>;
 
 type AnyString = string & {};
 
@@ -495,8 +496,8 @@ class BoundModelImpl<
 
       if (page.skipReasons) {
         for (const [reason, count] of Object.entries(page.skipReasons)) {
-          skipReasons[reason as ProjectionSkipReason] =
-            (skipReasons[reason as ProjectionSkipReason] ?? 0) + count;
+          skipReasons[reason as MigrationSkipReason] =
+            (skipReasons[reason as MigrationSkipReason] ?? 0) + count;
         }
       }
 
@@ -588,7 +589,10 @@ class BoundModelImpl<
         doc: this.stamp(value as object, key),
         indexes: this.model.resolveIndexKeys(value as T),
       }),
-      persist: (items) => this.engine.batchSet(this.model.name, items),
+      persist: (items) =>
+        this.engine.batchSetWithResult
+          ? this.engine.batchSetWithResult(this.model.name, items)
+          : this.engine.batchSet(this.model.name, items),
     };
   }
 
@@ -831,8 +835,8 @@ export function createStore<
 
             if (page.skipReasons) {
               for (const [reason, count] of Object.entries(page.skipReasons)) {
-                aggregate.skipReasons[reason as ProjectionSkipReason] =
-                  (aggregate.skipReasons[reason as ProjectionSkipReason] ?? 0) + count;
+                aggregate.skipReasons[reason as MigrationSkipReason] =
+                  (aggregate.skipReasons[reason as MigrationSkipReason] ?? 0) + count;
               }
             }
           }
