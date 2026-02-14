@@ -1,5 +1,6 @@
 import {
   type BatchSetItem,
+  type BatchSetResult,
   type EngineQueryResult,
   type MigrationCriteria,
   type MigrationLock,
@@ -24,7 +25,7 @@ export interface MigrationModelContext {
   readonly criteria: MigrationCriteria;
   project(doc: Record<string, unknown>): Promise<MigrationProjectionResult>;
   toBatchSetItem(key: string, value: unknown): BatchSetItem;
-  persist(items: BatchSetItem[]): Promise<void>;
+  persist(items: BatchSetItem[]): Promise<BatchSetResult | void>;
 }
 
 export type MigrationScope =
@@ -461,9 +462,10 @@ export class DefaultMigrator<TOptions = Record<string, unknown>> implements Migr
     let migrated = 0;
     let skipped = 0;
     const skipReasons: Record<string, number> = {};
-    const writes: BatchSetItem[] = [];
+    const writes: { key: string; migrated: boolean; item: BatchSetItem }[] = [];
 
-    for (const { key, doc: rawDoc } of page.documents) {
+    for (const entry of page.documents) {
+      const { key, doc: rawDoc } = entry;
       const projected = await context.project(rawDoc as Record<string, unknown>);
 
       if (!projected.ok) {
@@ -480,21 +482,58 @@ export class DefaultMigrator<TOptions = Record<string, unknown>> implements Migr
         continue;
       }
 
-      writes.push(context.toBatchSetItem(key, projected.value));
+      const item = context.toBatchSetItem(key, projected.value);
 
-      if (projected.migrated) {
+      if (typeof entry.writeToken === "string" && entry.writeToken.length > 0) {
+        item.expectedWriteToken = entry.writeToken;
+      }
+
+      writes.push({
+        key,
+        migrated: projected.migrated === true,
+        item,
+      });
+    }
+
+    let persistedKeys: Set<string> | null = null;
+    let conflictedKeys: Set<string> = new Set();
+
+    if (writes.length > 0) {
+      const persisted = await context.persist(writes.map((entry) => entry.item));
+      const normalized = normalizeBatchSetResult(persisted);
+
+      if (normalized) {
+        persistedKeys = new Set(normalized.persistedKeys);
+        conflictedKeys = new Set(normalized.conflictedKeys);
+      }
+    }
+
+    for (const write of writes) {
+      if (conflictedKeys.has(write.key)) {
+        skipped += 1;
+        skipReasons.concurrent_write = (skipReasons.concurrent_write ?? 0) + 1;
+        await this.runHook("onDocumentSkipped", {
+          runId: run.id,
+          model: modelName,
+          key: write.key,
+          reason: "concurrent_write",
+        });
+        continue;
+      }
+
+      if (persistedKeys && !persistedKeys.has(write.key)) {
+        continue;
+      }
+
+      if (write.migrated) {
         migrated += 1;
       }
 
       await this.runHook("onDocumentMigrated", {
         runId: run.id,
         model: modelName,
-        key,
+        key: write.key,
       });
-    }
-
-    if (writes.length > 0) {
-      await context.persist(writes);
     }
 
     const current = ensureModelProgress(run, modelName);
@@ -854,6 +893,17 @@ function uniqueStrings(values: readonly string[]): string[] {
 
   unique.sort((a, b) => a.localeCompare(b));
   return unique;
+}
+
+function normalizeBatchSetResult(result: BatchSetResult | void): BatchSetResult | null {
+  if (!result) {
+    return null;
+  }
+
+  return {
+    persistedKeys: uniqueStrings(result.persistedKeys),
+    conflictedKeys: uniqueStrings(result.conflictedKeys),
+  };
 }
 
 function hasKeys(record: Record<string, number>): boolean {

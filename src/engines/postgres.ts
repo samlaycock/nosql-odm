@@ -1,4 +1,5 @@
 import {
+  type BatchSetResult,
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
   type ComparableVersion,
@@ -157,7 +158,9 @@ export function postgresEngine(options: PostgresEngineOptions): PostgresQueryEng
             INSERT INTO ${refs.documentsTable} (collection, doc_key, doc_json)
             VALUES ($1, $2, $3::jsonb)
             ON CONFLICT (collection, doc_key)
-            DO UPDATE SET doc_json = EXCLUDED.doc_json
+            DO UPDATE SET
+              doc_json = EXCLUDED.doc_json,
+              write_version = ${refs.documentsTable}.write_version + 1
           `,
           [collection, key, docJson],
         );
@@ -176,7 +179,9 @@ export function postgresEngine(options: PostgresEngineOptions): PostgresQueryEng
         const updateResult = await tx.query(
           `
             UPDATE ${refs.documentsTable}
-            SET doc_json = $1::jsonb
+            SET
+              doc_json = $1::jsonb,
+              write_version = write_version + 1
             WHERE collection = $2 AND doc_key = $3
           `,
           [docJson, collection, key],
@@ -258,23 +263,14 @@ export function postgresEngine(options: PostgresEngineOptions): PostgresQueryEng
       await ready;
 
       await withTransaction(client, async (tx) => {
-        for (const item of items) {
-          const docJson = serializeDocument(item.doc);
-          const normalizedIndexes = normalizeIndexes(item.indexes);
-
-          await tx.query(
-            `
-              INSERT INTO ${refs.documentsTable} (collection, doc_key, doc_json)
-              VALUES ($1, $2, $3::jsonb)
-              ON CONFLICT (collection, doc_key)
-              DO UPDATE SET doc_json = EXCLUDED.doc_json
-            `,
-            [collection, item.key, docJson],
-          );
-
-          await replaceIndexes(tx, refs, collection, item.key, normalizedIndexes, true);
-        }
+        await applyBatchSet(tx, refs, collection, items);
       });
+    },
+
+    async batchSetWithResult(collection, items) {
+      await ready;
+
+      return withTransaction(client, async (tx) => applyBatchSet(tx, refs, collection, items));
     },
 
     async batchDelete(collection, keys) {
@@ -687,6 +683,69 @@ async function replaceIndexes(
   }
 }
 
+async function applyBatchSet(
+  tx: PostgresSessionLike,
+  refs: TableRefs,
+  collection: string,
+  items: BatchSetItem[],
+): Promise<BatchSetResult> {
+  const persistedKeys: string[] = [];
+  const conflictedKeys: string[] = [];
+
+  for (const item of items) {
+    const docJson = serializeDocument(item.doc);
+    const normalizedIndexes = normalizeIndexes(item.indexes);
+
+    if (item.expectedWriteToken !== undefined) {
+      const expectedWriteVersion = parseWriteToken(item.expectedWriteToken);
+      const updateResult = await tx.query(
+        `
+          UPDATE ${refs.documentsTable}
+          SET
+            doc_json = $1::jsonb,
+            write_version = write_version + 1
+          WHERE collection = $2
+            AND doc_key = $3
+            AND write_version = $4
+        `,
+        [docJson, collection, item.key, expectedWriteVersion],
+      );
+
+      if (
+        readRowCount(updateResult, "Postgres returned an invalid conditional batch-set result") ===
+        0
+      ) {
+        conflictedKeys.push(item.key);
+        continue;
+      }
+
+      await replaceIndexes(tx, refs, collection, item.key, normalizedIndexes, true);
+      persistedKeys.push(item.key);
+      continue;
+    }
+
+    await tx.query(
+      `
+        INSERT INTO ${refs.documentsTable} (collection, doc_key, doc_json)
+        VALUES ($1, $2, $3::jsonb)
+        ON CONFLICT (collection, doc_key)
+        DO UPDATE SET
+          doc_json = EXCLUDED.doc_json,
+          write_version = ${refs.documentsTable}.write_version + 1
+      `,
+      [collection, item.key, docJson],
+    );
+
+    await replaceIndexes(tx, refs, collection, item.key, normalizedIndexes, true);
+    persistedKeys.push(item.key);
+  }
+
+  return {
+    persistedKeys,
+    conflictedKeys,
+  };
+}
+
 async function ensureSchema(client: PostgresQueryableLike, refs: TableRefs): Promise<void> {
   const session = await acquireSession(client);
   const lockKey = toAdvisoryLockKey(
@@ -710,9 +769,14 @@ async function ensureSchema(client: PostgresQueryableLike, refs: TableRefs): Pro
       collection TEXT NOT NULL,
       doc_key TEXT NOT NULL,
       doc_json JSONB NOT NULL,
+      write_version BIGINT NOT NULL DEFAULT 1,
       PRIMARY KEY (collection, doc_key)
     )
   `);
+
+    await session.query(
+      `ALTER TABLE ${refs.documentsTable} ADD COLUMN IF NOT EXISTS write_version BIGINT NOT NULL DEFAULT 1`,
+    );
 
     await session.query(
       `CREATE INDEX IF NOT EXISTS ${documentsCollectionIdIndex} ON ${refs.documentsTable} (collection, id)`,
@@ -759,6 +823,16 @@ async function ensureSchema(client: PostgresQueryableLike, refs: TableRefs): Pro
       session.release?.();
     }
   }
+}
+
+function parseWriteToken(raw: string): number {
+  const value = Number(raw);
+
+  if (!Number.isFinite(value) || Math.floor(value) !== value || value <= 0) {
+    throw new Error("Postgres received an invalid write token");
+  }
+
+  return value;
 }
 
 async function withTransaction<T>(
@@ -1047,7 +1121,7 @@ async function getOutdatedDocuments(
   while (outdated.length < OUTDATED_PAGE_LIMIT) {
     const rows = await fetchRows(client, {
       sql: `
-        SELECT id, doc_key AS key, doc_json
+        SELECT id, doc_key AS key, doc_json, write_version
         FROM ${refs.documentsTable}
         WHERE collection = $1 AND id > $2
         ORDER BY id ASC
@@ -1064,12 +1138,21 @@ async function getOutdatedDocuments(
     for (const row of rows) {
       const id = readFiniteInteger(row, "id", "Postgres returned an invalid outdated query result");
       const key = readStringField(row, "key", "Postgres returned an invalid outdated query result");
+      const writeVersion = readFiniteInteger(
+        row,
+        "write_version",
+        "Postgres returned an invalid outdated query result",
+      );
       const doc = parseStoredDocument(row.doc_json, collection, key);
 
       scanCursorId = id;
 
       if (isOutdated(doc, criteria, parseVersion, compareVersions)) {
-        outdated.push({ key, doc: structuredClone(doc) });
+        outdated.push({
+          key,
+          doc: structuredClone(doc),
+          writeToken: String(writeVersion),
+        });
       }
 
       if (outdated.length >= OUTDATED_PAGE_LIMIT) {
