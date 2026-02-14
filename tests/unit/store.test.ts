@@ -245,6 +245,19 @@ describe("createStore()", () => {
 
     expect(store.user).toBeDefined();
   });
+
+  test("throws when both migrator and migrationHooks are provided", () => {
+    expect(() => {
+      createStore(engine, [buildUserV1()], {
+        migrator: new DefaultMigrator(engine),
+        migrationHooks: {
+          onMigrationCreated() {
+            return;
+          },
+        },
+      });
+    }).toThrow(/migrator.*migrationHooks.*cannot be provided together/i);
+  });
 });
 
 // ---------------------------------------------------------------------------

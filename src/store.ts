@@ -730,6 +730,13 @@ export function createStore<
   models: TModels,
   options?: CreateStoreOptions<TOptions>,
 ): Store<TModels, TOptions> {
+  if (options?.migrator && options?.migrationHooks) {
+    throw new Error(
+      'createStore options "migrator" and "migrationHooks" cannot be provided together. ' +
+        "When using a custom migrator, wire hooks inside that migrator.",
+    );
+  }
+
   const engineMigrator = options?.migrationHooks
     ? new DefaultMigrator(engine, {
         hooks: options.migrationHooks,

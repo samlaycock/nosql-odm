@@ -290,9 +290,23 @@ export class DefaultMigrator<TOptions = Record<string, unknown>> implements Migr
     }
 
     let run: PersistedMigrationRun | null = null;
+    let shouldNotifyFailure = true;
 
     try {
       const existing = await this.loadRun(runKey);
+
+      if (!existing) {
+        try {
+          await this.assertScopeIsNotCovered(normalizedScope, options?.lockTtlMs);
+        } catch (error) {
+          if (error instanceof MigrationScopeConflictError) {
+            shouldNotifyFailure = false;
+          }
+
+          throw error;
+        }
+      }
+
       run = existing ?? createRun(normalizedScope);
 
       if (!existing) {
@@ -401,12 +415,14 @@ export class DefaultMigrator<TOptions = Record<string, unknown>> implements Migr
         progress: null,
       };
     } catch (error) {
-      await this.runHook("onMigrationFailed", {
-        runId: run?.id ?? randomId(),
-        scope: normalizedScope.scope,
-        error,
-        progress: run ? toProgress(run, true) : null,
-      });
+      if (shouldNotifyFailure) {
+        await this.runHook("onMigrationFailed", {
+          runId: run?.id ?? randomId(),
+          scope: normalizedScope.scope,
+          error,
+          progress: run ? toProgress(run, true) : null,
+        });
+      }
       throw error;
     } finally {
       await this.engine.migration.releaseLock(lock);
@@ -855,7 +871,7 @@ function randomId(): string {
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function readString(record: Record<string, unknown>, key: string, context: string): string {
