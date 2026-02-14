@@ -11,6 +11,7 @@ import {
   CreateTableCommand,
   DeleteTableCommand,
   DynamoDBClient,
+  ListTablesCommand,
   waitUntilTableExists,
   waitUntilTableNotExists,
 } from "@aws-sdk/client-dynamodb";
@@ -29,6 +30,8 @@ const region = process.env.AWS_REGION ?? "us-east-1";
 const tableName = process.env.DYNAMODB_TEST_TABLE ?? createTestResourceName("nosql_odm_test");
 const isCi = process.env.CI === "true";
 const migrationTableWaitMaxSeconds = isCi ? 90 : 20;
+const connectAttemptsRaw = Number(process.env.DYNAMODB_CONNECT_ATTEMPTS ?? (isCi ? "180" : "60"));
+const connectDelayMsRaw = Number(process.env.DYNAMODB_CONNECT_DELAY_MS ?? (isCi ? "1500" : "1000"));
 
 let baseClient: DynamoDBClient;
 let documentClient: DynamoDBDocumentClient;
@@ -38,6 +41,46 @@ let createdTable = false;
 const nextCollection = createCollectionNameFactory();
 
 setDefaultTimeout(isCi ? 300_000 : 120_000);
+
+function normalizePositiveInteger(value: number, fallback: number): number {
+  if (!Number.isFinite(value) || value <= 0) {
+    return fallback;
+  }
+
+  return Math.floor(value);
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+async function waitForDynamoDbReady(): Promise<void> {
+  const attempts = normalizePositiveInteger(connectAttemptsRaw, isCi ? 180 : 60);
+  const delayMs = normalizePositiveInteger(connectDelayMsRaw, isCi ? 1500 : 1000);
+  let lastError: unknown = null;
+
+  for (let i = 0; i < attempts; i++) {
+    try {
+      await baseClient.send(new ListTablesCommand({ Limit: 1 }));
+      return;
+    } catch (error) {
+      lastError = error;
+
+      if (i < attempts - 1) {
+        await sleep(delayMs);
+      }
+    }
+  }
+
+  throw new Error(
+    `Unable to reach DynamoDB Local at ${endpoint}. ` +
+      `Start it with \`bun run services:up:dynamodb\`. ` +
+      `Retry config: attempts=${String(attempts)}, delayMs=${String(delayMs)}. ` +
+      `Root error: ${String(lastError)}`,
+  );
+}
 
 async function createTableForTests(): Promise<void> {
   try {
@@ -90,6 +133,7 @@ describe("dynamoDbEngine integration", () => {
     });
 
     documentClient = DynamoDBDocumentClient.from(baseClient);
+    await waitForDynamoDbReady();
     await createTableForTests();
   });
 
