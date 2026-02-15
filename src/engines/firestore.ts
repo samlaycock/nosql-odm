@@ -444,7 +444,12 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
 
       async getOutdated(collection, criteria, cursor) {
         if (criteria.skipMetadataSyncHint !== true) {
-          await syncMigrationMetadataForCriteria(database, documentsCollection, collection, criteria);
+          await syncMigrationMetadataForCriteria(
+            database,
+            documentsCollection,
+            collection,
+            criteria,
+          );
         }
         return queryOutdatedDocuments(documentsCollection, collection, criteria, cursor);
       },
