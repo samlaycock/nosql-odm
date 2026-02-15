@@ -502,7 +502,13 @@ export function dynamoDbEngine(options: DynamoDbEngineOptions): DynamoDbQueryEng
 
       async getOutdated(collection, criteria, cursor) {
         if (criteria.skipMetadataSyncHint !== true) {
-          await syncMigrationMetadataForCriteria(client, tableName, keyConfig, collection, criteria);
+          await syncMigrationMetadataForCriteria(
+            client,
+            tableName,
+            keyConfig,
+            collection,
+            criteria,
+          );
         }
         return getOutdatedDocuments(client, tableName, keyConfig, collection, criteria, cursor);
       },
