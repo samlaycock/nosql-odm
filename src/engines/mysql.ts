@@ -1240,7 +1240,9 @@ async function getOutdatedDocuments(
   criteria: MigrationCriteria,
   cursor?: string,
 ): Promise<EngineQueryResult> {
-  await syncMissingMigrationMetadata(client as MySqlPoolLike, refs, collection, criteria);
+  if (criteria.skipMetadataSyncHint !== true) {
+    await syncMissingMigrationMetadata(client as MySqlPoolLike, refs, collection, criteria);
+  }
   return getOutdatedDocumentsByMetadata(client, refs, collection, criteria, cursor);
 }
 
@@ -1251,6 +1253,7 @@ async function getOutdatedDocumentsByMetadata(
   criteria: MigrationCriteria,
   cursor?: string,
 ): Promise<EngineQueryResult> {
+  const pageLimit = normalizeOutdatedPageLimit(criteria.pageSizeHint);
   const startKey = cursor ?? "";
   const expectedSignature = computeIndexSignature(criteria.indexes);
   const rows = await fetchRows(client, {
@@ -1273,12 +1276,12 @@ async function getOutdatedDocumentsByMetadata(
       ORDER BY m.doc_key ASC
       LIMIT ?
     `,
-    params: [collection, startKey, expectedSignature, criteria.version, OUTDATED_PAGE_LIMIT + 1],
+    params: [collection, startKey, expectedSignature, criteria.version, pageLimit + 1],
     errorMessage: "MySQL returned an invalid outdated query result",
   });
 
-  const hasMore = rows.length > OUTDATED_PAGE_LIMIT;
-  const pageRows = hasMore ? rows.slice(0, OUTDATED_PAGE_LIMIT) : rows;
+  const hasMore = rows.length > pageLimit;
+  const pageRows = hasMore ? rows.slice(0, pageLimit) : rows;
   const documents: KeyedDocument[] = [];
 
   for (const row of pageRows) {
@@ -1301,6 +1304,14 @@ async function getOutdatedDocumentsByMetadata(
     documents,
     cursor: hasMore ? (documents[documents.length - 1]?.key ?? null) : null,
   };
+}
+
+function normalizeOutdatedPageLimit(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) {
+    return OUTDATED_PAGE_LIMIT;
+  }
+
+  return Math.max(1, Math.floor(value));
 }
 
 async function syncMissingMigrationMetadata(

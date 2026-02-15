@@ -443,7 +443,9 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
       },
 
       async getOutdated(collection, criteria, cursor) {
-        await syncMigrationMetadataForCriteria(database, documentsCollection, collection, criteria);
+        if (criteria.skipMetadataSyncHint !== true) {
+          await syncMigrationMetadataForCriteria(database, documentsCollection, collection, criteria);
+        }
         return queryOutdatedDocuments(documentsCollection, collection, criteria, cursor);
       },
 
@@ -746,6 +748,7 @@ async function queryOutdatedDocuments(
   criteria: MigrationCriteria,
   cursor: string | undefined,
 ): Promise<EngineQueryResult> {
+  const pageLimit = normalizeOutdatedPageLimit(criteria.pageSizeHint);
   const partition = migrationPartitionKey(collection, criteria.version, true);
   let query = documentsCollection.where("migrationPartition", "==", partition);
 
@@ -753,13 +756,13 @@ async function queryOutdatedDocuments(
     query = query.where("migrationOrderKey", ">", cursor);
   }
 
-  const raw = await query.limit(OUTDATED_PAGE_LIMIT + 1).get();
+  const raw = await query.limit(pageLimit + 1).get();
   const snapshot = parseQuerySnapshot(raw, "document record");
   const records = snapshot.docs
     .map((doc) => parseStoredDocumentRecord(snapshotData(doc, "document record")))
     .sort((a, b) => a.migrationOrderKey.localeCompare(b.migrationOrderKey));
-  const hasMore = records.length > OUTDATED_PAGE_LIMIT;
-  const pageRecords = hasMore ? records.slice(0, OUTDATED_PAGE_LIMIT) : records;
+  const hasMore = records.length > pageLimit;
+  const pageRecords = hasMore ? records.slice(0, pageLimit) : records;
   const documents: KeyedDocument[] = [];
 
   for (const record of pageRecords) {
@@ -774,6 +777,14 @@ async function queryOutdatedDocuments(
     documents,
     cursor: hasMore ? (pageRecords[pageRecords.length - 1]?.migrationOrderKey ?? null) : null,
   };
+}
+
+function normalizeOutdatedPageLimit(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) {
+    return OUTDATED_PAGE_LIMIT;
+  }
+
+  return Math.max(1, Math.floor(value));
 }
 
 function parseStoredDocumentRecord(raw: unknown): StoredDocumentRecord {

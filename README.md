@@ -495,7 +495,6 @@ Test runner modes:
 
 ```bash
 bun run test                                 # unit tests only (./tests/unit/*.test.ts)
-bun run test:integration                     # all integration suites
 bun run test:integration:dynamodb            # only DynamoDB integration
 bun run test:integration:cassandra           # only Cassandra integration
 bun run test:integration:redis               # only Redis integration

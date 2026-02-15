@@ -167,6 +167,38 @@ describe("paged migration API", () => {
     const progress = await store.user.getMigrationProgress();
     expect(progress).toBeNull();
   });
+
+  test("migrateNextPage passes continuation hints to the engine", async () => {
+    await seedUsers(engine, 150);
+
+    const observed: Array<{
+      pageSizeHint: number | undefined;
+      skipMetadataSyncHint: boolean | undefined;
+      cursor: string | undefined;
+    }> = [];
+    const originalGetOutdated = engine.migration.getOutdated.bind(engine.migration);
+    engine.migration.getOutdated = async (collection, criteria, cursor) => {
+      observed.push({
+        pageSizeHint: criteria.pageSizeHint,
+        skipMetadataSyncHint: criteria.skipMetadataSyncHint,
+        cursor,
+      });
+
+      return originalGetOutdated(collection, criteria, cursor);
+    };
+
+    const store = createStore(engine, [buildUserV2()]);
+    await store.user.migrateNextPage();
+    await store.user.migrateNextPage();
+
+    expect(observed.length).toBeGreaterThanOrEqual(2);
+    expect(observed[0]?.pageSizeHint).toBe(100);
+    expect(observed[0]?.skipMetadataSyncHint).toBe(false);
+    expect(observed[0]?.cursor).toBeUndefined();
+    expect(observed[1]?.pageSizeHint).toBeGreaterThan(0);
+    expect(observed[1]?.skipMetadataSyncHint).toBe(true);
+    expect(observed[1]?.cursor).toBeDefined();
+  });
 });
 
 describe("migration progress", () => {
@@ -252,6 +284,39 @@ describe("persisted migration run validation", () => {
 
     const store = createStore(engine, [buildUserV2()]);
     await expectReject(store.user.getMigrationProgress(), /invalid skip reasons/i);
+  });
+
+  test("rejects non-positive page size hints in persisted run state", async () => {
+    const lock = await engine.migration.acquireLock("user");
+    expect(lock).not.toBeNull();
+
+    await engine.migration.saveCheckpoint!(
+      lock!,
+      JSON.stringify({
+        id: "run-3",
+        scope: "model",
+        models: ["user"],
+        modelIndex: 0,
+        cursor: null,
+        startedAt: Date.now(),
+        updatedAt: Date.now(),
+        progressByModel: {
+          user: {
+            migrated: 0,
+            skipped: 0,
+            pages: 0,
+            skipReasons: {},
+          },
+        },
+        pageSizeByModel: {
+          user: 0,
+        },
+      }),
+    );
+    await engine.migration.releaseLock(lock!);
+
+    const store = createStore(engine, [buildUserV2()]);
+    await expectReject(store.user.getMigrationProgress(), /invalid page size hints/i);
   });
 });
 

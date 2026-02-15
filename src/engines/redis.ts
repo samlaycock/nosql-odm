@@ -616,7 +616,9 @@ export function redisEngine(options: RedisEngineOptions): RedisQueryEngine {
       },
 
       async getOutdated(collection, criteria, cursor) {
-        await syncMigrationMetadataForCriteria(client, keyPrefix, collection, criteria);
+        if (criteria.skipMetadataSyncHint !== true) {
+          await syncMigrationMetadataForCriteria(client, keyPrefix, collection, criteria);
+        }
         return getOutdatedDocuments(client, keyPrefix, collection, criteria, cursor);
       },
 
@@ -904,6 +906,7 @@ async function getOutdatedDocuments(
   criteria: MigrationCriteria,
   cursor: string | undefined,
 ): Promise<EngineQueryResult> {
+  const pageLimit = normalizeOutdatedPageLimit(criteria.pageSizeHint);
   const expectedSignature = computeIndexSignature(criteria.indexes);
   const expectedSignatureToken = migrationSignatureToken(expectedSignature);
   const mismatchKey = migrationMismatchTempKey(
@@ -930,7 +933,7 @@ async function getOutdatedDocuments(
   );
 
   let state = decodeOutdatedCursor(cursor, criteria.version, expectedSignature);
-  const requested = OUTDATED_PAGE_LIMIT;
+  const requested = pageLimit;
   let remaining = requested;
   const candidates: Array<{ key: string; source: "stale" | "mismatch" }> = [];
   let nextCursor: string | null = null;
@@ -1044,6 +1047,14 @@ async function getOutdatedDocuments(
     documents,
     cursor: nextCursor,
   };
+}
+
+function normalizeOutdatedPageLimit(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) {
+    return OUTDATED_PAGE_LIMIT;
+  }
+
+  return Math.max(1, Math.floor(value));
 }
 
 async function fetchZsetPageByScore(

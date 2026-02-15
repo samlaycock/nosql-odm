@@ -107,6 +107,13 @@ export interface MigrationDocumentSkippedEvent {
   readonly error?: unknown;
 }
 
+export interface MigrationDocumentsPersistedEvent {
+  readonly runId: string;
+  readonly model: string;
+  readonly persistedKeys: readonly string[];
+  readonly conflictedKeys: readonly string[];
+}
+
 export interface MigrationPageCommittedEvent {
   readonly runId: string;
   readonly model: string;
@@ -133,6 +140,7 @@ export interface MigrationHooks {
   onPageClaimed?(event: MigrationPageClaimedEvent): void | Promise<void>;
   onDocumentMigrated?(event: MigrationDocumentMigratedEvent): void | Promise<void>;
   onDocumentSkipped?(event: MigrationDocumentSkippedEvent): void | Promise<void>;
+  onDocumentsPersisted?(event: MigrationDocumentsPersistedEvent): void | Promise<void>;
   onPageCommitted?(event: MigrationPageCommittedEvent): void | Promise<void>;
   onMigrationCompleted?(event: MigrationCompletedEvent): void | Promise<void>;
   onMigrationFailed?(event: MigrationFailedEvent): void | Promise<void>;
@@ -170,6 +178,7 @@ interface PersistedMigrationRun {
   startedAt: number;
   updatedAt: number;
   progressByModel: Record<string, PersistedMigrationModelProgress>;
+  pageSizeByModel: Record<string, number>;
 }
 
 interface DefaultMigratorOptions {
@@ -177,6 +186,12 @@ interface DefaultMigratorOptions {
 }
 
 const STORE_SCOPE_KEY = "__nosql_odm_migration_scope__store";
+const DEFAULT_MIGRATION_PAGE_SIZE = 100;
+const MIN_MIGRATION_PAGE_SIZE = 10;
+const MAX_MIGRATION_PAGE_SIZE = 500;
+const PROJECTION_CONCURRENCY = 8;
+const FAST_PAGE_MS = 500;
+const SLOW_PAGE_MS = 2000;
 
 export class MigrationScopeConflictError extends Error {
   constructor(message: string) {
@@ -325,7 +340,11 @@ export class DefaultMigrator<TOptions = Record<string, unknown>> implements Migr
 
         const page = await this.engine.migration.getOutdated(
           modelName,
-          context.criteria,
+          {
+            ...context.criteria,
+            pageSizeHint: getPageSizeHint(run, modelName),
+            skipMetadataSyncHint: run.cursor !== null,
+          },
           run.cursor ?? undefined,
         );
 
@@ -350,7 +369,14 @@ export class DefaultMigrator<TOptions = Record<string, unknown>> implements Migr
           documentCount: page.documents.length,
         });
 
+        const pageStartedAt = Date.now();
         const result = await this.migrateDocuments(run, modelName, context, page);
+        tunePageSizeHint(run, modelName, {
+          fetchedCount: page.documents.length,
+          durationMs: Date.now() - pageStartedAt,
+          hadMore: page.cursor !== null,
+          conflictCount: result.skipReasons.concurrent_write ?? 0,
+        });
 
         run.cursor = page.cursor;
         run.updatedAt = Date.now();
@@ -464,9 +490,17 @@ export class DefaultMigrator<TOptions = Record<string, unknown>> implements Migr
     const skipReasons: Record<string, number> = {};
     const writes: { key: string; migrated: boolean; item: BatchSetItem }[] = [];
 
-    for (const entry of page.documents) {
-      const { key, doc: rawDoc } = entry;
-      const projected = await context.project(rawDoc as Record<string, unknown>);
+    const projectedEntries = await mapWithConcurrency(
+      page.documents,
+      PROJECTION_CONCURRENCY,
+      async (entry) => ({
+        entry,
+        projected: await context.project(entry.doc as Record<string, unknown>),
+      }),
+    );
+
+    for (const { entry, projected } of projectedEntries) {
+      const { key } = entry;
 
       if (!projected.ok) {
         skipped += 1;
@@ -506,6 +540,20 @@ export class DefaultMigrator<TOptions = Record<string, unknown>> implements Migr
         persistedKeys = new Set(normalized.persistedKeys);
         conflictedKeys = new Set(normalized.conflictedKeys);
       }
+
+      const attemptedKeys = writes.map((write) => write.key);
+      const persistedSet = persistedKeys;
+      const persistedHookKeys = persistedSet
+        ? attemptedKeys.filter((key) => persistedSet.has(key) && !conflictedKeys.has(key))
+        : attemptedKeys.filter((key) => !conflictedKeys.has(key));
+      const conflictedHookKeys = attemptedKeys.filter((key) => conflictedKeys.has(key));
+
+      await this.runHook("onDocumentsPersisted", {
+        runId: run.id,
+        model: modelName,
+        persistedKeys: persistedHookKeys,
+        conflictedKeys: conflictedHookKeys,
+      });
     }
 
     for (const write of writes) {
@@ -579,14 +627,19 @@ export class DefaultMigrator<TOptions = Record<string, unknown>> implements Migr
       return;
     }
 
-    for (const modelName of scope.models) {
-      const modelActive = await this.isScopeActive({ scope: "model", model: modelName }, lockTtlMs);
+    const statuses = await Promise.all(
+      scope.models.map(async (modelName) => ({
+        modelName,
+        active: await this.isScopeActive({ scope: "model", model: modelName }, lockTtlMs),
+      })),
+    );
 
-      if (modelActive) {
-        throw new MigrationScopeConflictError(
-          `Cannot start store migration because model "${modelName}" is already being migrated`,
-        );
-      }
+    const conflict = statuses.find((status) => status.active);
+
+    if (conflict) {
+      throw new MigrationScopeConflictError(
+        `Cannot start store migration because model "${conflict.modelName}" is already being migrated`,
+      );
     }
   }
 
@@ -712,6 +765,7 @@ function createRun(scope: MigrationScope): PersistedMigrationRun {
     startedAt,
     updatedAt: startedAt,
     progressByModel,
+    pageSizeByModel: {},
   };
 }
 
@@ -864,6 +918,28 @@ function parseRun(raw: string): PersistedMigrationRun {
     };
   }
 
+  const pageSizeByModelRaw = parsed.pageSizeByModel;
+  const pageSizeByModel: Record<string, number> = {};
+
+  if (pageSizeByModelRaw !== undefined) {
+    if (!isRecord(pageSizeByModelRaw)) {
+      throw new Error("Migration run state has invalid page size hints");
+    }
+
+    for (const [modelName, rawPageSize] of Object.entries(pageSizeByModelRaw)) {
+      if (
+        typeof rawPageSize !== "number" ||
+        !Number.isFinite(rawPageSize) ||
+        Math.floor(rawPageSize) !== rawPageSize ||
+        rawPageSize <= 0
+      ) {
+        throw new Error("Migration run state has invalid page size hints");
+      }
+
+      pageSizeByModel[modelName] = rawPageSize;
+    }
+  }
+
   return {
     id,
     scope: scopeRaw,
@@ -873,6 +949,7 @@ function parseRun(raw: string): PersistedMigrationRun {
     startedAt,
     updatedAt,
     progressByModel,
+    pageSizeByModel,
   };
 }
 
@@ -918,6 +995,79 @@ function randomId(): string {
   const now = Date.now().toString(36);
   const random = Math.random().toString(36).slice(2);
   return `${now}_${random}`;
+}
+
+function getPageSizeHint(run: PersistedMigrationRun, modelName: string): number {
+  const existing = run.pageSizeByModel[modelName];
+
+  if (
+    typeof existing === "number" &&
+    Number.isFinite(existing) &&
+    Number.isInteger(existing) &&
+    existing > 0
+  ) {
+    return existing;
+  }
+
+  run.pageSizeByModel[modelName] = DEFAULT_MIGRATION_PAGE_SIZE;
+  return DEFAULT_MIGRATION_PAGE_SIZE;
+}
+
+function tunePageSizeHint(
+  run: PersistedMigrationRun,
+  modelName: string,
+  stats: {
+    fetchedCount: number;
+    durationMs: number;
+    hadMore: boolean;
+    conflictCount: number;
+  },
+): void {
+  const current = getPageSizeHint(run, modelName);
+  let next = current;
+
+  if (stats.conflictCount > 0 || stats.durationMs >= SLOW_PAGE_MS) {
+    next = Math.max(MIN_MIGRATION_PAGE_SIZE, Math.floor(current * 0.6));
+  } else if (stats.hadMore && stats.fetchedCount >= current && stats.durationMs <= FAST_PAGE_MS) {
+    next = Math.min(MAX_MIGRATION_PAGE_SIZE, Math.ceil(current * 1.25));
+  }
+
+  if (next !== current) {
+    run.pageSizeByModel[modelName] = next;
+  }
+}
+
+async function mapWithConcurrency<TInput, TOutput>(
+  items: readonly TInput[],
+  concurrency: number,
+  map: (item: TInput, index: number) => Promise<TOutput>,
+): Promise<TOutput[]> {
+  if (items.length === 0) {
+    return [];
+  }
+
+  const normalizedConcurrency = Math.max(1, Math.floor(concurrency));
+  const results = Array.from({ length: items.length }) as TOutput[];
+  let nextIndex = 0;
+
+  const workers = Array.from(
+    { length: Math.min(normalizedConcurrency, items.length) },
+    async () => {
+      while (true) {
+        const current = nextIndex;
+        nextIndex += 1;
+
+        if (current >= items.length) {
+          return;
+        }
+
+        results[current] = await map(items[current]!, current);
+      }
+    },
+  );
+
+  await Promise.all(workers);
+  return results;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

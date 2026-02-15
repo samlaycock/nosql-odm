@@ -501,7 +501,9 @@ export function dynamoDbEngine(options: DynamoDbEngineOptions): DynamoDbQueryEng
       },
 
       async getOutdated(collection, criteria, cursor) {
-        await syncMigrationMetadataForCriteria(client, tableName, keyConfig, collection, criteria);
+        if (criteria.skipMetadataSyncHint !== true) {
+          await syncMigrationMetadataForCriteria(client, tableName, keyConfig, collection, criteria);
+        }
         return getOutdatedDocuments(client, tableName, keyConfig, collection, criteria, cursor);
       },
 
@@ -1398,9 +1400,10 @@ async function getOutdatedDocuments(
   criteria: MigrationCriteria,
   cursor: string | undefined,
 ): Promise<EngineQueryResult> {
+  const pageLimit = normalizeOutdatedPageLimit(criteria.pageSizeHint);
   const expectedSignature = computeIndexSignature(criteria.indexes);
   const state = decodeOutdatedCursor(cursor, criteria.version, expectedSignature);
-  const remaining = OUTDATED_PAGE_LIMIT;
+  const remaining = pageLimit;
   const metadata: MigrationMetadataItem[] = [];
   let remainingSlots = remaining;
   let nextCursor: string | null = null;
@@ -1525,6 +1528,14 @@ async function getOutdatedDocuments(
     documents,
     cursor: nextCursor,
   };
+}
+
+function normalizeOutdatedPageLimit(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) {
+    return OUTDATED_PAGE_LIMIT;
+  }
+
+  return Math.max(1, Math.floor(value));
 }
 
 async function queryMigrationMetadataPage(

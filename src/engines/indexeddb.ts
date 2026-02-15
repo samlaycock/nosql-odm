@@ -422,7 +422,7 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
 
         return paginate(outdated, {
           cursor,
-          limit: OUTDATED_PAGE_LIMIT,
+          limit: normalizeOutdatedPageLimit(criteria.pageSizeHint),
         });
       },
 
@@ -761,6 +761,14 @@ function defaultCompareVersions(a: ComparableVersion, b: ComparableVersion): num
     numeric: true,
     sensitivity: "base",
   });
+}
+
+function normalizeOutdatedPageLimit(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) {
+    return OUTDATED_PAGE_LIMIT;
+  }
+
+  return Math.max(1, Math.floor(value));
 }
 
 function normalizeNumericVersion(value: string): number | null {

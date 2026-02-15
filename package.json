@@ -82,7 +82,6 @@
   },
   "scripts": {
     "test": "bun test ./tests/unit/*.test.ts",
-    "test:integration": "bun test ./tests/integration/*.test.ts",
     "test:integration:memory": "bun test ./tests/integration/memory-engine.test.ts",
     "test:integration:sqlite": "bun test ./tests/integration/sqlite-engine.test.ts",
     "test:integration:indexeddb": "bun test ./tests/integration/indexeddb-engine.test.ts",

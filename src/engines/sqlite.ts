@@ -989,13 +989,16 @@ function getOutdatedDocuments(
   criteria: MigrationCriteria,
   cursor?: string,
 ): EngineQueryResult {
-  syncMissingMigrationMetadata(
-    db,
-    scanMissingMetadataStmt,
-    upsertMigrationMetadataStmt,
-    collection,
-    criteria,
-  );
+  if (criteria.skipMetadataSyncHint !== true) {
+    syncMissingMigrationMetadata(
+      db,
+      scanMissingMetadataStmt,
+      upsertMigrationMetadataStmt,
+      collection,
+      criteria,
+    );
+  }
+  const pageLimit = normalizeOutdatedPageLimit(criteria.pageSizeHint);
   const startId = resolveCursorId(collection, cursor, selectDocumentIdByKeyStmt);
   const expectedSignature = computeIndexSignature(criteria.indexes);
   const rows = queryOutdatedByMetadataStmt.all(
@@ -1003,10 +1006,10 @@ function getOutdatedDocuments(
     startId,
     expectedSignature,
     criteria.version,
-    OUTDATED_PAGE_LIMIT + 1,
+    pageLimit + 1,
   );
-  const hasMore = rows.length > OUTDATED_PAGE_LIMIT;
-  const pageRows = hasMore ? rows.slice(0, OUTDATED_PAGE_LIMIT) : rows;
+  const hasMore = rows.length > pageLimit;
+  const pageRows = hasMore ? rows.slice(0, pageLimit) : rows;
   const documents: KeyedDocument[] = pageRows.map((row) => ({
     key: row.doc_key,
     doc: parseStoredDocument(row.doc_json, collection, row.doc_key),
@@ -1017,6 +1020,14 @@ function getOutdatedDocuments(
     documents,
     cursor: hasMore ? (documents[documents.length - 1]?.key ?? null) : null,
   };
+}
+
+function normalizeOutdatedPageLimit(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) {
+    return OUTDATED_PAGE_LIMIT;
+  }
+
+  return Math.max(1, Math.floor(value));
 }
 
 function syncMissingMigrationMetadata(

@@ -231,7 +231,10 @@ export function memoryEngine(options?: MemoryEngineOptions): MemoryQueryEngine {
         }
 
         // Reuse paginate for cursor-based pagination
-        return paginate(outdated, { cursor, limit: 100 });
+        return paginate(outdated, {
+          cursor,
+          limit: normalizeOutdatedPageLimit(criteria.pageSizeHint),
+        });
       },
 
       async saveCheckpoint(lock, cursor) {
@@ -425,6 +428,14 @@ function safeCompare(
   } catch {
     return null;
   }
+}
+
+function normalizeOutdatedPageLimit(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) {
+    return 100;
+  }
+
+  return Math.max(1, Math.floor(value));
 }
 
 function defaultParseVersion(raw: unknown): ComparableVersion | null {
