@@ -558,6 +558,8 @@ async function queryByIndex(
       const valueTieArg = builder.push(cursor.indexValue);
       const idArg = builder.push(cursor.id);
 
+      // Descending queries still advance by d.id for deterministic tie-breaking
+      // when multiple rows share the same index value.
       whereClauses.push(
         `(ix.index_value < ${valueArg} OR (ix.index_value = ${valueTieArg} AND d.id > ${idArg}))`,
       );
@@ -571,7 +573,9 @@ async function queryByIndex(
     sort === "asc"
       ? `ORDER BY ix.index_value ASC, d.id ASC`
       : sort === "desc"
-        ? `ORDER BY ix.index_value DESC, d.id ASC`
+        ? // Keep id ascending in both directions so the cursor predicate and
+          // ORDER BY use the same tie-break dimension.
+          `ORDER BY ix.index_value DESC, d.id ASC`
         : `ORDER BY d.id ASC`;
 
   let sql = `
@@ -886,6 +890,8 @@ async function ensureSchema(client: PostgresQueryableLike, refs: TableRefs): Pro
     `${refs.schema}|${refs.documentsTable}|${refs.indexesTable}|${refs.migrationMetadataTable}|${refs.migrationLocksTable}|${refs.migrationCheckpointsTable}`,
   );
 
+  // A process-scoped advisory lock prevents concurrent instances from racing
+  // DDL statements during lazy schema bootstrap.
   await session.query(`SELECT pg_advisory_lock($1)`, [lockKey]);
 
   try {
@@ -1283,6 +1289,8 @@ async function getOutdatedDocuments(
   cursor?: string,
 ): Promise<EngineQueryResult> {
   if (criteria.skipMetadataSyncHint !== true) {
+    // Refresh metadata only when starting a scan; continuation pages reuse
+    // the same targetVersion/signature window for consistency and cost control.
     await syncMissingMigrationMetadata(client, refs, collection, criteria);
   }
   return getOutdatedDocumentsByMetadata(client, refs, collection, criteria, cursor);
@@ -1362,6 +1370,7 @@ async function syncMissingMigrationMetadata(
   criteria: MigrationCriteria,
 ): Promise<void> {
   while (true) {
+    // Sync in chunks so large collections do not hold long transactions.
     const rows = await fetchRows(client, {
       sql: `
         SELECT d.doc_key AS key, d.doc_json

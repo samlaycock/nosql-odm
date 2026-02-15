@@ -1408,6 +1408,8 @@ async function getOutdatedDocuments(
 ): Promise<EngineQueryResult> {
   const pageLimit = normalizeOutdatedPageLimit(criteria.pageSizeHint);
   const expectedSignature = computeIndexSignature(criteria.indexes);
+  // Cursor carries both phase and criteria fingerprint so old cursors cannot
+  // be reused after schema/index expectations change.
   const state = decodeOutdatedCursor(cursor, criteria.version, expectedSignature);
   const remaining = pageLimit;
   const metadata: MigrationMetadataItem[] = [];
@@ -1415,6 +1417,7 @@ async function getOutdatedDocuments(
   let nextCursor: string | null = null;
 
   if (state.phase === "stale") {
+    // Phase 1: strictly outdated versions (safe, high-priority migration set).
     const stale = await queryMigrationMetadataPage(client, tableName, keyConfig, {
       indexName: keyConfig.migrationOutdatedIndexName,
       keyConditionExpression: "#pk = :pk",
@@ -1445,6 +1448,7 @@ async function getOutdatedDocuments(
   }
 
   if (nextCursor === null && remainingSlots > 0 && state.phase === "current-low") {
+    // Phase 2: "current" docs whose index signature sorts before expected.
     const expectedPrefix = migrationOutdatedSignaturePrefix(expectedSignature);
     const low = await queryMigrationMetadataPage(client, tableName, keyConfig, {
       indexName: keyConfig.migrationOutdatedIndexName,
@@ -1478,6 +1482,7 @@ async function getOutdatedDocuments(
   }
 
   if (nextCursor === null && remainingSlots > 0 && state.phase === "current-high") {
+    // Phase 3: "current" docs whose index signature sorts after expected.
     const expectedAfter = migrationOutdatedSignatureAfter(expectedSignature);
     const high = await queryMigrationMetadataPage(client, tableName, keyConfig, {
       indexName: keyConfig.migrationOutdatedIndexName,
@@ -1996,6 +2001,8 @@ function decodeOutdatedCursor(
       typeof parsedExpectedSignature !== "string" ||
       parsedExpectedSignature !== expectedSignature
     ) {
+      // Any mismatch means the cursor was produced for a different migration
+      // window; restart from phase 1 to avoid skipping candidates.
       return baseState;
     }
 

@@ -235,6 +235,8 @@ export class DefaultMigrator<TOptions = Record<string, unknown>> implements Migr
         };
       }
 
+      // If another process holds the lock before persisting a checkpoint,
+      // surface a synthetic "running" progress object instead of throwing.
       const locked = await this.engine.migration.getStatus?.(runKey);
       const progress = locked ? placeholderProgress(normalizedScope, locked.lock.acquiredAt) : null;
 
@@ -343,6 +345,8 @@ export class DefaultMigrator<TOptions = Record<string, unknown>> implements Migr
           {
             ...context.criteria,
             pageSizeHint: getPageSizeHint(run, modelName),
+            // Metadata sync can be expensive for large collections; perform it
+            // on the first page only, then continue with metadata snapshots.
             skipMetadataSyncHint: run.cursor !== null,
           },
           run.cursor ?? undefined,
@@ -558,6 +562,8 @@ export class DefaultMigrator<TOptions = Record<string, unknown>> implements Migr
 
     for (const write of writes) {
       if (conflictedKeys.has(write.key)) {
+        // A write conflict means someone updated the document after it was read
+        // for migration; count it as skipped so the next run can retry safely.
         skipped += 1;
         skipReasons.concurrent_write = (skipReasons.concurrent_write ?? 0) + 1;
         await this.runHook("onDocumentSkipped", {
@@ -977,6 +983,8 @@ function normalizeBatchSetResult(result: BatchSetResult | void): BatchSetResult 
     return null;
   }
 
+  // Normalization keeps hook payloads deterministic across engines that may
+  // return duplicates or varying order.
   return {
     persistedKeys: uniqueStrings(result.persistedKeys),
     conflictedKeys: uniqueStrings(result.conflictedKeys),
@@ -1026,6 +1034,9 @@ function tunePageSizeHint(
   const current = getPageSizeHint(run, modelName);
   let next = current;
 
+  // Conservative AIMD-style tuning:
+  // - shrink quickly on contention or slow pages
+  // - grow slowly when pages are full and fast
   if (stats.conflictCount > 0 || stats.durationMs >= SLOW_PAGE_MS) {
     next = Math.max(MIN_MIGRATION_PAGE_SIZE, Math.floor(current * 0.6));
   } else if (stats.hadMore && stats.fetchedCount >= current && stats.durationMs <= FAST_PAGE_MS) {
@@ -1050,6 +1061,8 @@ async function mapWithConcurrency<TInput, TOutput>(
   const results = Array.from({ length: items.length }) as TOutput[];
   let nextIndex = 0;
 
+  // Workers process items out of order, but each result is written back to its
+  // original slot so callers receive a stable, input-ordered array.
   const workers = Array.from(
     { length: Math.min(normalizedConcurrency, items.length) },
     async () => {
