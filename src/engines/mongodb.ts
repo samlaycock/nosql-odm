@@ -509,7 +509,9 @@ export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine
 
       async getOutdated(collection, criteria, cursor) {
         await ready;
-        await syncMigrationMetadataForCriteria(documentsCollection, collection, criteria);
+        if (criteria.skipMetadataSyncHint !== true) {
+          await syncMigrationMetadataForCriteria(documentsCollection, collection, criteria);
+        }
         return getOutdatedDocuments(documentsCollection, collection, criteria, cursor);
       },
 
@@ -806,10 +808,11 @@ async function getOutdatedDocuments(
   criteria: MigrationCriteria,
   cursor: string | undefined,
 ): Promise<EngineQueryResult> {
+  const pageLimit = normalizeOutdatedPageLimit(criteria.pageSizeHint);
   const expectedSignature = computeIndexSignature(criteria.indexes);
   const state = decodeOutdatedCursor(cursor, criteria.version, expectedSignature);
   const documents: StoredDocumentRecord[] = [];
-  let remaining = OUTDATED_PAGE_LIMIT;
+  let remaining = pageLimit;
   let nextCursor: string | null = null;
 
   if (state.phase === "stale") {
@@ -897,6 +900,14 @@ async function getOutdatedDocuments(
     })),
     cursor: nextCursor,
   };
+}
+
+function normalizeOutdatedPageLimit(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) {
+    return OUTDATED_PAGE_LIMIT;
+  }
+
+  return Math.max(1, Math.floor(value));
 }
 
 async function queryOutdatedStalePhase(

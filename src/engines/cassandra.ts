@@ -341,13 +341,15 @@ export function cassandraEngine(options: CassandraEngineOptions): CassandraQuery
       async getOutdated(collection, criteria, cursor) {
         await ready;
 
-        await syncMigrationMetadataForCriteria(
-          client,
-          documentsTable,
-          migrationIndexTable,
-          collection,
-          criteria,
-        );
+        if (criteria.skipMetadataSyncHint !== true) {
+          await syncMigrationMetadataForCriteria(
+            client,
+            documentsTable,
+            migrationIndexTable,
+            collection,
+            criteria,
+          );
+        }
         return getOutdatedDocuments(
           client,
           documentsTable,
@@ -1696,10 +1698,11 @@ async function getOutdatedDocuments(
   criteria: MigrationCriteria,
   cursor: string | undefined,
 ): Promise<EngineQueryResult> {
+  const pageLimit = normalizeOutdatedPageLimit(criteria.pageSizeHint);
   const expectedSignature = computeIndexSignature(criteria.indexes);
   let state = decodeOutdatedCursor(cursor, criteria.version, expectedSignature);
   const candidates: MigrationIndexRow[] = [];
-  let remaining = OUTDATED_PAGE_LIMIT;
+  let remaining = pageLimit;
   let nextCursor: string | null = null;
   const expectedSort = toIndexSignatureSort(expectedSignature);
 
@@ -1786,6 +1789,14 @@ async function getOutdatedDocuments(
     documents,
     cursor: nextCursor,
   };
+}
+
+function normalizeOutdatedPageLimit(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) {
+    return OUTDATED_PAGE_LIMIT;
+  }
+
+  return Math.max(1, Math.floor(value));
 }
 
 async function queryOutdatedPhase(

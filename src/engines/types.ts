@@ -172,6 +172,10 @@ export interface MigrationCriteria {
   parseVersion?: (raw: unknown) => ComparableVersion | null;
   /** Optional comparator for parsed version values. */
   compareVersions?: (a: ComparableVersion, b: ComparableVersion) => number;
+  /** Optional engine hint for migration page size. */
+  pageSizeHint?: number;
+  /** Optional engine hint to skip expensive metadata sync for continuation pages. */
+  skipMetadataSyncHint?: boolean;
 }
 
 export interface MigrationStatus {
