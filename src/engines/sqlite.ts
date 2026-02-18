@@ -3,6 +3,7 @@ import {
   type BatchSetResult,
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
+  EngineUniqueConstraintError,
   type AcquireLockOptions,
   type ComparableVersion,
   type EngineQueryResult,
@@ -37,6 +38,10 @@ interface QueryRow {
 interface CursorRow {
   id: number;
   index_value: string;
+}
+
+interface UniqueConflictRow {
+  doc_key: string;
 }
 
 interface LockRow {
@@ -121,6 +126,21 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
     INSERT INTO index_entries (collection, doc_key, index_name, index_value)
     VALUES (?, ?, ?, ?)
   `);
+
+  const selectUniqueConflictStmt = db.prepare<
+    [string, string, string, string],
+    UniqueConflictRow | undefined
+  >(
+    `
+      SELECT doc_key
+      FROM index_entries
+      WHERE collection = ?
+        AND index_name = ?
+        AND index_value = ?
+        AND doc_key <> ?
+      LIMIT 1
+    `,
+  );
 
   const selectDocumentIdByKeyStmt = db.prepare<[string, string], { id: number } | undefined>(
     `SELECT id FROM documents WHERE collection = ? AND doc_key = ?`,
@@ -236,14 +256,36 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
     LIMIT ?
   `);
 
+  const assertUniqueIndexes = (
+    collection: string,
+    key: string,
+    uniqueIndexes: ResolvedIndexKeys,
+  ): void => {
+    for (const [indexName, indexValue] of Object.entries(uniqueIndexes)) {
+      const conflict = selectUniqueConflictStmt.get(collection, indexName, String(indexValue), key);
+
+      if (conflict) {
+        throw new EngineUniqueConstraintError(
+          collection,
+          key,
+          indexName,
+          String(indexValue),
+          conflict.doc_key,
+        );
+      }
+    }
+  };
+
   const putTxn = db.transaction(
     (
       collection: string,
       key: string,
       docJson: string,
       indexes: ResolvedIndexKeys,
+      uniqueIndexes: ResolvedIndexKeys,
       metadata: MigrationMetadata,
     ) => {
+      assertUniqueIndexes(collection, key, uniqueIndexes);
       upsertDocumentStmt.run(collection, key, docJson);
       deleteIndexesForDocumentStmt.run(collection, key);
 
@@ -267,8 +309,10 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
       key: string,
       docJson: string,
       indexes: ResolvedIndexKeys,
+      uniqueIndexes: ResolvedIndexKeys,
       metadata: MigrationMetadata,
     ) => {
+      assertUniqueIndexes(collection, key, uniqueIndexes);
       const result = updateDocumentStmt.run(docJson, collection, key) as { changes?: unknown };
       const changes = Number(result?.changes ?? 0);
 
@@ -298,8 +342,10 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
       key: string,
       docJson: string,
       indexes: ResolvedIndexKeys,
+      uniqueIndexes: ResolvedIndexKeys,
       metadata: MigrationMetadata,
     ) => {
+      assertUniqueIndexes(collection, key, uniqueIndexes);
       insertDocumentStmt.run(collection, key, docJson);
 
       for (const [indexName, indexValue] of Object.entries(indexes)) {
@@ -323,10 +369,12 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
         key: string;
         docJson: string;
         indexes: ResolvedIndexKeys;
+        uniqueIndexes: ResolvedIndexKeys;
         metadata: MigrationMetadata;
       }[],
     ): void => {
       for (const item of items) {
+        assertUniqueIndexes(collection, item.key, item.uniqueIndexes);
         upsertDocumentStmt.run(collection, item.key, item.docJson);
         deleteIndexesForDocumentStmt.run(collection, item.key);
 
@@ -352,6 +400,7 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
         key: string;
         docJson: string;
         indexes: ResolvedIndexKeys;
+        uniqueIndexes: ResolvedIndexKeys;
         metadata: MigrationMetadata;
         expectedWriteToken?: string;
       }[],
@@ -360,6 +409,8 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
       const conflictedKeys: string[] = [];
 
       for (const item of items) {
+        assertUniqueIndexes(collection, item.key, item.uniqueIndexes);
+
         if (item.expectedWriteToken !== undefined) {
           const expectedWriteVersion = parseWriteToken(item.expectedWriteToken);
           const result = updateDocumentWithTokenStmt.run(
@@ -437,6 +488,10 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
   );
 
   const engine: SqliteQueryEngine = {
+    capabilities: {
+      uniqueConstraints: "atomic",
+    },
+
     db,
 
     close() {
@@ -453,13 +508,17 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
       return parseStoredDocument(row.doc_json, collection, key);
     },
 
-    async create(collection, key, doc, indexes, _options, migrationMetadata) {
+    async create(collection, key, doc, indexes, _options, migrationMetadata, uniqueIndexes) {
       const docJson = serializeDocument(doc, collection, key);
       const metadata = normalizeMigrationMetadata(migrationMetadata) ?? deriveLegacyMetadata(doc);
 
       try {
-        createTxn(collection, key, docJson, indexes, metadata);
+        createTxn(collection, key, docJson, indexes, uniqueIndexes ?? {}, metadata);
       } catch (error) {
+        if (error instanceof EngineUniqueConstraintError) {
+          throw error;
+        }
+
         if (isSqliteUniqueConstraintError(error)) {
           throw new EngineDocumentAlreadyExistsError(collection, key);
         }
@@ -468,17 +527,17 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
       }
     },
 
-    async put(collection, key, doc, indexes, _options, migrationMetadata) {
+    async put(collection, key, doc, indexes, _options, migrationMetadata, uniqueIndexes) {
       const docJson = serializeDocument(doc, collection, key);
       const metadata = normalizeMigrationMetadata(migrationMetadata) ?? deriveLegacyMetadata(doc);
 
-      putTxn(collection, key, docJson, indexes, metadata);
+      putTxn(collection, key, docJson, indexes, uniqueIndexes ?? {}, metadata);
     },
 
-    async update(collection, key, doc, indexes, _options, migrationMetadata) {
+    async update(collection, key, doc, indexes, _options, migrationMetadata, uniqueIndexes) {
       const docJson = serializeDocument(doc, collection, key);
       const metadata = normalizeMigrationMetadata(migrationMetadata) ?? deriveLegacyMetadata(doc);
-      updateTxn(collection, key, docJson, indexes, metadata);
+      updateTxn(collection, key, docJson, indexes, uniqueIndexes ?? {}, metadata);
     },
 
     async delete(collection, key) {
@@ -517,6 +576,7 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
         key: item.key,
         docJson: serializeDocument(item.doc, collection, item.key),
         indexes: item.indexes,
+        uniqueIndexes: item.uniqueIndexes ?? {},
         metadata:
           normalizeMigrationMetadata(item.migrationMetadata) ?? deriveLegacyMetadata(item.doc),
       }));
@@ -529,6 +589,7 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
         key: item.key,
         docJson: serializeDocument(item.doc, collection, item.key),
         indexes: item.indexes,
+        uniqueIndexes: item.uniqueIndexes ?? {},
         metadata:
           normalizeMigrationMetadata(item.migrationMetadata) ?? deriveLegacyMetadata(item.doc),
         expectedWriteToken: item.expectedWriteToken,

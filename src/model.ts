@@ -6,6 +6,7 @@ import type { ResolvedIndexKeys } from "./engines/types";
 // ---------------------------------------------------------------------------
 
 export type MigrationStrategy = "lazy" | "readonly" | "eager";
+export type MigrationErrorMode = "ignore" | "throw";
 
 export type VersionValue = string | number;
 export type ParseVersion = (raw: unknown) => VersionValue | null;
@@ -13,6 +14,7 @@ export type CompareVersions = (a: VersionValue, b: VersionValue) => number;
 
 export interface ModelOptions {
   migration?: MigrationStrategy;
+  migrationErrors?: MigrationErrorMode;
   versionField?: string;
   indexesField?: string;
   parseVersion?: ParseVersion;
@@ -381,6 +383,21 @@ export class ModelDefinition<
 
     return resolved;
   }
+
+  resolveUniqueIndexKeys(data: T): ResolvedIndexKeys {
+    const resolved: ResolvedIndexKeys = {};
+
+    for (const index of this.indexes) {
+      if (index.unique !== true) {
+        continue;
+      }
+
+      const resolvedName = typeof index.name === "function" ? index.name(data) : index.name;
+      resolved[resolvedName] = resolveIndexValue(index.value as IndexValue<unknown>, data);
+    }
+
+    return resolved;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -519,6 +536,7 @@ class ModelBuilderImpl<
 
 const DEFAULT_OPTIONS: Required<ModelOptions> = {
   migration: "lazy",
+  migrationErrors: "ignore",
   versionField: "__v",
   indexesField: "__indexes",
   parseVersion: defaultParseVersion,

@@ -7,6 +7,7 @@ A lightweight, schema-first ODM for NoSQL-style data stores.
 - Versioned schemas with forward migrations
 - Index-based queries, `where` queries, and cursor pagination
 - Lazy migration on reads
+- Optional strict migration error mode (`migrationErrors: "throw"`)
 - Ignore-first migration behavior for non-migratable documents
 - Dynamic index names (multi-tenant style index partitions)
 - Explicit bulk operations (`batchGet`, `batchSet`, `batchDelete`)
@@ -1213,7 +1214,7 @@ See `dist/index.d.ts` and `dist/engines/memory.d.ts` for full signatures.
 - Query comparisons are lexicographic (index values are stored as strings).
 - Adding a new schema version resets builder indexes; re-add indexes for the latest shape.
 - `create`, `batchSet`, and `update` validate against the latest schema.
-- The `unique` index flag is metadata only in this package; uniqueness enforcement is adapter-specific.
+- Unique indexes require an engine with atomic uniqueness support. `createStore()` throws if a model declares `unique: true` indexes and the selected engine cannot guarantee uniqueness.
 
 ## License
 

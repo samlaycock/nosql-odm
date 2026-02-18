@@ -4,8 +4,10 @@ import { model, ValidationError } from "../../src/model";
 import {
   createStore,
   DocumentAlreadyExistsError,
+  MigrationProjectionError,
   MigrationAlreadyRunningError,
   MigrationScopeConflictError,
+  UniqueConstraintError,
 } from "../../src/store";
 import { memoryEngine, type MemoryQueryEngine } from "../../src/engines/memory";
 import { DefaultMigrator } from "../../src/migrator";
@@ -31,6 +33,21 @@ function buildUserV1() {
     )
     .index({ name: "primary", value: "id" })
     .index({ name: "byEmail", value: "email" })
+    .build();
+}
+
+function buildUserV1WithUniqueEmail() {
+  return model("user")
+    .schema(
+      1,
+      z.object({
+        id: z.string(),
+        name: z.string(),
+        email: z.email(),
+      }),
+    )
+    .index({ name: "primary", value: "id" })
+    .index({ name: "byEmail", value: "email", unique: true })
     .build();
 }
 
@@ -257,6 +274,91 @@ describe("createStore()", () => {
         },
       });
     }).toThrow(/migrator.*migrationHooks.*cannot be provided together/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Unique indexes
+// ---------------------------------------------------------------------------
+
+describe("unique indexes", () => {
+  test("createStore rejects unique indexes when the engine lacks atomic uniqueness support", () => {
+    const noUniqueEngine = memoryEngine() as MemoryQueryEngine & {
+      capabilities?: { uniqueConstraints: "none" };
+    };
+    noUniqueEngine.capabilities = { uniqueConstraints: "none" };
+
+    expect(() => createStore(noUniqueEngine, [buildUserV1WithUniqueEmail()])).toThrow(
+      /does not support atomic unique constraints/i,
+    );
+  });
+
+  test("create enforces unique index values", async () => {
+    const store = createStore(engine, [buildUserV1WithUniqueEmail()]);
+
+    await store.user.create("u1", {
+      id: "u1",
+      name: "Sam",
+      email: "sam@example.com",
+    });
+
+    await expectReject(
+      store.user.create("u2", {
+        id: "u2",
+        name: "Other",
+        email: "sam@example.com",
+      }),
+      UniqueConstraintError,
+    );
+  });
+
+  test("update enforces unique index values", async () => {
+    const store = createStore(engine, [buildUserV1WithUniqueEmail()]);
+
+    await store.user.create("u1", {
+      id: "u1",
+      name: "Sam",
+      email: "sam@example.com",
+    });
+    await store.user.create("u2", {
+      id: "u2",
+      name: "Jamie",
+      email: "jamie@example.com",
+    });
+
+    await expectReject(
+      store.user.update("u2", {
+        email: "sam@example.com",
+      }),
+      UniqueConstraintError,
+    );
+
+    expect(await store.user.findByKey("u2")).toEqual({
+      id: "u2",
+      name: "Jamie",
+      email: "jamie@example.com",
+    });
+  });
+
+  test("batchSet rejects duplicate unique values atomically", async () => {
+    const store = createStore(engine, [buildUserV1WithUniqueEmail()]);
+
+    await expectReject(
+      store.user.batchSet([
+        {
+          key: "u1",
+          data: { id: "u1", name: "Sam", email: "sam@example.com" },
+        },
+        {
+          key: "u2",
+          data: { id: "u2", name: "Other", email: "sam@example.com" },
+        },
+      ]),
+      UniqueConstraintError,
+    );
+
+    expect(await store.user.findByKey("u1")).toBeNull();
+    expect(await store.user.findByKey("u2")).toBeNull();
   });
 });
 
@@ -2962,6 +3064,106 @@ describe("lazy migration error handling", () => {
     const raw = (await engine.get("broken", "b1")) as Record<string, unknown>;
     expect(raw.__v).toBe(1);
     expect(raw.value).toBe("test");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Strict migration error mode
+// ---------------------------------------------------------------------------
+
+describe("strict migration error mode", () => {
+  function buildStrictBrokenValidationModel() {
+    return model("broken", { migrationErrors: "throw" })
+      .schema(1, z.object({ id: z.string(), value: z.string() }))
+      .schema(
+        2,
+        z.object({
+          id: z.string(),
+          value: z.string(),
+          count: z.number().min(0),
+        }),
+        { migrate: (old) => ({ ...old, count: -1 }) },
+      )
+      .index({ name: "primary", value: "id" })
+      .index({ name: "all", value: () => "yes" })
+      .build();
+  }
+
+  function buildStrictThrowingMigrationModel() {
+    return model("broken", { migrationErrors: "throw" })
+      .schema(1, z.object({ id: z.string(), value: z.string() }))
+      .schema(
+        2,
+        z.object({
+          id: z.string(),
+          value: z.string(),
+          active: z.boolean(),
+        }),
+        {
+          migrate: () => {
+            throw new Error("migration exploded");
+          },
+        },
+      )
+      .index({ name: "primary", value: "id" })
+      .build();
+  }
+
+  test("findByKey throws when lazy projection fails", async () => {
+    await engine.put("broken", "b1", { __v: 1, id: "b1", value: "test" }, { primary: "b1" });
+
+    const store = createStore(engine, [buildStrictBrokenValidationModel()]);
+
+    await expectReject(store.broken.findByKey("b1"), MigrationProjectionError);
+  });
+
+  test("query throws when lazy projection fails", async () => {
+    await engine.put(
+      "broken",
+      "b1",
+      { __v: 1, id: "b1", value: "test" },
+      { primary: "b1", all: "yes" },
+    );
+
+    const store = createStore(engine, [buildStrictBrokenValidationModel()]);
+
+    await expectReject(
+      store.broken.query({
+        index: "all",
+        filter: { value: "yes" },
+      }),
+      MigrationProjectionError,
+    );
+  });
+
+  test("batchGet throws when lazy projection fails", async () => {
+    await engine.put("broken", "b1", { __v: 1, id: "b1", value: "test" }, { primary: "b1" });
+
+    const store = createStore(engine, [buildStrictBrokenValidationModel()]);
+
+    await expectReject(store.broken.batchGet(["b1"]), MigrationProjectionError);
+  });
+
+  test("update throws when source document projection fails", async () => {
+    await engine.put("broken", "b1", { __v: 1, id: "b1", value: "test" }, { primary: "b1" });
+
+    const store = createStore(engine, [buildStrictThrowingMigrationModel()]);
+
+    await expectReject(
+      store.broken.update("b1", {
+        value: "new",
+        active: true,
+      }),
+      MigrationProjectionError,
+    );
+  });
+
+  test("migrateAll throws when projection fails", async () => {
+    await engine.put("broken", "b1", { __v: 1, id: "b1", value: "test" }, {});
+
+    const store = createStore(engine, [buildStrictBrokenValidationModel()]);
+
+    await expectReject(store.broken.migrateAll(), MigrationProjectionError);
   });
 });
 

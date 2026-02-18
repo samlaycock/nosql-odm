@@ -29,6 +29,7 @@ export interface BatchSetItem {
   key: string;
   doc: unknown;
   indexes: ResolvedIndexKeys;
+  uniqueIndexes?: ResolvedIndexKeys;
   migrationMetadata?: MigrationDocumentMetadata;
   /**
    * Optional optimistic-write token captured when the document was read.
@@ -72,6 +73,36 @@ export class EngineDocumentNotFoundError extends Error {
     this.name = "EngineDocumentNotFoundError";
     this.collection = collection;
     this.key = key;
+  }
+}
+
+/**
+ * Engine-level unique index violation used by write methods when a unique
+ * index value is already owned by another document key.
+ */
+export class EngineUniqueConstraintError extends Error {
+  readonly collection: string;
+  readonly indexName: string;
+  readonly indexValue: string;
+  readonly key: string;
+  readonly existingKey: string | null;
+
+  constructor(
+    collection: string,
+    key: string,
+    indexName: string,
+    indexValue: string,
+    existingKey?: string | null,
+  ) {
+    super(
+      `Unique index "${indexName}" violation in model "${collection}" for value "${indexValue}"`,
+    );
+    this.name = "EngineUniqueConstraintError";
+    this.collection = collection;
+    this.indexName = indexName;
+    this.indexValue = indexValue;
+    this.key = key;
+    this.existingKey = existingKey ?? null;
   }
 }
 
@@ -188,6 +219,10 @@ export interface MigrationStatus {
 // ---------------------------------------------------------------------------
 
 export interface QueryEngine<TOptions = Record<string, unknown>> {
+  capabilities?: {
+    uniqueConstraints: "atomic" | "none";
+  };
+
   get(collection: string, key: string, options?: TOptions): Promise<unknown>;
 
   /**
@@ -201,6 +236,7 @@ export interface QueryEngine<TOptions = Record<string, unknown>> {
     indexes: ResolvedIndexKeys,
     options?: TOptions,
     migrationMetadata?: MigrationDocumentMetadata,
+    uniqueIndexes?: ResolvedIndexKeys,
   ): Promise<void>;
 
   put(
@@ -210,6 +246,7 @@ export interface QueryEngine<TOptions = Record<string, unknown>> {
     indexes: ResolvedIndexKeys,
     options?: TOptions,
     migrationMetadata?: MigrationDocumentMetadata,
+    uniqueIndexes?: ResolvedIndexKeys,
   ): Promise<void>;
 
   /**
@@ -223,6 +260,7 @@ export interface QueryEngine<TOptions = Record<string, unknown>> {
     indexes: ResolvedIndexKeys,
     options?: TOptions,
     migrationMetadata?: MigrationDocumentMetadata,
+    uniqueIndexes?: ResolvedIndexKeys,
   ): Promise<void>;
 
   delete(collection: string, key: string, options?: TOptions): Promise<void>;
