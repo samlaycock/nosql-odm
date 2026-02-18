@@ -1,6 +1,7 @@
 import {
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
+  EngineUniqueConstraintError,
   type MigrationDocumentMetadata,
   type QueryEngine,
   type QueryParams,
@@ -144,6 +145,59 @@ export class DocumentAlreadyExistsError extends Error {
   constructor(collection: string, key: string) {
     super(`Document "${key}" already exists in model "${collection}"`);
     this.name = "DocumentAlreadyExistsError";
+  }
+}
+
+export class UniqueConstraintError extends Error {
+  readonly collection: string;
+  readonly key: string;
+  readonly indexName: string;
+  readonly indexValue: string;
+  readonly existingKey: string | null;
+
+  constructor(
+    collection: string,
+    key: string,
+    indexName: string,
+    indexValue: string,
+    existingKey?: string | null,
+  ) {
+    super(
+      `Unique index "${indexName}" violation in model "${collection}" for value "${indexValue}"`,
+    );
+    this.name = "UniqueConstraintError";
+    this.collection = collection;
+    this.key = key;
+    this.indexName = indexName;
+    this.indexValue = indexValue;
+    this.existingKey = existingKey ?? null;
+  }
+}
+
+export class MigrationProjectionError extends Error {
+  readonly collection: string;
+  readonly key: string | null;
+  readonly reason: ProjectionSkipReason;
+  override readonly cause?: unknown;
+
+  constructor(
+    collection: string,
+    reason: ProjectionSkipReason,
+    key?: string,
+    options?: {
+      cause?: unknown;
+    },
+  ) {
+    super(
+      `Migration projection failed for model "${collection}"${
+        key ? ` and key "${key}"` : ""
+      }: ${reason}`,
+    );
+    this.name = "MigrationProjectionError";
+    this.collection = collection;
+    this.key = key ?? null;
+    this.reason = reason;
+    this.cause = options?.cause;
   }
 }
 
@@ -304,6 +358,7 @@ class BoundModelImpl<
     const projected = await this.model.projectToLatest(raw as Record<string, unknown>);
 
     if (!projected.ok) {
+      this.maybeThrowProjectionError(projected.reason, key, projected.error);
       return null;
     }
 
@@ -327,6 +382,7 @@ class BoundModelImpl<
       const projected = await this.model.projectToLatest(rawDoc as Record<string, unknown>);
 
       if (!projected.ok) {
+        this.maybeThrowProjectionError(projected.reason, key, projected.error);
         continue;
       }
 
@@ -346,13 +402,31 @@ class BoundModelImpl<
     const validated = await this.model.validate(data);
     const doc = this.stamp(validated as object, key);
     const indexes = this.model.resolveIndexKeys(validated);
+    const uniqueIndexes = this.model.resolveUniqueIndexKeys(validated);
     const migrationMetadata = this.currentMigrationMetadata();
 
     try {
-      await this.engine.create(this.model.name, key, doc, indexes, options, migrationMetadata);
+      await this.engine.create(
+        this.model.name,
+        key,
+        doc,
+        indexes,
+        options,
+        migrationMetadata,
+        uniqueIndexes,
+      );
     } catch (error) {
       if (error instanceof EngineDocumentAlreadyExistsError) {
         throw new DocumentAlreadyExistsError(this.model.name, key);
+      }
+      if (error instanceof EngineUniqueConstraintError) {
+        throw new UniqueConstraintError(
+          this.model.name,
+          key,
+          error.indexName,
+          error.indexValue,
+          error.existingKey,
+        );
       }
 
       throw error;
@@ -375,6 +449,7 @@ class BoundModelImpl<
     if (projected.ok) {
       current = projected.value as Record<string, unknown>;
     } else {
+      this.maybeThrowProjectionError(projected.reason, key, projected.error);
       // Ignore migration failures on read/merge path and attempt to apply the
       // update against the stored document as-is.
       current = existingDoc;
@@ -384,13 +459,31 @@ class BoundModelImpl<
     const validated = await this.model.validate(merged);
     const doc = this.stamp(validated as object, key);
     const indexes = this.model.resolveIndexKeys(validated);
+    const uniqueIndexes = this.model.resolveUniqueIndexKeys(validated);
     const migrationMetadata = this.currentMigrationMetadata();
 
     try {
-      await this.engine.update(this.model.name, key, doc, indexes, options, migrationMetadata);
+      await this.engine.update(
+        this.model.name,
+        key,
+        doc,
+        indexes,
+        options,
+        migrationMetadata,
+        uniqueIndexes,
+      );
     } catch (error) {
       if (error instanceof EngineDocumentNotFoundError) {
         throw new Error(`Document "${key}" not found in model "${this.model.name}"`);
+      }
+      if (error instanceof EngineUniqueConstraintError) {
+        throw new UniqueConstraintError(
+          this.model.name,
+          key,
+          error.indexName,
+          error.indexValue,
+          error.existingKey,
+        );
       }
 
       throw error;
@@ -412,6 +505,7 @@ class BoundModelImpl<
       const projected = await this.model.projectToLatest(rawDoc as Record<string, unknown>);
 
       if (!projected.ok) {
+        this.maybeThrowProjectionError(projected.reason, key, projected.error);
         continue;
       }
 
@@ -433,6 +527,7 @@ class BoundModelImpl<
       validated: T;
       doc: object;
       indexes: Record<string, string>;
+      uniqueIndexes: Record<string, string>;
       migrationMetadata: MigrationDocumentMetadata;
     }[] = [];
 
@@ -448,20 +543,36 @@ class BoundModelImpl<
         validated,
         doc: this.stamp(validated as object, item.key),
         indexes: this.model.resolveIndexKeys(validated),
+        uniqueIndexes: this.model.resolveUniqueIndexKeys(validated),
         migrationMetadata: this.currentMigrationMetadata(),
       });
     }
 
-    await this.engine.batchSet(
-      this.model.name,
-      prepared.map((item) => ({
-        key: item.key,
-        doc: item.doc,
-        indexes: item.indexes,
-        migrationMetadata: item.migrationMetadata,
-      })),
-      options,
-    );
+    try {
+      await this.engine.batchSet(
+        this.model.name,
+        prepared.map((item) => ({
+          key: item.key,
+          doc: item.doc,
+          indexes: item.indexes,
+          uniqueIndexes: item.uniqueIndexes,
+          migrationMetadata: item.migrationMetadata,
+        })),
+        options,
+      );
+    } catch (error) {
+      if (error instanceof EngineUniqueConstraintError) {
+        throw new UniqueConstraintError(
+          this.model.name,
+          error.key,
+          error.indexName,
+          error.indexValue,
+          error.existingKey,
+        );
+      }
+
+      throw error;
+    }
 
     return prepared.map((item) => item.validated);
   }
@@ -581,10 +692,25 @@ class BoundModelImpl<
       key: item.key,
       doc: this.stamp(item.value as object, item.key),
       indexes: this.model.resolveIndexKeys(item.value),
+      uniqueIndexes: this.model.resolveUniqueIndexKeys(item.value),
       migrationMetadata: this.currentMigrationMetadata(),
     }));
 
-    await this.engine.batchSet(this.model.name, prepared, options);
+    try {
+      await this.engine.batchSet(this.model.name, prepared, options);
+    } catch (error) {
+      if (error instanceof EngineUniqueConstraintError) {
+        throw new UniqueConstraintError(
+          this.model.name,
+          error.key,
+          error.indexName,
+          error.indexValue,
+          error.existingKey,
+        );
+      }
+
+      throw error;
+    }
   }
 
   private migrationCriteria(): MigrationCriteria {
@@ -602,17 +728,41 @@ class BoundModelImpl<
     return {
       collection: this.model.name,
       criteria: this.migrationCriteria(),
-      project: (doc) => this.model.projectToLatest(doc),
+      project: async (doc) => {
+        const projected = await this.model.projectToLatest(doc);
+
+        if (!projected.ok && this.shouldThrowProjectionErrors()) {
+          throw this.createProjectionError(projected.reason, undefined, projected.error);
+        }
+
+        return projected;
+      },
       toBatchSetItem: (key, value) => ({
         key,
         doc: this.stamp(value as object, key),
         indexes: this.model.resolveIndexKeys(value as T),
+        uniqueIndexes: this.model.resolveUniqueIndexKeys(value as T),
         migrationMetadata: this.currentMigrationMetadata(),
       }),
-      persist: (items) =>
-        this.engine.batchSetWithResult
-          ? this.engine.batchSetWithResult(this.model.name, items)
-          : this.engine.batchSet(this.model.name, items),
+      persist: async (items) => {
+        try {
+          return this.engine.batchSetWithResult
+            ? this.engine.batchSetWithResult(this.model.name, items)
+            : this.engine.batchSet(this.model.name, items);
+        } catch (error) {
+          if (error instanceof EngineUniqueConstraintError) {
+            throw new UniqueConstraintError(
+              this.model.name,
+              error.key,
+              error.indexName,
+              error.indexValue,
+              error.existingKey,
+            );
+          }
+
+          throw error;
+        }
+      },
     };
   }
 
@@ -637,6 +787,34 @@ class BoundModelImpl<
     }
 
     return this.migrator;
+  }
+
+  private shouldThrowProjectionErrors(): boolean {
+    return this.model.options.migrationErrors === "throw";
+  }
+
+  private maybeThrowProjectionError(
+    reason: ProjectionSkipReason,
+    key?: string,
+    cause?: unknown,
+  ): void {
+    if (!this.shouldThrowProjectionErrors()) {
+      return;
+    }
+
+    throw this.createProjectionError(reason, key, cause);
+  }
+
+  private createProjectionError(
+    reason: ProjectionSkipReason,
+    key?: string,
+    cause?: unknown,
+  ): MigrationProjectionError {
+    if (cause instanceof MigrationProjectionError) {
+      return cause;
+    }
+
+    return new MigrationProjectionError(this.model.name, reason, key, { cause });
   }
 
   // Resolves query params: `where` shorthand → `index`/`filter`, or pass through
@@ -772,6 +950,14 @@ export function createStore<
   for (const modelDef of models) {
     if (boundModels.has(modelDef.name)) {
       throw new Error(`Duplicate model name: "${modelDef.name}"`);
+    }
+
+    const hasUniqueIndexes = modelDef.indexes.some((index) => index.unique === true);
+
+    if (hasUniqueIndexes && engine.capabilities?.uniqueConstraints !== "atomic") {
+      throw new Error(
+        `Model "${modelDef.name}" declares unique indexes, but the configured engine does not support atomic unique constraints`,
+      );
     }
 
     boundModels.set(modelDef.name, new BoundModelImpl(modelDef, engine, migrator));

@@ -1,6 +1,7 @@
 import {
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
+  EngineUniqueConstraintError,
   type QueryEngine,
   type QueryParams,
   type EngineQueryResult,
@@ -18,6 +19,7 @@ import { DefaultMigrator } from "../migrator";
 interface StoredDocument {
   doc: Record<string, unknown>;
   indexes: ResolvedIndexKeys;
+  uniqueIndexes: ResolvedIndexKeys;
 }
 
 // ---------------------------------------------------------------------------
@@ -38,6 +40,7 @@ export interface MemoryEngineOptions {
 
 export function memoryEngine(options?: MemoryEngineOptions): MemoryQueryEngine {
   const collections = new Map<string, Map<string, StoredDocument>>();
+  const uniqueOwnership = new Map<string, Map<string, Map<string, string>>>();
   const locks = new Map<string, MigrationLock>();
   const checkpoints = new Map<string, string>();
   let engineOptions = options ?? {};
@@ -53,7 +56,79 @@ export function memoryEngine(options?: MemoryEngineOptions): MemoryQueryEngine {
     return col;
   }
 
+  function cloneUniqueOwnershipState(
+    state: Map<string, Map<string, string>>,
+  ): Map<string, Map<string, string>> {
+    const cloned = new Map<string, Map<string, string>>();
+
+    for (const [indexName, values] of state) {
+      cloned.set(indexName, new Map(values));
+    }
+
+    return cloned;
+  }
+
+  function getCollectionUniqueOwnership(collection: string): Map<string, Map<string, string>> {
+    let state = uniqueOwnership.get(collection);
+
+    if (!state) {
+      state = new Map();
+      uniqueOwnership.set(collection, state);
+    }
+
+    return state;
+  }
+
+  function reserveUniqueIndexes(
+    collection: string,
+    key: string,
+    nextUniqueIndexes: ResolvedIndexKeys,
+    collectionUniqueState: Map<string, Map<string, string>>,
+  ): void {
+    for (const [indexName, indexValue] of Object.entries(nextUniqueIndexes)) {
+      let ownerByValue = collectionUniqueState.get(indexName);
+
+      if (!ownerByValue) {
+        ownerByValue = new Map();
+        collectionUniqueState.set(indexName, ownerByValue);
+      }
+
+      const existingKey = ownerByValue.get(indexValue);
+
+      if (existingKey && existingKey !== key) {
+        throw new EngineUniqueConstraintError(collection, key, indexName, indexValue, existingKey);
+      }
+    }
+
+    for (const [indexName, ownerByValue] of collectionUniqueState) {
+      for (const [indexValue, ownerKey] of ownerByValue) {
+        if (ownerKey === key) {
+          ownerByValue.delete(indexValue);
+        }
+      }
+
+      if (ownerByValue.size === 0) {
+        collectionUniqueState.delete(indexName);
+      }
+    }
+
+    for (const [indexName, indexValue] of Object.entries(nextUniqueIndexes)) {
+      let ownerByValue = collectionUniqueState.get(indexName);
+
+      if (!ownerByValue) {
+        ownerByValue = new Map();
+        collectionUniqueState.set(indexName, ownerByValue);
+      }
+
+      ownerByValue.set(indexValue, key);
+    }
+  }
+
   const engine: MemoryQueryEngine = {
+    capabilities: {
+      uniqueConstraints: "atomic",
+    },
+
     setOptions(newOptions: MemoryEngineOptions) {
       engineOptions = newOptions;
     },
@@ -65,49 +140,67 @@ export function memoryEngine(options?: MemoryEngineOptions): MemoryQueryEngine {
       return stored ? structuredClone(stored.doc) : null;
     },
 
-    async create(collection, key, doc, indexes) {
+    async create(collection, key, doc, indexes, _options, _migrationMetadata, uniqueIndexes) {
       engineOptions.onBeforePut?.(collection, key, doc);
 
       const col = getCollection(collection);
+      const collectionUniqueState = getCollectionUniqueOwnership(collection);
 
       if (col.has(key)) {
         throw new EngineDocumentAlreadyExistsError(collection, key);
       }
 
-      col.set(key, {
-        doc: structuredClone(doc) as Record<string, unknown>,
-        indexes: { ...indexes },
-      });
-    },
-
-    async put(collection, key, doc, indexes) {
-      engineOptions.onBeforePut?.(collection, key, doc);
-
-      const col = getCollection(collection);
+      reserveUniqueIndexes(collection, key, uniqueIndexes ?? {}, collectionUniqueState);
 
       col.set(key, {
         doc: structuredClone(doc) as Record<string, unknown>,
         indexes: { ...indexes },
+        uniqueIndexes: { ...uniqueIndexes },
       });
     },
 
-    async update(collection, key, doc, indexes) {
+    async put(collection, key, doc, indexes, _options, _migrationMetadata, uniqueIndexes) {
       engineOptions.onBeforePut?.(collection, key, doc);
 
       const col = getCollection(collection);
+      const collectionUniqueState = getCollectionUniqueOwnership(collection);
+
+      reserveUniqueIndexes(collection, key, uniqueIndexes ?? {}, collectionUniqueState);
+
+      col.set(key, {
+        doc: structuredClone(doc) as Record<string, unknown>,
+        indexes: { ...indexes },
+        uniqueIndexes: { ...uniqueIndexes },
+      });
+    },
+
+    async update(collection, key, doc, indexes, _options, _migrationMetadata, uniqueIndexes) {
+      engineOptions.onBeforePut?.(collection, key, doc);
+
+      const col = getCollection(collection);
+      const collectionUniqueState = getCollectionUniqueOwnership(collection);
 
       if (!col.has(key)) {
         throw new EngineDocumentNotFoundError(collection, key);
       }
 
+      reserveUniqueIndexes(collection, key, uniqueIndexes ?? {}, collectionUniqueState);
+
       col.set(key, {
         doc: structuredClone(doc) as Record<string, unknown>,
         indexes: { ...indexes },
+        uniqueIndexes: { ...uniqueIndexes },
       });
     },
 
     async delete(collection, key) {
       const col = getCollection(collection);
+      const collectionUniqueState = getCollectionUniqueOwnership(collection);
+      const existing = col.get(key);
+
+      if (existing) {
+        reserveUniqueIndexes(collection, key, {}, collectionUniqueState);
+      }
 
       col.delete(key);
     },
@@ -135,21 +228,36 @@ export function memoryEngine(options?: MemoryEngineOptions): MemoryQueryEngine {
 
     async batchSet(collection, items) {
       const col = getCollection(collection);
+      const collectionUniqueState = getCollectionUniqueOwnership(collection);
+      const stagedUniqueState = cloneUniqueOwnershipState(collectionUniqueState);
+
+      // Validate unique constraints for the whole batch up front so duplicate
+      // unique values fail before any write is applied.
+      for (const item of items) {
+        reserveUniqueIndexes(collection, item.key, item.uniqueIndexes ?? {}, stagedUniqueState);
+      }
 
       for (const item of items) {
         engineOptions.onBeforePut?.(collection, item.key, item.doc);
 
+        reserveUniqueIndexes(collection, item.key, item.uniqueIndexes ?? {}, collectionUniqueState);
+
         col.set(item.key, {
           doc: structuredClone(item.doc) as Record<string, unknown>,
           indexes: { ...item.indexes },
+          uniqueIndexes: { ...item.uniqueIndexes },
         });
       }
     },
 
     async batchDelete(collection, keys) {
       const col = getCollection(collection);
+      const collectionUniqueState = getCollectionUniqueOwnership(collection);
 
       for (const key of keys) {
+        if (col.has(key)) {
+          reserveUniqueIndexes(collection, key, {}, collectionUniqueState);
+        }
         col.delete(key);
       }
     },

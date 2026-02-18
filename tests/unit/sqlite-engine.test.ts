@@ -5,6 +5,7 @@ import { sqliteEngine } from "../../src/engines/sqlite";
 import {
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
+  EngineUniqueConstraintError,
   type QueryEngine,
 } from "../../src/engines/types";
 
@@ -461,6 +462,101 @@ describe("update()", () => {
     } catch (error) {
       expect(error).toBeInstanceOf(EngineDocumentNotFoundError);
     }
+  });
+});
+
+describe("unique constraints", () => {
+  test("create enforces unique index values", async () => {
+    await engine.create(
+      "users",
+      "u1",
+      { id: "u1", email: "sam@example.com" },
+      { byEmail: "sam@example.com" },
+      undefined,
+      undefined,
+      { byEmail: "sam@example.com" },
+    );
+
+    try {
+      await engine.create(
+        "users",
+        "u2",
+        { id: "u2", email: "sam@example.com" },
+        { byEmail: "sam@example.com" },
+        undefined,
+        undefined,
+        { byEmail: "sam@example.com" },
+      );
+      throw new Error("expected create to fail with unique constraint error");
+    } catch (error) {
+      expect(error).toBeInstanceOf(EngineUniqueConstraintError);
+    }
+  });
+
+  test("update enforces unique index values", async () => {
+    await engine.put(
+      "users",
+      "u1",
+      { id: "u1", email: "sam@example.com" },
+      { byEmail: "sam@example.com" },
+      undefined,
+      undefined,
+      { byEmail: "sam@example.com" },
+    );
+    await engine.put(
+      "users",
+      "u2",
+      { id: "u2", email: "jamie@example.com" },
+      { byEmail: "jamie@example.com" },
+      undefined,
+      undefined,
+      { byEmail: "jamie@example.com" },
+    );
+
+    try {
+      await engine.update(
+        "users",
+        "u2",
+        { id: "u2", email: "sam@example.com" },
+        { byEmail: "sam@example.com" },
+        undefined,
+        undefined,
+        { byEmail: "sam@example.com" },
+      );
+      throw new Error("expected update to fail with unique constraint error");
+    } catch (error) {
+      expect(error).toBeInstanceOf(EngineUniqueConstraintError);
+    }
+
+    expect(await engine.get("users", "u2")).toEqual({
+      id: "u2",
+      email: "jamie@example.com",
+    });
+  });
+
+  test("batchSet enforces unique index values atomically", async () => {
+    try {
+      await engine.batchSet!("users", [
+        {
+          key: "u1",
+          doc: { id: "u1", email: "sam@example.com" },
+          indexes: { byEmail: "sam@example.com" },
+          uniqueIndexes: { byEmail: "sam@example.com" },
+        },
+        {
+          key: "u2",
+          doc: { id: "u2", email: "sam@example.com" },
+          indexes: { byEmail: "sam@example.com" },
+          uniqueIndexes: { byEmail: "sam@example.com" },
+        },
+      ]);
+      throw new Error("expected batchSet to fail with unique constraint error");
+    } catch (error) {
+      expect(error).toBeInstanceOf(EngineUniqueConstraintError);
+    }
+
+    expect(await engine.get("users", "u1")).toBeNull();
+    expect(await engine.get("users", "u2")).toBeNull();
   });
 });
 

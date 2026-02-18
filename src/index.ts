@@ -5,6 +5,7 @@ export {
   VersionError,
   MigrationError,
   type MigrationStrategy,
+  type MigrationErrorMode,
   type ModelOptions,
   type SchemaOptions,
   type VersionValue,
@@ -23,9 +24,11 @@ export {
 export {
   createStore,
   DocumentAlreadyExistsError,
+  MigrationProjectionError,
   MigrationAlreadyRunningError,
   MissingMigratorError,
   MigrationScopeConflictError,
+  UniqueConstraintError,
   type QueryResult,
   type BatchSetInputItem,
   type MigrationResult,
@@ -42,7 +45,11 @@ export {
 
 export { DefaultMigrator } from "./migrator";
 
-export { EngineDocumentAlreadyExistsError, EngineDocumentNotFoundError } from "./engines/types";
+export {
+  EngineDocumentAlreadyExistsError,
+  EngineDocumentNotFoundError,
+  EngineUniqueConstraintError,
+} from "./engines/types";
 
 export type {
   ComparableVersion,
