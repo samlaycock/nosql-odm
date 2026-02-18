@@ -1,0 +1,37 @@
+name: 🧪💾 IndexedDB Integration
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/store.ts"
+      - "src/model.ts"
+      - "src/migrator.ts"
+      - "src/engines/types.ts"
+      - "src/engines/indexeddb.ts"
+      - "tests/integration/indexeddb-engine.test.ts"
+      - ".github/workflows/integration-indexeddb.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-indexeddb:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Run IndexedDB integration tests
+        run: bun run test:integration:indexeddb
