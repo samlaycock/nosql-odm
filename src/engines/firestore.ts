@@ -1,3 +1,4 @@
+import { DefaultMigrator } from "../migrator";
 import {
   type BatchSetResult,
   EngineDocumentAlreadyExistsError,
@@ -14,7 +15,6 @@ import {
   type QueryParams,
   type ResolvedIndexKeys,
 } from "./types";
-import { DefaultMigrator } from "../migrator";
 
 const DEFAULT_DOCUMENTS_COLLECTION = "nosql_odm_documents";
 const DEFAULT_METADATA_COLLECTION = "nosql_odm_metadata";

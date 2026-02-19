@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import * as z from "zod";
+
 import { model, ModelDefinition, ValidationError, VersionError } from "../../src/model";
 
 // ---------------------------------------------------------------------------

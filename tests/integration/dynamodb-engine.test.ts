@@ -1,13 +1,4 @@
 import {
-  afterAll,
-  beforeAll,
-  beforeEach,
-  describe,
-  expect,
-  setDefaultTimeout,
-  test,
-} from "bun:test";
-import {
   CreateTableCommand,
   DeleteTableCommand,
   DynamoDBClient,
@@ -16,6 +7,16 @@ import {
   waitUntilTableNotExists,
 } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, PutCommand } from "@aws-sdk/lib-dynamodb";
+import {
+  afterAll,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  setDefaultTimeout,
+  test,
+} from "bun:test";
+
 import { dynamoDbEngine, type DynamoDbQueryEngine } from "../../src/engines/dynamodb";
 import {
   EngineDocumentAlreadyExistsError,

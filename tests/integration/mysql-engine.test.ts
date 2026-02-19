@@ -8,6 +8,7 @@ import {
   test,
 } from "bun:test";
 import { createPool, type Pool } from "mysql2/promise";
+
 import { mySqlEngine, type MySqlQueryEngine } from "../../src/engines/mysql";
 import {
   EngineDocumentAlreadyExistsError,

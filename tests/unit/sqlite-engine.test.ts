@@ -1,6 +1,8 @@
-import { describe, expect, test, beforeEach, afterEach } from "bun:test";
-import { Database as BunDatabase } from "bun:sqlite";
 import type BetterSqlite3 from "better-sqlite3";
+
+import { Database as BunDatabase } from "bun:sqlite";
+import { describe, expect, test, beforeEach, afterEach } from "bun:test";
+
 import { sqliteEngine } from "../../src/engines/sqlite";
 import {
   EngineDocumentAlreadyExistsError,

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { indexedDB as fakeIndexedDB } from "fake-indexeddb";
+
 import { indexedDbEngine, type IndexedDbQueryEngine } from "../../src/engines/indexeddb";
 import {
   EngineDocumentAlreadyExistsError,

@@ -8,6 +8,7 @@ import {
   test,
 } from "bun:test";
 import { Client } from "cassandra-driver";
+
 import { cassandraEngine, type CassandraQueryEngine } from "../../src/engines/cassandra";
 import {
   EngineDocumentAlreadyExistsError,

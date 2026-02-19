@@ -1,3 +1,4 @@
+import { DefaultMigrator } from "../migrator";
 import {
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
@@ -10,7 +11,6 @@ import {
   type FieldCondition,
   type MigrationLock,
 } from "./types";
-import { DefaultMigrator } from "../migrator";
 
 // ---------------------------------------------------------------------------
 // Types

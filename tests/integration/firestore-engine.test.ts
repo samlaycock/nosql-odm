@@ -1,3 +1,4 @@
+import { Firestore } from "@google-cloud/firestore";
 import {
   afterAll,
   beforeAll,
@@ -8,7 +9,7 @@ import {
   test,
 } from "bun:test";
 import { generateKeyPairSync } from "node:crypto";
-import { Firestore } from "@google-cloud/firestore";
+
 import { firestoreEngine, type FirestoreQueryEngine } from "../../src/engines/firestore";
 import {
   EngineDocumentAlreadyExistsError,

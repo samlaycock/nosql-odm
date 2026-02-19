@@ -1,3 +1,4 @@
+import { DefaultMigrator } from "../migrator";
 import {
   type BatchSetItem,
   type BatchSetResult,
@@ -15,7 +16,6 @@ import {
   type QueryParams,
   type ResolvedIndexKeys,
 } from "./types";
-import { DefaultMigrator } from "../migrator";
 
 const DEFAULT_DOCUMENTS_TABLE = "nosql_odm_documents";
 const DEFAULT_METADATA_TABLE = "nosql_odm_metadata";
