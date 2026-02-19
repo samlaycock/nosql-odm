@@ -1,13 +1,15 @@
-name: 🧪💾 Memory Integration
+name: 🧪🧠 Memory Integration
 
 on:
   pull_request:
     branches: [main]
     paths:
+      # Shared core files - changes to these affect all adapters
       - "src/store.ts"
       - "src/model.ts"
       - "src/migrator.ts"
       - "src/engines/types.ts"
+      # Adapter-specific files
       - "src/engines/memory.ts"
       - "tests/integration/memory-engine.test.ts"
       - ".github/workflows/integration-memory.yml"
