@@ -1,4 +1,6 @@
 import type Database from "better-sqlite3";
+
+import { DefaultMigrator } from "../migrator";
 import {
   type BatchSetResult,
   EngineDocumentAlreadyExistsError,
@@ -17,7 +19,6 @@ import {
   type QueryParams,
   type ResolvedIndexKeys,
 } from "./types";
-import { DefaultMigrator } from "../migrator";
 
 const LATEST_SCHEMA_VERSION = 2;
 const OUTDATED_PAGE_LIMIT = 100;

@@ -1,5 +1,13 @@
 import { describe, expect, test, beforeEach } from "bun:test";
 import * as z from "zod";
+
+import { memoryEngine, type MemoryQueryEngine } from "../../src/engines/memory";
+import {
+  EngineDocumentAlreadyExistsError,
+  EngineDocumentNotFoundError,
+  type QueryEngine,
+} from "../../src/engines/types";
+import { DefaultMigrator } from "../../src/migrator";
 import { model, ValidationError } from "../../src/model";
 import {
   createStore,
@@ -9,13 +17,6 @@ import {
   MigrationScopeConflictError,
   UniqueConstraintError,
 } from "../../src/store";
-import { memoryEngine, type MemoryQueryEngine } from "../../src/engines/memory";
-import { DefaultMigrator } from "../../src/migrator";
-import {
-  EngineDocumentAlreadyExistsError,
-  EngineDocumentNotFoundError,
-  type QueryEngine,
-} from "../../src/engines/types";
 
 // ---------------------------------------------------------------------------
 // Helpers

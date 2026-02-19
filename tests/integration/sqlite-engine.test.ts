@@ -1,6 +1,8 @@
-import { afterEach, beforeEach } from "bun:test";
-import { Database as BunDatabase } from "bun:sqlite";
 import type BetterSqlite3 from "better-sqlite3";
+
+import { Database as BunDatabase } from "bun:sqlite";
+import { afterEach, beforeEach } from "bun:test";
+
 import { sqliteEngine, type SqliteQueryEngine } from "../../src/engines/sqlite";
 import { createCollectionNameFactory } from "./helpers";
 import { runMigrationIntegrationSuite } from "./migration-suite";

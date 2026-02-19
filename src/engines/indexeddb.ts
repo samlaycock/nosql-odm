@@ -1,3 +1,4 @@
+import { DefaultMigrator } from "../migrator";
 import {
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
@@ -10,7 +11,6 @@ import {
   type QueryParams,
   type ResolvedIndexKeys,
 } from "./types";
-import { DefaultMigrator } from "../migrator";
 
 // ---------------------------------------------------------------------------
 // Public options / types

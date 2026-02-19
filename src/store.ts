@@ -1,3 +1,5 @@
+import type { ProjectionSkipReason } from "./model";
+
 import {
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
@@ -10,8 +12,6 @@ import {
   type MigrationCriteria,
   type MigrationStatus,
 } from "./engines/types";
-import type { ProjectionSkipReason } from "./model";
-import { ModelDefinition } from "./model";
 import {
   DefaultMigrator,
   type MigrationHooks,
@@ -23,6 +23,7 @@ import {
   type MigrationScope,
   MigrationScopeConflictError,
 } from "./migrator";
+import { ModelDefinition } from "./model";
 
 export type {
   MigrationHooks,

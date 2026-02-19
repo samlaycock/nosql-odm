@@ -11,6 +11,8 @@ import {
   type BatchWriteCommandInput,
   type QueryCommandInput,
 } from "@aws-sdk/lib-dynamodb";
+
+import { DefaultMigrator } from "../migrator";
 import {
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
@@ -25,7 +27,6 @@ import {
   type QueryParams,
   type ResolvedIndexKeys,
 } from "./types";
-import { DefaultMigrator } from "../migrator";
 
 const MAX_BATCH_WRITE = 25;
 const MAX_BATCH_GET = 100;

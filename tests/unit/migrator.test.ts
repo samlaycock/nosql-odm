@@ -1,7 +1,8 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import * as z from "zod";
-import { createStore, MigrationScopeConflictError, MissingMigratorError } from "../../src/store";
+
 import { memoryEngine, type MemoryQueryEngine } from "../../src/engines/memory";
+import { createStore, MigrationScopeConflictError, MissingMigratorError } from "../../src/store";
 
 function buildUserV2() {
   return model("user")
