@@ -1,13 +1,15 @@
-name: 🧪💾 IndexedDB Integration
+name: 🧪📇 IndexedDB Integration
 
 on:
   pull_request:
     branches: [main]
     paths:
+      # Shared core files - changes to these affect all adapters
       - "src/store.ts"
       - "src/model.ts"
       - "src/migrator.ts"
       - "src/engines/types.ts"
+      # Adapter-specific files
       - "src/engines/indexeddb.ts"
       - "tests/integration/indexeddb-engine.test.ts"
       - ".github/workflows/integration-indexeddb.yml"
