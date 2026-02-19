@@ -120,6 +120,10 @@ export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine
   const ready = ensureSchema(documentsCollection, metadataCollection);
 
   const engine: MongoDbQueryEngine = {
+    capabilities: {
+      uniqueConstraints: "atomic",
+    },
+
     async get(collection, key) {
       await ready;
 

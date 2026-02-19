@@ -21,6 +21,10 @@ interface MigrationIntegrationSuiteOptions<TOptions = Record<string, unknown>> {
 }
 
 interface MigrationBoundModelApi {
+  create(key: string, data: Record<string, unknown>): Promise<unknown>;
+  update(key: string, data: Record<string, unknown>): Promise<unknown>;
+  batchSet(items: { key: string; data: Record<string, unknown> }[]): Promise<unknown>;
+  findByKey(key: string): Promise<Record<string, unknown> | null>;
   getOrCreateMigration(options?: MigrationRunOptions): Promise<MigrationRunProgress>;
   migrateNextPage(options?: MigrationRunOptions): Promise<MigrationNextPageResult>;
   migrateAll(options?: MigrationRunOptions): Promise<MigrationResult>;
@@ -67,6 +71,21 @@ function buildUserModel(collection: string) {
     )
     .index({ name: "primary", value: "id" })
     .index({ name: "byEmail", value: "email" })
+    .build();
+}
+
+function buildUniqueUserModel(collection: string) {
+  return model(collection)
+    .schema(
+      1,
+      z.object({
+        id: z.string(),
+        name: z.string(),
+        email: z.email(),
+      }),
+    )
+    .index({ name: "primary", value: "id" })
+    .index({ name: "byEmail", value: "email", unique: true })
     .build();
 }
 
@@ -203,6 +222,80 @@ export function runMigrationIntegrationSuite<TOptions>(
     test("engine exposes a default migrator", () => {
       const engine = options.getEngine();
       expect(engine.migrator).toBeDefined();
+    });
+
+    test("store unique create rejects duplicate values", async () => {
+      const engine = options.getEngine();
+      const collection = options.nextCollection("users_unique_create");
+      const User = buildUniqueUserModel(collection);
+      const store = createStore(engine, [User]);
+      const users = getBoundModel(store, collection);
+
+      await users.create("u1", {
+        id: "u1",
+        name: "Sam",
+        email: "sam@example.com",
+      });
+
+      await expectReject(
+        users.create("u2", {
+          id: "u2",
+          name: "Other",
+          email: "sam@example.com",
+        }),
+        /Unique index .* violation/,
+      );
+    });
+
+    test("store unique update rejects duplicate values", async () => {
+      const engine = options.getEngine();
+      const collection = options.nextCollection("users_unique_update");
+      const User = buildUniqueUserModel(collection);
+      const store = createStore(engine, [User]);
+      const users = getBoundModel(store, collection);
+
+      await users.create("u1", {
+        id: "u1",
+        name: "Sam",
+        email: "sam@example.com",
+      });
+      await users.create("u2", {
+        id: "u2",
+        name: "Jamie",
+        email: "jamie@example.com",
+      });
+
+      await expectReject(
+        users.update("u2", {
+          email: "sam@example.com",
+        }),
+        /Unique index .* violation/,
+      );
+    });
+
+    test("store unique batchSet rejects duplicate values atomically", async () => {
+      const engine = options.getEngine();
+      const collection = options.nextCollection("users_unique_batch");
+      const User = buildUniqueUserModel(collection);
+      const store = createStore(engine, [User]);
+      const users = getBoundModel(store, collection);
+
+      await expectReject(
+        users.batchSet([
+          {
+            key: "u1",
+            data: { id: "u1", name: "Sam", email: "sam@example.com" },
+          },
+          {
+            key: "u2",
+            data: { id: "u2", name: "Other", email: "sam@example.com" },
+          },
+        ]),
+        /Unique index .* violation/,
+      );
+
+      expect(await users.findByKey("u1")).toBeNull();
+      expect(await users.findByKey("u2")).toBeNull();
     });
 
     test("model migrateAll migrates stale versions and reindexes latest docs", async () => {

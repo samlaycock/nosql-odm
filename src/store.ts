@@ -5,6 +5,7 @@ import {
   EngineDocumentNotFoundError,
   EngineUniqueConstraintError,
   type MigrationDocumentMetadata,
+  type MigrationLock,
   type QueryEngine,
   type QueryParams,
   type QueryFilter,
@@ -407,15 +408,17 @@ class BoundModelImpl<
     const migrationMetadata = this.currentMigrationMetadata();
 
     try {
-      await this.engine.create(
-        this.model.name,
-        key,
-        doc,
-        indexes,
-        options,
-        migrationMetadata,
-        uniqueIndexes,
-      );
+      await this.withUniqueConstraintGuard([{ key, uniqueIndexes }], options, async () => {
+        await this.engine.create(
+          this.model.name,
+          key,
+          doc,
+          indexes,
+          options,
+          migrationMetadata,
+          uniqueIndexes,
+        );
+      });
     } catch (error) {
       if (error instanceof EngineDocumentAlreadyExistsError) {
         throw new DocumentAlreadyExistsError(this.model.name, key);
@@ -464,15 +467,17 @@ class BoundModelImpl<
     const migrationMetadata = this.currentMigrationMetadata();
 
     try {
-      await this.engine.update(
-        this.model.name,
-        key,
-        doc,
-        indexes,
-        options,
-        migrationMetadata,
-        uniqueIndexes,
-      );
+      await this.withUniqueConstraintGuard([{ key, uniqueIndexes }], options, async () => {
+        await this.engine.update(
+          this.model.name,
+          key,
+          doc,
+          indexes,
+          options,
+          migrationMetadata,
+          uniqueIndexes,
+        );
+      });
     } catch (error) {
       if (error instanceof EngineDocumentNotFoundError) {
         throw new Error(`Document "${key}" not found in model "${this.model.name}"`);
@@ -550,16 +555,25 @@ class BoundModelImpl<
     }
 
     try {
-      await this.engine.batchSet(
-        this.model.name,
+      await this.withUniqueConstraintGuard(
         prepared.map((item) => ({
           key: item.key,
-          doc: item.doc,
-          indexes: item.indexes,
           uniqueIndexes: item.uniqueIndexes,
-          migrationMetadata: item.migrationMetadata,
         })),
         options,
+        async () => {
+          await this.engine.batchSet(
+            this.model.name,
+            prepared.map((item) => ({
+              key: item.key,
+              doc: item.doc,
+              indexes: item.indexes,
+              uniqueIndexes: item.uniqueIndexes,
+              migrationMetadata: item.migrationMetadata,
+            })),
+            options,
+          );
+        },
       );
     } catch (error) {
       if (error instanceof EngineUniqueConstraintError) {
@@ -698,7 +712,16 @@ class BoundModelImpl<
     }));
 
     try {
-      await this.engine.batchSet(this.model.name, prepared, options);
+      await this.withUniqueConstraintGuard(
+        prepared.map((item) => ({
+          key: item.key,
+          uniqueIndexes: item.uniqueIndexes,
+        })),
+        options,
+        async () => {
+          await this.engine.batchSet(this.model.name, prepared, options);
+        },
+      );
     } catch (error) {
       if (error instanceof EngineUniqueConstraintError) {
         throw new UniqueConstraintError(
@@ -747,9 +770,17 @@ class BoundModelImpl<
       }),
       persist: async (items) => {
         try {
-          return this.engine.batchSetWithResult
-            ? this.engine.batchSetWithResult(this.model.name, items)
-            : this.engine.batchSet(this.model.name, items);
+          return this.withUniqueConstraintGuard(
+            items.map((item) => ({
+              key: item.key,
+              uniqueIndexes: item.uniqueIndexes ?? {},
+            })),
+            undefined,
+            async () =>
+              this.engine.batchSetWithResult
+                ? this.engine.batchSetWithResult(this.model.name, items)
+                : this.engine.batchSet(this.model.name, items),
+          );
         } catch (error) {
           if (error instanceof EngineUniqueConstraintError) {
             throw new UniqueConstraintError(
@@ -816,6 +847,120 @@ class BoundModelImpl<
     }
 
     return new MigrationProjectionError(this.model.name, reason, key, { cause });
+  }
+
+  private async withUniqueConstraintGuard<R>(
+    candidates: readonly {
+      key: string;
+      uniqueIndexes: Record<string, string>;
+    }[],
+    options: TOptions | undefined,
+    operation: () => Promise<R>,
+  ): Promise<R> {
+    if (!candidates.some((candidate) => Object.keys(candidate.uniqueIndexes).length > 0)) {
+      return operation();
+    }
+
+    const lock = await this.acquireUniqueConstraintLock();
+
+    try {
+      await this.assertNoUniqueConstraintConflicts(candidates, options);
+      return await operation();
+    } finally {
+      await this.engine.migration.releaseLock(lock);
+    }
+  }
+
+  private async acquireUniqueConstraintLock(): Promise<MigrationLock> {
+    const collection = this.uniqueConstraintLockCollection();
+    const maxAttempts = 200;
+    const lockTtlMs = 30_000;
+    const delayMs = 10;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const lock = await this.engine.migration.acquireLock(collection, { ttl: lockTtlMs });
+
+      if (lock) {
+        return lock;
+      }
+
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, delayMs);
+      });
+    }
+
+    throw new Error(`Unable to acquire unique-constraint lock for model "${this.model.name}"`);
+  }
+
+  private uniqueConstraintLockCollection(): string {
+    return `${this.model.name}::__unique_constraints`;
+  }
+
+  private async assertNoUniqueConstraintConflicts(
+    candidates: readonly {
+      key: string;
+      uniqueIndexes: Record<string, string>;
+    }[],
+    options?: TOptions,
+  ): Promise<void> {
+    const candidateByKey = new Map<string, Record<string, string>>();
+    const ownerByIndexValue = new Map<string, string>();
+
+    for (const candidate of candidates) {
+      candidateByKey.set(candidate.key, candidate.uniqueIndexes);
+
+      for (const [indexName, indexValue] of Object.entries(candidate.uniqueIndexes)) {
+        const token = `${indexName}\u0000${indexValue}`;
+        const existingOwner = ownerByIndexValue.get(token);
+
+        if (existingOwner && existingOwner !== candidate.key) {
+          throw new UniqueConstraintError(
+            this.model.name,
+            candidate.key,
+            indexName,
+            indexValue,
+            existingOwner,
+          );
+        }
+
+        ownerByIndexValue.set(token, candidate.key);
+      }
+    }
+
+    for (const [token, ownerKey] of ownerByIndexValue) {
+      const separator = token.indexOf("\u0000");
+      const indexName = token.slice(0, separator);
+      const indexValue = token.slice(separator + 1);
+      const result = await this.engine.query(
+        this.model.name,
+        {
+          index: indexName,
+          filter: { value: indexValue },
+          limit: 10,
+        },
+        options,
+      );
+
+      for (const { key: existingKey } of result.documents) {
+        if (existingKey === ownerKey) {
+          continue;
+        }
+
+        const plannedForExisting = candidateByKey.get(existingKey);
+
+        if (plannedForExisting && plannedForExisting[indexName] !== indexValue) {
+          continue;
+        }
+
+        throw new UniqueConstraintError(
+          this.model.name,
+          ownerKey,
+          indexName,
+          indexValue,
+          existingKey,
+        );
+      }
+    }
   }
 
   // Resolves query params: `where` shorthand → `index`/`filter`, or pass through
