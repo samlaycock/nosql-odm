@@ -384,6 +384,10 @@ export function redisEngine(options: RedisEngineOptions): RedisQueryEngine {
   const keyPrefix = normalizePrefix(options.keyPrefix ?? DEFAULT_KEY_PREFIX);
 
   const engine: RedisQueryEngine = {
+    capabilities: {
+      uniqueConstraints: "atomic",
+    },
+
     async get(collection, key) {
       const record = await loadDocumentRecord(client, keyPrefix, collection, key);
 

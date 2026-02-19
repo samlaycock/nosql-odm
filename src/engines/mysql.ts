@@ -82,6 +82,10 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
   const ready = ensureSchema(client, refs);
 
   const engine: MySqlQueryEngine = {
+    capabilities: {
+      uniqueConstraints: "atomic",
+    },
+
     async get(collection, key) {
       await ready;
 

@@ -131,6 +131,10 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
   const dbPromise = openDatabase(factory, databaseName);
 
   const engine: IndexedDbQueryEngine = {
+    capabilities: {
+      uniqueConstraints: "atomic",
+    },
+
     close() {
       void dbPromise.then((db) => db.close()).catch(() => undefined);
     },

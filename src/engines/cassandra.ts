@@ -132,6 +132,10 @@ export function cassandraEngine(options: CassandraEngineOptions): CassandraQuery
   }
 
   const engine: CassandraQueryEngine = {
+    capabilities: {
+      uniqueConstraints: "atomic",
+    },
+
     async get(collection, key) {
       await ready;
 

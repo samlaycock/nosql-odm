@@ -215,6 +215,10 @@ export function dynamoDbEngine(options: DynamoDbEngineOptions): DynamoDbQueryEng
   const keyConfig = normalizeKeyConfig(options);
 
   const engine: DynamoDbQueryEngine = {
+    capabilities: {
+      uniqueConstraints: "atomic",
+    },
+
     async get(collection, key) {
       const item = await getDocumentItem(client, tableName, keyConfig, collection, key);
 

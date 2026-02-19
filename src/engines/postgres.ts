@@ -112,6 +112,10 @@ export function postgresEngine(options: PostgresEngineOptions): PostgresQueryEng
   const ready = ensureSchema(client, refs);
 
   const engine: PostgresQueryEngine = {
+    capabilities: {
+      uniqueConstraints: "atomic",
+    },
+
     async get(collection, key) {
       await ready;
 

@@ -116,6 +116,10 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
   );
 
   const engine: FirestoreQueryEngine = {
+    capabilities: {
+      uniqueConstraints: "atomic",
+    },
+
     async get(collection, key) {
       const raw = await documentRef(documentsCollection, collection, key).get();
       const snapshot = parseDocumentSnapshot(raw, "document record");
