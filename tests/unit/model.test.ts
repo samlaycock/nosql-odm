@@ -847,6 +847,27 @@ describe("edge cases", () => {
     });
   });
 
+  test("throws when static and dynamic indexes resolve to the same runtime name", () => {
+    const m = model("resource")
+      .schema(
+        1,
+        z.object({
+          id: z.string(),
+          email: z.string(),
+        }),
+      )
+      .index({ name: "byEmail", value: "email" })
+      .index("emailAlias_v1", {
+        name: () => "byEmail",
+        value: (data) => `${data.email}#${data.id}`,
+      })
+      .build();
+
+    expect(() => m.resolveIndexKeys({ id: "r1", email: "a@b.com" })).toThrow(
+      'Model "resource" resolved index-name collision for "byEmail" between static index name "byEmail" and dynamic index key "emailAlias_v1"',
+    );
+  });
+
   test("dynamic index name: builder requires key and definition", () => {
     expect(() => {
       model("resource")
@@ -889,6 +910,30 @@ describe("edge cases", () => {
       "us-east#user": "us-east#user#r1",
     });
     expect(m.indexNames).toEqual(["regionType_v1", "tenantType_v1"]);
+  });
+
+  test("throws when dynamic indexes resolve to the same runtime name", () => {
+    const m = model("resource")
+      .schema(
+        1,
+        z.object({
+          id: z.string(),
+          tenant: z.string(),
+        }),
+      )
+      .index("tenantUser_v1", {
+        name: (data) => `${data.tenant}#member`,
+        value: (data) => `${data.tenant}#user#${data.id}`,
+      })
+      .index("tenantRole_v1", {
+        name: (data) => `${data.tenant}#member`,
+        value: (data) => `${data.tenant}#role#${data.id}`,
+      })
+      .build();
+
+    expect(() => m.resolveIndexKeys({ id: "r1", tenant: "acme" })).toThrow(
+      'Model "resource" resolved index-name collision for "acme#member" between dynamic index key "tenantUser_v1" and dynamic index key "tenantRole_v1"',
+    );
   });
 
   test("dynamic index name returning empty string", () => {
