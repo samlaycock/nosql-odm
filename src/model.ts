@@ -533,24 +533,23 @@ class ModelBuilderImpl<
   }
 
   private validateIndexes(): void {
-    const staticIndexNames = new Set<string>();
-    const dynamicIndexKeys = new Set<string>();
+    const keyCategories = new Map<string, "static index name" | "dynamic index key">();
 
     for (const index of this.indexes) {
-      if (typeof index.name === "string") {
-        if (staticIndexNames.has(index.name)) {
-          throw new Error(`Model "${this.name}" has duplicate static index name "${index.name}"`);
+      const category = typeof index.name === "string" ? "static index name" : "dynamic index key";
+      const existingCategory = keyCategories.get(index.key);
+
+      if (existingCategory) {
+        if (existingCategory === category) {
+          throw new Error(`Model "${this.name}" has duplicate ${category} "${index.key}"`);
         }
 
-        staticIndexNames.add(index.name);
-        continue;
+        throw new Error(
+          `Model "${this.name}" has duplicate index key "${index.key}" shared by a ${existingCategory} and a ${category}`,
+        );
       }
 
-      if (dynamicIndexKeys.has(index.key)) {
-        throw new Error(`Model "${this.name}" has duplicate dynamic index key "${index.key}"`);
-      }
-
-      dynamicIndexKeys.add(index.key);
+      keyCategories.set(index.key, category);
     }
   }
 }
