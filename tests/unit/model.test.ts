@@ -227,6 +227,21 @@ describe("builder validation", () => {
         .build();
     }).toThrow('Model "user" has duplicate dynamic index key "tenantIdx_v1"');
   });
+
+  test("throws when static index name collides with dynamic index key", () => {
+    expect(() => {
+      model("user")
+        .schema(1, z.object({ id: z.string(), tenantId: z.string(), email: z.string() }))
+        .index({ name: "tenantIdx_v1", value: "email" })
+        .index("tenantIdx_v1", {
+          name: (data) => `tenant#${data.tenantId}`,
+          value: (data) => data.id,
+        })
+        .build();
+    }).toThrow(
+      'Model "user" has duplicate index key "tenantIdx_v1" shared by a static index name and a dynamic index key',
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------
