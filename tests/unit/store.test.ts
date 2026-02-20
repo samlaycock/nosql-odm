@@ -15,6 +15,7 @@ import {
   MigrationProjectionError,
   MigrationAlreadyRunningError,
   MigrationScopeConflictError,
+  type ProjectionSkippedEvent,
   UniqueConstraintError,
 } from "../../src/store";
 
@@ -3066,6 +3067,74 @@ describe("lazy migration error handling", () => {
     expect(raw.__v).toBe(1);
     expect(raw.value).toBe("test");
   });
+
+  test("emits projection skip events for ignored read/query skip paths", async () => {
+    await engine.put(
+      "broken",
+      "b1",
+      { __v: 1, id: "b1", value: "test" },
+      { primary: "b1", all: "yes" },
+    );
+
+    const events: ProjectionSkippedEvent[] = [];
+    const store = createStore(engine, [buildBrokenMigrationModel()], {
+      projectionHooks: {
+        onProjectionSkipped(event) {
+          events.push(event);
+        },
+      },
+    });
+
+    await store.broken.findByKey("b1");
+    await store.broken.query({
+      index: "all",
+      filter: { value: "yes" },
+    });
+    await store.broken.batchGet(["b1"]);
+
+    expect(
+      events.map((event) => ({
+        model: event.model,
+        key: event.key,
+        reason: event.reason,
+        operation: event.operation,
+      })),
+    ).toEqual([
+      {
+        model: "broken",
+        key: "b1",
+        reason: "validation_error",
+        operation: "findByKey",
+      },
+      {
+        model: "broken",
+        key: "b1",
+        reason: "validation_error",
+        operation: "query",
+      },
+      {
+        model: "broken",
+        key: "b1",
+        reason: "validation_error",
+        operation: "batchGet",
+      },
+    ]);
+  });
+
+  test("ignores projection hook errors and preserves default non-throwing behavior", async () => {
+    await engine.put("broken", "b1", { __v: 1, id: "b1", value: "test" }, { primary: "b1" });
+
+    const store = createStore(engine, [buildBrokenMigrationModel()], {
+      projectionHooks: {
+        onProjectionSkipped() {
+          throw new Error("projection hook failed");
+        },
+      },
+    });
+
+    const result = await store.broken.findByKey("b1");
+    expect(result).toBeNull();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -3165,6 +3234,22 @@ describe("strict migration error mode", () => {
     const store = createStore(engine, [buildStrictBrokenValidationModel()]);
 
     await expectReject(store.broken.migrateAll(), MigrationProjectionError);
+  });
+
+  test("does not emit projection skip events when strict mode throws", async () => {
+    await engine.put("broken", "b1", { __v: 1, id: "b1", value: "test" }, { primary: "b1" });
+
+    const events: ProjectionSkippedEvent[] = [];
+    const store = createStore(engine, [buildStrictBrokenValidationModel()], {
+      projectionHooks: {
+        onProjectionSkipped(event) {
+          events.push(event);
+        },
+      },
+    });
+
+    await expectReject(store.broken.findByKey("b1"), MigrationProjectionError);
+    expect(events).toEqual([]);
   });
 });
 
