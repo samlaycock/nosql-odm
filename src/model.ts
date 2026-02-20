@@ -522,12 +522,36 @@ class ModelBuilderImpl<
       throw new Error(`Model "${this.name}" must have at least one schema version`);
     }
 
+    this.validateIndexes();
+
     return new ModelDefinition<T, TOptions, TName, TStaticIndexNames, THasDynamicIndexes>(
       this.name,
       this.options,
       this.versions,
       this.indexes,
     );
+  }
+
+  private validateIndexes(): void {
+    const staticIndexNames = new Set<string>();
+    const dynamicIndexKeys = new Set<string>();
+
+    for (const index of this.indexes) {
+      if (typeof index.name === "string") {
+        if (staticIndexNames.has(index.name)) {
+          throw new Error(`Model "${this.name}" has duplicate static index name "${index.name}"`);
+        }
+
+        staticIndexNames.add(index.name);
+        continue;
+      }
+
+      if (dynamicIndexKeys.has(index.key)) {
+        throw new Error(`Model "${this.name}" has duplicate dynamic index key "${index.key}"`);
+      }
+
+      dynamicIndexKeys.add(index.key);
+    }
   }
 }
 

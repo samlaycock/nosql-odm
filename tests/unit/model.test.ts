@@ -201,6 +201,32 @@ describe("builder validation", () => {
         });
     }).toThrow("Schema version must be 2, got 3");
   });
+
+  test("throws on duplicate static index names", () => {
+    expect(() => {
+      model("user")
+        .schema(1, z.object({ id: z.string(), email: z.string() }))
+        .index({ name: "byEmail", value: "email" })
+        .index({ name: "byEmail", value: "id" })
+        .build();
+    }).toThrow('Model "user" has duplicate static index name "byEmail"');
+  });
+
+  test("throws on duplicate dynamic index keys", () => {
+    expect(() => {
+      model("user")
+        .schema(1, z.object({ id: z.string(), tenantId: z.string(), email: z.string() }))
+        .index("tenantIdx_v1", {
+          name: (data) => `tenant#${data.tenantId}`,
+          value: (data) => data.email,
+        })
+        .index("tenantIdx_v1", {
+          name: (data) => `id#${data.id}`,
+          value: (data) => data.id,
+        })
+        .build();
+    }).toThrow('Model "user" has duplicate dynamic index key "tenantIdx_v1"');
+  });
 });
 
 // ---------------------------------------------------------------------------
