@@ -60,6 +60,19 @@ export interface MigrationResult {
 
 export type MigrationSkipReason = ProjectionSkipReason | "concurrent_write";
 export type MigrationSkipReasons = Partial<Record<MigrationSkipReason, number>>;
+export type ProjectionSkipOperation = "findByKey" | "query" | "batchGet" | "update";
+
+export interface ProjectionSkippedEvent {
+  readonly model: string;
+  readonly key: string;
+  readonly reason: ProjectionSkipReason;
+  readonly operation: ProjectionSkipOperation;
+  readonly error?: unknown;
+}
+
+export interface ProjectionHooks {
+  onProjectionSkipped?(event: ProjectionSkippedEvent): void | Promise<void>;
+}
 
 type AnyString = string & {};
 
@@ -224,6 +237,7 @@ export { MigrationScopeConflictError };
 export interface CreateStoreOptions<TOptions = Record<string, unknown>> {
   migrator?: Migrator<TOptions>;
   migrationHooks?: MigrationHooks;
+  projectionHooks?: ProjectionHooks;
 }
 
 type JsonPrimitive = string | number | boolean | null;
@@ -339,15 +353,18 @@ class BoundModelImpl<
   private model: ModelDefinition<T, any, string, TStaticIndexNames, THasDynamicIndexes>;
   private engine: QueryEngine<TOptions>;
   private migrator: Migrator<TOptions> | null;
+  private projectionHooks: ProjectionHooks | undefined;
 
   constructor(
     model: ModelDefinition<T, any, string, TStaticIndexNames, THasDynamicIndexes>,
     engine: QueryEngine<TOptions>,
     migrator: Migrator<TOptions> | null,
+    projectionHooks?: ProjectionHooks,
   ) {
     this.model = model;
     this.engine = engine;
     this.migrator = migrator;
+    this.projectionHooks = projectionHooks;
   }
 
   async findByKey(key: string, options?: TOptions): Promise<T | null> {
@@ -360,7 +377,7 @@ class BoundModelImpl<
     const projected = await this.model.projectToLatest(raw as Record<string, unknown>);
 
     if (!projected.ok) {
-      this.maybeThrowProjectionError(projected.reason, key, projected.error);
+      await this.handleProjectionFailure(projected.reason, key, "findByKey", projected.error);
       return null;
     }
 
@@ -384,7 +401,7 @@ class BoundModelImpl<
       const projected = await this.model.projectToLatest(rawDoc as Record<string, unknown>);
 
       if (!projected.ok) {
-        this.maybeThrowProjectionError(projected.reason, key, projected.error);
+        await this.handleProjectionFailure(projected.reason, key, "query", projected.error);
         continue;
       }
 
@@ -453,7 +470,7 @@ class BoundModelImpl<
     if (projected.ok) {
       current = projected.value as Record<string, unknown>;
     } else {
-      this.maybeThrowProjectionError(projected.reason, key, projected.error);
+      await this.handleProjectionFailure(projected.reason, key, "update", projected.error);
       // Ignore migration failures on read/merge path and attempt to apply the
       // update against the stored document as-is.
       current = existingDoc;
@@ -511,7 +528,7 @@ class BoundModelImpl<
       const projected = await this.model.projectToLatest(rawDoc as Record<string, unknown>);
 
       if (!projected.ok) {
-        this.maybeThrowProjectionError(projected.reason, key, projected.error);
+        await this.handleProjectionFailure(projected.reason, key, "batchGet", projected.error);
         continue;
       }
 
@@ -825,12 +842,20 @@ class BoundModelImpl<
     return this.model.options.migrationErrors === "throw";
   }
 
-  private maybeThrowProjectionError(
+  private async handleProjectionFailure(
     reason: ProjectionSkipReason,
-    key?: string,
+    key: string,
+    operation: ProjectionSkipOperation,
     cause?: unknown,
-  ): void {
+  ): Promise<void> {
     if (!this.shouldThrowProjectionErrors()) {
+      await this.runProjectionHook({
+        model: this.model.name,
+        key,
+        reason,
+        operation,
+        error: cause,
+      });
       return;
     }
 
@@ -847,6 +872,20 @@ class BoundModelImpl<
     }
 
     return new MigrationProjectionError(this.model.name, reason, key, { cause });
+  }
+
+  private async runProjectionHook(event: ProjectionSkippedEvent): Promise<void> {
+    const hooks = this.projectionHooks;
+
+    if (!hooks?.onProjectionSkipped) {
+      return;
+    }
+
+    try {
+      await hooks.onProjectionSkipped(event);
+    } catch {
+      // Hook errors are intentionally ignored so read/query behavior is stable.
+    }
   }
 
   private async withUniqueConstraintGuard<R>(
@@ -1106,7 +1145,10 @@ export function createStore<
       );
     }
 
-    boundModels.set(modelDef.name, new BoundModelImpl(modelDef, engine, migrator));
+    boundModels.set(
+      modelDef.name,
+      new BoundModelImpl(modelDef, engine, migrator, options?.projectionHooks),
+    );
   }
 
   const allModelNames = Array.from(boundModels.keys()).sort((a, b) => a.localeCompare(b));
