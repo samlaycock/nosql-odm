@@ -148,5 +148,31 @@
     "pg": "^8.18.0",
     "redis": "^5.11.0",
     "typescript": "^5"
+  },
+  "peerDependenciesMeta": {
+    "@aws-sdk/lib-dynamodb": {
+      "optional": true
+    },
+    "@google-cloud/firestore": {
+      "optional": true
+    },
+    "better-sqlite3": {
+      "optional": true
+    },
+    "cassandra-driver": {
+      "optional": true
+    },
+    "mongodb": {
+      "optional": true
+    },
+    "mysql2": {
+      "optional": true
+    },
+    "pg": {
+      "optional": true
+    },
+    "redis": {
+      "optional": true
+    }
   }
 }

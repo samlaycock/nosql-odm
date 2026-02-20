@@ -28,6 +28,8 @@ In other words, the ODM acts as a type-safe proxy over the engine contract. Adap
 npm install nosql-odm zod
 ```
 
+Adapter packages are optional peer dependencies. Install only the engine package(s) you use.
+
 For SQLite support:
 
 ```bash
@@ -62,6 +64,18 @@ For Firestore support:
 
 ```bash
 npm install @google-cloud/firestore
+```
+
+For MySQL support:
+
+```bash
+npm install mysql2
+```
+
+For Postgres support:
+
+```bash
+npm install pg
 ```
 
 ## Quick Start
