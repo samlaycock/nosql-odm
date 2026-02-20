@@ -372,32 +372,48 @@ export class ModelDefinition<
   }
 
   resolveIndexKeys(data: T): ResolvedIndexKeys {
+    return this.resolveIndexes(data, false);
+  }
+
+  resolveUniqueIndexKeys(data: T): ResolvedIndexKeys {
+    return this.resolveIndexes(data, true);
+  }
+
+  private resolveIndexes(data: T, uniqueOnly: boolean): ResolvedIndexKeys {
     const resolved: ResolvedIndexKeys = {};
+    const resolvedSources = new Map<string, string>();
 
     for (const index of this.indexes) {
+      if (uniqueOnly && index.unique !== true) {
+        continue;
+      }
+
       // For static-name indexes, the resolved name equals the key.
       // For dynamic-name indexes, the resolved name is computed from document data,
       // and becomes the engine-level index identifier for this document.
       const resolvedName = typeof index.name === "function" ? index.name(data) : index.name;
+      const sourceIdentifier = this.describeIndexIdentifier(index);
+      const existingSource = resolvedSources.get(resolvedName);
+
+      if (existingSource) {
+        throw new Error(
+          `Model "${this.name}" resolved index-name collision for "${resolvedName}" between ${existingSource} and ${sourceIdentifier}`,
+        );
+      }
+
+      resolvedSources.set(resolvedName, sourceIdentifier);
       resolved[resolvedName] = resolveIndexValue(index.value as IndexValue<unknown>, data);
     }
 
     return resolved;
   }
 
-  resolveUniqueIndexKeys(data: T): ResolvedIndexKeys {
-    const resolved: ResolvedIndexKeys = {};
-
-    for (const index of this.indexes) {
-      if (index.unique !== true) {
-        continue;
-      }
-
-      const resolvedName = typeof index.name === "function" ? index.name(data) : index.name;
-      resolved[resolvedName] = resolveIndexValue(index.value as IndexValue<unknown>, data);
+  private describeIndexIdentifier(index: StoredIndex<T>): string {
+    if (typeof index.name === "string") {
+      return `static index name "${index.name}"`;
     }
 
-    return resolved;
+    return `dynamic index key "${index.key}"`;
   }
 }
 
