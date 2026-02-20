@@ -1,5 +1,44 @@
 # nosql-odm
 
+## 0.7.1
+
+### Patch Changes
+
+- 29affc9: Update CI quality and test workflows to install dependencies with `bun install --frozen-lockfile` for deterministic dependency resolution.
+- 14f54a1: Validate model index definitions at build time to reject duplicate static index names, duplicate dynamic index storage keys, and collisions between static index names and dynamic storage keys with clear runtime errors.
+
+  Add unit tests covering duplicate detection and error messages for both static and dynamic index definitions.
+
+- 3152fb8: Add an `oxfmt` import-sorting configuration and apply consistent import ordering across source and test files.
+
+  Also refresh formatter/linter and related dependency versions in `package.json` and `bun.lock` so formatting behavior is deterministic in CI and local development.
+
+- 44fab13: Expand README documentation for migration error behavior (`migrationErrors`), including concise tolerant-vs-strict examples, public API option defaults, and user-facing error type references.
+
+  Document uniqueness guarantees with an engine capability matrix and runtime/error semantics for unique indexes.
+
+  Refresh development dependencies and lockfile entries, including AWS DynamoDB SDK packages and formatting/linting toolchain updates.
+
+- 6ca9ba0: Add projection-skip observability hooks to `createStore` so ignored projection failures in read/query paths can be observed with model, key, reason, and operation context.
+
+  Emit projection skip events for `findByKey`, `query`, `batchGet`, and update fallback paths when migration error mode is `ignore`, while preserving strict-mode throwing behavior.
+
+- 784f00c: Gate the publish workflow behind quality checks, unit tests, and selected in-process integration smoke tests (memory, indexeddb, sqlite).
+
+  The release job now depends on these prerequisite jobs via `needs`, and the workflow includes inline comments documenting the required checks.
+
+- b1109bc: Detect resolved index-name collisions at runtime when building index key maps, and throw deterministic errors that include the model name and conflicting index identifiers.
+
+  Add unit tests for static+dynamic and dynamic+dynamic resolved name collision scenarios.
+
+- 89f6111: Extend atomic unique-index enforcement coverage across all engine integrations by declaring explicit unique-constraint capabilities on the remaining adapters and adding shared integration tests for duplicate create/update/batchSet behavior.
+
+  Add a store-level unique guard that uses engine-backed locks and index checks to enforce unique index values consistently across create, update, batchSet, lazy writeback, and migration persistence paths.
+
+- ab0df1c: Mark engine adapter peer dependencies as optional via `peerDependenciesMeta` so consumers only need to install the database drivers they actually use.
+
+  Clarify installation requirements in the README by explicitly noting that adapter peers are optional and documenting `mysql2` and `pg` install commands.
+
 ## 0.7.0
 
 ### Minor Changes
@@ -7,6 +46,7 @@
 - 43fd641: Improve migration throughput and consistency across all engines by adding adaptive paging hints, reducing redundant metadata sync work, and tightening migrator execution behavior.
 
   ### Added
+
   - Optional migration criteria hints for engines:
     - `pageSizeHint`
     - `skipMetadataSyncHint`
@@ -16,12 +56,14 @@
     - `onDocumentsPersisted({ persistedKeys, conflictedKeys, ... })`
 
   ### Changed
+
   - Engines now honor dynamic page-size hints for outdated-document paging.
   - Engines with metadata sync paths can skip redundant sync on continuation pages.
   - Store-scope conflict checks in the default migrator now resolve model scope activity concurrently.
   - Migration run-state parsing now validates persisted page-size hints.
 
   ### Tooling / Docs
+
   - Removed the aggregate `test:integration` npm script because it is not reliable in constrained shared-runner environments.
   - README test runner examples now point to per-engine integration scripts only.
 
@@ -32,6 +74,7 @@
 - 990e9e2: Overhaul migration orchestration around a new `Migrator` abstraction with run upsert, page-by-page execution, scope-aware conflict checks, and durable progress tracking.
 
   ### Added
+
   - `DefaultMigrator` and `Migrator` interfaces for custom migration workflows.
   - Model and store migration APIs for paged workflows:
     - `getOrCreateMigration()`
@@ -41,6 +84,7 @@
   - Built-in engines now expose `engine.migrator` by default.
 
   ### Changed
+
   - `migrateAll()` now executes through migrator runs/pages and enforces scope conflicts between model-level and store-level migrations.
   - Store-wide migrations fail fast when scope is already covered by another active migration run.
 
@@ -49,6 +93,7 @@
 ### Minor Changes
 
 - 1d256bf: Add a new Postgres engine adapter using `pg`.
+
   - Introduce `postgresEngine` with full `QueryEngine` support for CRUD, query filters/sorting/pagination, batch operations, and migration lock/checkpoint flows.
   - Add package export `nosql-odm/engines/postgres`.
   - Add Postgres integration coverage and local Docker service/test scripts.
@@ -57,11 +102,13 @@
 - 755a3de: Add a new MySQL engine via `nosql-odm/engines/mysql` backed by `mysql2`.
 
   This release introduces first-class MySQL support with:
+
   - Full `QueryEngine` contract coverage for create/get/update/delete, `batchGet`, and paginated queries.
   - Migration primitives (locks, checkpoints, and outdated migration discovery).
   - Support for custom internal table names used for metadata and migration state.
 
   Also includes:
+
   - Integration test coverage for MySQL parity with the other engines.
   - Docker Compose service wiring and test scripts for local MySQL integration runs.
   - Updated package exports and documentation for MySQL setup/usage.
