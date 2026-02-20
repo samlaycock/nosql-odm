@@ -3135,6 +3135,37 @@ describe("lazy migration error handling", () => {
     const result = await store.broken.findByKey("b1");
     expect(result).toBeNull();
   });
+
+  test("emits projection skip events for update fallback projection failures", async () => {
+    await engine.put("broken", "b1", { __v: 1, id: "b1", value: "test" }, { primary: "b1" });
+
+    const events: ProjectionSkippedEvent[] = [];
+    const store = createStore(engine, [buildBrokenMigrationModel()], {
+      projectionHooks: {
+        onProjectionSkipped(event) {
+          events.push(event);
+        },
+      },
+    });
+
+    await expectReject(store.broken.update("b1", { value: "new" }), ValidationError);
+
+    expect(
+      events.map((event) => ({
+        model: event.model,
+        key: event.key,
+        reason: event.reason,
+        operation: event.operation,
+      })),
+    ).toEqual([
+      {
+        model: "broken",
+        key: "b1",
+        reason: "validation_error",
+        operation: "update",
+      },
+    ]);
+  });
 });
 
 // ---------------------------------------------------------------------------
