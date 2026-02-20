@@ -831,6 +831,45 @@ Modes:
 - `readonly`: read APIs project in-memory but do not persist migration write-backs.
 - `eager`: same read behavior as `readonly`; use explicit migration jobs (`migrateAll` / paged APIs) for persistence.
 
+`migrationErrors` controls what happens when projection fails during read paths:
+
+- `ignore` (default): skip bad documents and continue.
+- `throw`: raise `MigrationProjectionError` immediately.
+
+Concise behavior examples:
+
+Tolerant (`ignore`, default):
+
+```ts
+const User = model("user", {
+  migration: "lazy",
+  migrationErrors: "ignore", // default
+})
+  .schema(/* ... */)
+  .build();
+
+const store = createStore(memoryEngine(), [User]);
+
+// If projection fails for this document, result is null (no throw).
+const user = await store.user.findByKey("u1");
+```
+
+Strict (`throw`):
+
+```ts
+const User = model("user", {
+  migration: "lazy",
+  migrationErrors: "throw",
+})
+  .schema(/* ... */)
+  .build();
+
+const store = createStore(memoryEngine(), [User]);
+
+// Projection failure throws MigrationProjectionError.
+await store.user.findByKey("u1");
+```
+
 ### 3. Migration scopes and conflict rules
 
 There are two run scopes:
@@ -1176,6 +1215,61 @@ const User = model("user", {
   },
 });
 ```
+
+## Public API Defaults and Error Types
+
+### Model option defaults
+
+`model(name, options?)` default behavior:
+
+- `migration: "lazy"`
+- `migrationErrors: "ignore"`
+- `versionField: "__v"`
+- `indexesField: "__indexes"`
+
+### Store option defaults
+
+`createStore(engine, models, options?)` default behavior:
+
+- `migrator`: uses `engine.migrator` when present; otherwise migration APIs throw `MissingMigratorError`.
+- `migrationHooks`: disabled unless provided.
+- `projectionHooks`: disabled unless provided.
+
+### User-facing error types
+
+Common errors surfaced by store/model APIs:
+
+- `DocumentAlreadyExistsError`: `create()` key already exists.
+- `UniqueConstraintError`: unique index conflict on `create`, `update`, or `batchSet`.
+- `MigrationProjectionError`: projection failed and model is in strict mode (`migrationErrors: "throw"`).
+- `MigrationAlreadyRunningError`: `migrateAll()`/paging hit a busy migration lock.
+- `MigrationScopeConflictError`: overlapping store/model migration scopes.
+- `MissingMigratorError`: no migrator configured or exposed by the selected engine.
+- `ValidationError`: input or migrated output failed schema validation.
+
+## Uniqueness Guarantees and Engine Capability Matrix
+
+Unique index guarantees depend on engine capability declarations:
+
+- If a model declares `unique: true` indexes, `createStore()` requires an engine with
+  `capabilities.uniqueConstraints === "atomic"`.
+- If not atomic, `createStore()` throws during startup (before runtime writes).
+- Runtime unique violations throw `UniqueConstraintError`.
+
+Built-in engine capability matrix (`capabilities.uniqueConstraints`):
+
+| Engine    | Package path                  | Unique constraints |
+| --------- | ----------------------------- | ------------------ |
+| Memory    | `nosql-odm/engines/memory`    | `atomic`           |
+| SQLite    | `nosql-odm/engines/sqlite`    | `atomic`           |
+| IndexedDB | `nosql-odm/engines/indexeddb` | `atomic`           |
+| DynamoDB  | `nosql-odm/engines/dynamodb`  | `atomic`           |
+| Cassandra | `nosql-odm/engines/cassandra` | `atomic`           |
+| Redis     | `nosql-odm/engines/redis`     | `atomic`           |
+| MongoDB   | `nosql-odm/engines/mongodb`   | `atomic`           |
+| Firestore | `nosql-odm/engines/firestore` | `atomic`           |
+| MySQL     | `nosql-odm/engines/mysql`     | `atomic`           |
+| Postgres  | `nosql-odm/engines/postgres`  | `atomic`           |
 
 ## Engine Contract (Adapter Authors)
 
