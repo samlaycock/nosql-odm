@@ -242,10 +242,108 @@ export class MissingMigratorError extends Error {
 
 export { MigrationScopeConflictError };
 
+export interface UniqueConstraintLockOptions {
+  /** Lock TTL in milliseconds for unique-constraint guards. */
+  ttlMs?: number;
+  /** Maximum lock-acquisition attempts before failing. */
+  maxAttempts?: number;
+  /** Delay between lock-acquisition retries in milliseconds. */
+  retryDelayMs?: number;
+  /**
+   * Renewal interval in milliseconds for long-running guarded operations.
+   * Set to `null` to disable lock renewal.
+   */
+  heartbeatIntervalMs?: number | null;
+}
+
 export interface CreateStoreOptions<TOptions = Record<string, unknown>> {
   migrator?: Migrator<TOptions>;
   migrationHooks?: MigrationHooks;
   projectionHooks?: ProjectionHooks;
+  uniqueConstraintLock?: UniqueConstraintLockOptions;
+}
+
+interface ResolvedUniqueConstraintLockOptions {
+  readonly ttlMs: number;
+  readonly maxAttempts: number;
+  readonly retryDelayMs: number;
+  readonly heartbeatIntervalMs: number | null;
+}
+
+interface UniqueConstraintLockLease {
+  readonly currentLock: () => MigrationLock;
+  readonly stop: () => Promise<void>;
+  readonly assertHealthy: () => void;
+}
+
+const DEFAULT_UNIQUE_CONSTRAINT_LOCK_TTL_MS = 30_000;
+const DEFAULT_UNIQUE_CONSTRAINT_LOCK_MAX_ATTEMPTS = 200;
+const DEFAULT_UNIQUE_CONSTRAINT_LOCK_RETRY_DELAY_MS = 10;
+
+function normalizeIntegerOption(
+  value: number | null | undefined,
+  name: string,
+  minimum: number,
+  defaultValue: number,
+): number {
+  if (value === undefined || value === null) {
+    return defaultValue;
+  }
+
+  if (!Number.isFinite(value) || !Number.isInteger(value) || value < minimum) {
+    throw new Error(
+      `createStore option "uniqueConstraintLock.${name}" must be an integer >= ${String(minimum)}`,
+    );
+  }
+
+  return value;
+}
+
+function resolveUniqueConstraintLockOptions(
+  options?: UniqueConstraintLockOptions,
+): ResolvedUniqueConstraintLockOptions {
+  const ttlMs = normalizeIntegerOption(
+    options?.ttlMs,
+    "ttlMs",
+    1,
+    DEFAULT_UNIQUE_CONSTRAINT_LOCK_TTL_MS,
+  );
+  const maxAttempts = normalizeIntegerOption(
+    options?.maxAttempts,
+    "maxAttempts",
+    1,
+    DEFAULT_UNIQUE_CONSTRAINT_LOCK_MAX_ATTEMPTS,
+  );
+  const retryDelayMs = normalizeIntegerOption(
+    options?.retryDelayMs,
+    "retryDelayMs",
+    0,
+    DEFAULT_UNIQUE_CONSTRAINT_LOCK_RETRY_DELAY_MS,
+  );
+  const defaultHeartbeatIntervalMs = Math.max(1, Math.floor(ttlMs / 2));
+  const heartbeatInput = options?.heartbeatIntervalMs;
+  const heartbeatIntervalMs =
+    heartbeatInput === null || heartbeatInput === 0
+      ? null
+      : normalizeIntegerOption(
+          heartbeatInput,
+          "heartbeatIntervalMs",
+          1,
+          defaultHeartbeatIntervalMs,
+        );
+
+  if (heartbeatIntervalMs !== null && heartbeatIntervalMs > ttlMs) {
+    throw new Error(
+      'createStore option "uniqueConstraintLock.heartbeatIntervalMs" must be <= "uniqueConstraintLock.ttlMs"',
+    );
+  }
+
+  return {
+    ttlMs,
+    maxAttempts,
+    retryDelayMs,
+    heartbeatIntervalMs,
+  };
 }
 
 type JsonPrimitive = string | number | boolean | null;
@@ -362,17 +460,21 @@ class BoundModelImpl<
   private engine: QueryEngine<TOptions>;
   private migrator: Migrator<TOptions> | null;
   private projectionHooks: ProjectionHooks | undefined;
+  private uniqueConstraintLockOptions: ResolvedUniqueConstraintLockOptions;
 
   constructor(
     model: ModelDefinition<T, any, string, TStaticIndexNames, THasDynamicIndexes>,
     engine: QueryEngine<TOptions>,
     migrator: Migrator<TOptions> | null,
     projectionHooks?: ProjectionHooks,
+    uniqueConstraintLockOptions?: ResolvedUniqueConstraintLockOptions,
   ) {
     this.model = model;
     this.engine = engine;
     this.migrator = migrator;
     this.projectionHooks = projectionHooks;
+    this.uniqueConstraintLockOptions =
+      uniqueConstraintLockOptions ?? resolveUniqueConstraintLockOptions();
   }
 
   async findByKey(key: string, options?: TOptions): Promise<T | null> {
@@ -990,39 +1092,148 @@ class BoundModelImpl<
       return operation();
     }
 
-    const lock = await this.acquireUniqueConstraintLock();
+    const lockLease = this.createUniqueConstraintLockLease(
+      await this.acquireUniqueConstraintLock(),
+    );
+    const state: { result?: R; hasError: boolean; error: unknown } = {
+      hasError: false,
+      error: null,
+    };
 
     try {
       await this.assertNoUniqueConstraintConflicts(candidates, options);
-      return await operation();
+      lockLease.assertHealthy();
+      state.result = await operation();
+    } catch (error) {
+      state.hasError = true;
+      state.error = error;
     } finally {
-      await this.engine.migration.releaseLock(lock);
+      await lockLease.stop();
+      await this.engine.migration.releaseLock(lockLease.currentLock());
     }
+
+    lockLease.assertHealthy();
+
+    if (state.hasError) {
+      throw state.error;
+    }
+
+    return state.result as R;
   }
 
   private async acquireUniqueConstraintLock(): Promise<MigrationLock> {
     const collection = this.uniqueConstraintLockCollection();
-    const maxAttempts = 200;
-    const lockTtlMs = 30_000;
-    const delayMs = 10;
+    const { ttlMs, maxAttempts, retryDelayMs } = this.uniqueConstraintLockOptions;
 
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      const lock = await this.engine.migration.acquireLock(collection, { ttl: lockTtlMs });
+    for (const attempt of Array.from({ length: maxAttempts }, (_, index) => index)) {
+      const lock = await this.engine.migration.acquireLock(collection, { ttl: ttlMs });
 
       if (lock) {
         return lock;
       }
 
-      await new Promise<void>((resolve) => {
-        setTimeout(resolve, delayMs);
-      });
+      if (attempt === maxAttempts - 1) {
+        break;
+      }
+
+      await this.sleep(retryDelayMs);
     }
 
-    throw new Error(`Unable to acquire unique-constraint lock for model "${this.model.name}"`);
+    throw new Error(
+      `Unable to acquire unique-constraint lock for model "${this.model.name}" after ${String(maxAttempts)} attempts`,
+    );
   }
 
   private uniqueConstraintLockCollection(): string {
     return `${this.model.name}::__unique_constraints`;
+  }
+
+  private createUniqueConstraintLockLease(initialLock: MigrationLock): UniqueConstraintLockLease {
+    const intervalMs = this.uniqueConstraintLockOptions.heartbeatIntervalMs;
+
+    if (intervalMs === null) {
+      return {
+        currentLock() {
+          return initialLock;
+        },
+        async stop() {},
+        assertHealthy() {},
+      };
+    }
+
+    const state = {
+      active: true,
+      currentLock: initialLock,
+      timer: null as ReturnType<typeof setTimeout> | null,
+      pendingRenewal: null as Promise<void> | null,
+      error: null as unknown,
+    };
+    const modelName = this.model.name;
+    const collection = this.uniqueConstraintLockCollection();
+    const scheduleNext = (): void => {
+      if (!state.active || state.error !== null) {
+        return;
+      }
+
+      state.timer = setTimeout(() => {
+        state.timer = null;
+        state.pendingRenewal = renewLock().finally(() => {
+          state.pendingRenewal = null;
+        });
+      }, intervalMs);
+    };
+    const renewLock = async (): Promise<void> => {
+      if (!state.active || state.error !== null) {
+        return;
+      }
+
+      try {
+        const renewed = await this.engine.migration.acquireLock(collection, { ttl: 0 });
+
+        if (!renewed) {
+          throw new Error(`Unable to renew unique-constraint lock for model "${modelName}"`);
+        }
+
+        state.currentLock = renewed;
+        scheduleNext();
+      } catch (error) {
+        state.error = error;
+        state.active = false;
+      }
+    };
+
+    scheduleNext();
+
+    return {
+      currentLock() {
+        return state.currentLock;
+      },
+      async stop() {
+        state.active = false;
+
+        if (state.timer !== null) {
+          clearTimeout(state.timer);
+          state.timer = null;
+        }
+
+        if (state.pendingRenewal) {
+          await state.pendingRenewal;
+        }
+      },
+      assertHealthy() {
+        if (state.error !== null) {
+          throw new Error(`Unique-constraint lock renewal failed for model "${modelName}"`, {
+            cause: state.error,
+          });
+        }
+      },
+    };
+  }
+
+  private async sleep(delayMs: number): Promise<void> {
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, delayMs);
+    });
   }
 
   private async assertNoUniqueConstraintConflicts(
@@ -1220,6 +1431,9 @@ export function createStore<
       })
     : (engine.migrator ?? null);
   const migrator = options?.migrator ?? engineMigrator;
+  const uniqueConstraintLockOptions = resolveUniqueConstraintLockOptions(
+    options?.uniqueConstraintLock,
+  );
   const boundModels = new Map<string, BoundModelImpl<any, TOptions, any, any>>();
 
   for (const modelDef of models) {
@@ -1237,7 +1451,13 @@ export function createStore<
 
     boundModels.set(
       modelDef.name,
-      new BoundModelImpl(modelDef, engine, migrator, options?.projectionHooks),
+      new BoundModelImpl(
+        modelDef,
+        engine,
+        migrator,
+        options?.projectionHooks,
+        uniqueConstraintLockOptions,
+      ),
     );
   }
 
