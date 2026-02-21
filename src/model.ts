@@ -388,6 +388,12 @@ export class ModelDefinition<
         continue;
       }
 
+      const resolvedValue = resolveIndexValue(index.value as IndexValue<unknown>, data);
+
+      if (resolvedValue === undefined) {
+        continue;
+      }
+
       // For static-name indexes, the resolved name equals the key.
       // For dynamic-name indexes, the resolved name is computed from document data,
       // and becomes the engine-level index identifier for this document.
@@ -402,7 +408,7 @@ export class ModelDefinition<
       }
 
       resolvedSources.set(resolvedName, sourceIdentifier);
-      resolved[resolvedName] = resolveIndexValue(index.value as IndexValue<unknown>, data);
+      resolved[resolvedName] = resolvedValue;
     }
 
     return resolved;
@@ -634,12 +640,24 @@ export class InitialModelBuilderImpl<
 // Helpers
 // ---------------------------------------------------------------------------
 
-function resolveIndexValue<T>(value: IndexValue<T>, data: T): string {
+function resolveIndexValue<T>(value: IndexValue<T>, data: T): string | undefined {
   if (typeof value === "function") {
-    return value(data);
+    const resolved = value(data);
+
+    if (resolved === undefined || resolved === null) {
+      return undefined;
+    }
+
+    return resolved;
   }
 
-  return String((data as Record<string, unknown>)[value]);
+  const fieldValue = (data as Record<string, unknown>)[value];
+
+  if (fieldValue === undefined || fieldValue === null) {
+    return undefined;
+  }
+
+  return String(fieldValue as string | number | boolean | bigint | symbol);
 }
 
 function defaultParseVersion(raw: unknown): VersionValue | null {
