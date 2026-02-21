@@ -53,6 +53,36 @@ function buildUserV1WithUniqueEmail() {
     .build();
 }
 
+function buildUserV1WithOptionalEmail() {
+  return model("user")
+    .schema(
+      1,
+      z.object({
+        id: z.string(),
+        name: z.string(),
+        email: z.email().optional(),
+      }),
+    )
+    .index({ name: "primary", value: "id" })
+    .index({ name: "byEmail", value: "email" })
+    .build();
+}
+
+function buildUserV1WithOptionalUniqueEmail() {
+  return model("user")
+    .schema(
+      1,
+      z.object({
+        id: z.string(),
+        name: z.string(),
+        email: z.email().optional(),
+      }),
+    )
+    .index({ name: "primary", value: "id" })
+    .index({ name: "byEmail", value: "email", unique: true })
+    .build();
+}
+
 function buildUserV2() {
   return model("user")
     .schema(
@@ -361,6 +391,34 @@ describe("unique indexes", () => {
 
     expect(await store.user.findByKey("u1")).toBeNull();
     expect(await store.user.findByKey("u2")).toBeNull();
+  });
+
+  test("create allows multiple documents with missing optional unique index values", async () => {
+    const store = createStore(engine, [buildUserV1WithOptionalUniqueEmail()]);
+
+    await store.user.create("u1", {
+      id: "u1",
+      name: "Sam",
+    });
+    await store.user.create("u2", {
+      id: "u2",
+      name: "Other",
+    });
+
+    await store.user.create("u3", {
+      id: "u3",
+      name: "Jamie",
+      email: "jamie@example.com",
+    });
+
+    await expectReject(
+      store.user.create("u4", {
+        id: "u4",
+        name: "Duplicate",
+        email: "jamie@example.com",
+      }),
+      UniqueConstraintError,
+    );
   });
 });
 
@@ -684,6 +742,38 @@ describe("store.query()", () => {
 
     expect(results.documents).toHaveLength(0);
     expect(results.cursor).toBeNull();
+  });
+
+  test('does not index missing optional fields as the literal string "undefined"', async () => {
+    const store = createStore(engine, [buildUserV1WithOptionalEmail()]);
+
+    await store.user.create("u1", {
+      id: "u1",
+      name: "Missing Email",
+    });
+    await store.user.create("u2", {
+      id: "u2",
+      name: "Has Email",
+      email: "sam@example.com",
+    });
+
+    const undefinedResults = await store.user.query({
+      index: "byEmail",
+      filter: { value: "undefined" },
+    });
+    const emailResults = await store.user.query({
+      index: "byEmail",
+      filter: { value: "sam@example.com" },
+    });
+
+    expect(undefinedResults.documents).toHaveLength(0);
+    expect(emailResults.documents).toEqual([
+      {
+        id: "u2",
+        name: "Has Email",
+        email: "sam@example.com",
+      },
+    ]);
   });
 
   test("returns all documents when no filter is provided", async () => {
