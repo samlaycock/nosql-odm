@@ -1,5 +1,5 @@
 ---
-"nosql-odm": patch
+"nosql-odm": minor
 ---
 
 Parallelize unique-index pre-check queries during unique-guarded writes and add bounded concurrency via `createStore(..., { uniqueConstraintPrecheck: { concurrency } })`.
