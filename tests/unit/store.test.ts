@@ -12,6 +12,7 @@ import { model, ValidationError } from "../../src/model";
 import {
   createStore,
   DocumentAlreadyExistsError,
+  DocumentNotFoundError,
   MigrationProjectionError,
   MigrationAlreadyRunningError,
   MigrationScopeConflictError,
@@ -894,12 +895,16 @@ describe("store.update()", () => {
     expect(fetched).toEqual(updated);
   });
 
-  test("throws for non-existent document", async () => {
+  test("throws DocumentNotFoundError for non-existent document", async () => {
     const store = createStore(engine, [buildUserV1()]);
 
-    expect(store.user.update("nonexistent", { name: "Sam" })).rejects.toThrow(
-      'Document "nonexistent" not found',
-    );
+    try {
+      await store.user.update("nonexistent", { name: "Sam" });
+      throw new Error("expected update to fail with not found");
+    } catch (error) {
+      expect(error).toBeInstanceOf(DocumentNotFoundError);
+      expect(String(error)).toContain('Document "nonexistent" not found in model "user"');
+    }
   });
 
   test("validates merged data", async () => {
@@ -937,7 +942,7 @@ describe("store.update()", () => {
     expect(newResults.documents).toHaveLength(1);
   });
 
-  test("throws not found when engine.update reports concurrent delete", async () => {
+  test("throws DocumentNotFoundError when engine.update reports concurrent delete", async () => {
     const raceEngine: QueryEngine<never> = {
       async get() {
         return {
@@ -979,6 +984,7 @@ describe("store.update()", () => {
       await store.user.update("u1", { name: "Samuel" });
       throw new Error("expected update to fail with not found");
     } catch (error) {
+      expect(error).toBeInstanceOf(DocumentNotFoundError);
       expect(String(error)).toContain('Document "u1" not found in model "user"');
     }
   });

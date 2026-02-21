@@ -24,6 +24,7 @@ export {
 export {
   createStore,
   DocumentAlreadyExistsError,
+  DocumentNotFoundError,
   MigrationProjectionError,
   MigrationAlreadyRunningError,
   MissingMigratorError,

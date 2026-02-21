@@ -163,6 +163,13 @@ export class DocumentAlreadyExistsError extends Error {
   }
 }
 
+export class DocumentNotFoundError extends Error {
+  constructor(collection: string, key: string) {
+    super(`Document "${key}" not found in model "${collection}"`);
+    this.name = "DocumentNotFoundError";
+  }
+}
+
 export class UniqueConstraintError extends Error {
   readonly collection: string;
   readonly key: string;
@@ -460,7 +467,7 @@ class BoundModelImpl<
     const existing = await this.engine.get(this.model.name, key, options);
 
     if (existing === null || existing === undefined) {
-      throw new Error(`Document "${key}" not found in model "${this.model.name}"`);
+      throw new DocumentNotFoundError(this.model.name, key);
     }
 
     const existingDoc = existing as Record<string, unknown>;
@@ -497,7 +504,7 @@ class BoundModelImpl<
       });
     } catch (error) {
       if (error instanceof EngineDocumentNotFoundError) {
-        throw new Error(`Document "${key}" not found in model "${this.model.name}"`);
+        throw new DocumentNotFoundError(this.model.name, key);
       }
       if (error instanceof EngineUniqueConstraintError) {
         throw new UniqueConstraintError(
