@@ -521,6 +521,12 @@ bun run test:integration:postgres            # only Postgres integration
 
 The DynamoDB integration suite creates and deletes its own test table automatically.
 
+CI workflow coverage:
+
+- Pull requests run `test.yml` (unit suite) and path-filtered adapter integration workflows for fast feedback.
+- `.github/workflows/integration-full-matrix.yml` runs the full adapter integration matrix nightly at `04:00 UTC` and supports manual runs via `workflow_dispatch`.
+- `.github/workflows/publish.yml` keeps release gating focused on quality checks, unit tests, and smoke integrations.
+
 ## CRUD
 
 `create` requires an explicit key:

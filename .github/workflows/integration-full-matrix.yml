@@ -1,0 +1,85 @@
+name: 🧪🌙 Full Integration Matrix
+
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  full-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - engine: memory
+            timeout: 20
+            service_up: ""
+            service_down: ""
+          - engine: indexeddb
+            timeout: 20
+            service_up: ""
+            service_down: ""
+          - engine: sqlite
+            timeout: 20
+            service_up: ""
+            service_down: ""
+          - engine: dynamodb
+            timeout: 30
+            service_up: bun run services:up:dynamodb
+            service_down: bun run services:down:dynamodb
+          - engine: cassandra
+            timeout: 30
+            service_up: bun run services:up:cassandra
+            service_down: bun run services:down:cassandra
+          - engine: redis
+            timeout: 30
+            service_up: bun run services:up:redis
+            service_down: bun run services:down:redis
+          - engine: mongodb
+            timeout: 30
+            service_up: bun run services:up:mongodb
+            service_down: bun run services:down:mongodb
+          - engine: firestore
+            timeout: 30
+            service_up: bun run services:up:firestore
+            service_down: bun run services:down:firestore
+          - engine: mysql
+            timeout: 30
+            service_up: bun run services:up:mysql
+            service_down: bun run services:down:mysql
+          - engine: postgres
+            timeout: 30
+            service_up: bun run services:up:postgres
+            service_down: bun run services:down:postgres
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Start service (${{ matrix.engine }})
+        if: ${{ matrix.service_up != '' }}
+        run: ${{ matrix.service_up }}
+
+      - name: Run integration tests (${{ matrix.engine }})
+        run: bun run test:integration:${{ matrix.engine }}
+
+      - name: Stop service (${{ matrix.engine }})
+        if: ${{ always() && matrix.service_down != '' }}
+        run: ${{ matrix.service_down }}
