@@ -274,6 +274,7 @@ interface UniqueConstraintLockLease {
   readonly currentLock: () => MigrationLock;
   readonly stop: () => Promise<void>;
   readonly assertHealthy: () => void;
+  readonly waitForFailure: () => Promise<void>;
 }
 
 const DEFAULT_UNIQUE_CONSTRAINT_LOCK_TTL_MS = 30_000;
@@ -1095,18 +1096,41 @@ class BoundModelImpl<
     const lockLease = this.createUniqueConstraintLockLease(
       await this.acquireUniqueConstraintLock(),
     );
-    const state: { result?: R; hasError: boolean; error: unknown } = {
-      hasError: false,
-      error: null,
-    };
+    let result: R | undefined = undefined;
+    let operationError: unknown = null;
 
     try {
       await this.assertNoUniqueConstraintConflicts(candidates, options);
       lockLease.assertHealthy();
-      state.result = await operation();
-    } catch (error) {
-      state.hasError = true;
-      state.error = error;
+
+      const operationResult = operation()
+        .then((value) => ({
+          status: "success" as const,
+          value,
+        }))
+        .catch((error) => ({
+          status: "error" as const,
+          error,
+        }));
+      const raceResult = await Promise.race([
+        operationResult,
+        lockLease.waitForFailure().then(() => ({
+          status: "lease_failed" as const,
+        })),
+      ]);
+
+      if (raceResult.status === "lease_failed") {
+        lockLease.assertHealthy();
+        throw new Error(
+          `Unique-constraint lock lease entered an invalid state for model "${this.model.name}"`,
+        );
+      }
+
+      if (raceResult.status === "error") {
+        operationError = raceResult.error;
+      } else {
+        result = raceResult.value;
+      }
     } finally {
       await lockLease.stop();
       await this.engine.migration.releaseLock(lockLease.currentLock());
@@ -1114,11 +1138,11 @@ class BoundModelImpl<
 
     lockLease.assertHealthy();
 
-    if (state.hasError) {
-      throw state.error;
+    if (operationError !== null) {
+      throw operationError;
     }
 
-    return state.result as R;
+    return result as R;
   }
 
   private async acquireUniqueConstraintLock(): Promise<MigrationLock> {
@@ -1158,9 +1182,18 @@ class BoundModelImpl<
         },
         async stop() {},
         assertHealthy() {},
+        async waitForFailure() {
+          await new Promise<void>(() => {
+            // This lease has no heartbeat, so renewal cannot fail.
+          });
+        },
       };
     }
 
+    let notifyFailure: (() => void) | null = null;
+    const failurePromise = new Promise<void>((resolve) => {
+      notifyFailure = resolve;
+    });
     const state = {
       active: true,
       currentLock: initialLock,
@@ -1199,6 +1232,7 @@ class BoundModelImpl<
       } catch (error) {
         state.error = error;
         state.active = false;
+        notifyFailure?.();
       }
     };
 
@@ -1226,6 +1260,9 @@ class BoundModelImpl<
             cause: state.error,
           });
         }
+      },
+      async waitForFailure() {
+        await failurePromise;
       },
     };
   }
