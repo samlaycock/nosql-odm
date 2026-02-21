@@ -160,6 +160,14 @@ export interface KeyedDocument {
   writeToken?: string;
 }
 
+export interface EngineGetResult {
+  doc: unknown;
+  /**
+   * Optional engine-specific optimistic-write token for conditional updates.
+   */
+  writeToken?: string;
+}
+
 /**
  * Engine-level query result. Unlike the user-facing QueryResult, documents
  * include their storage keys.
@@ -224,6 +232,11 @@ export interface QueryEngine<TOptions = Record<string, unknown>> {
   };
 
   get(collection: string, key: string, options?: TOptions): Promise<unknown>;
+  getWithMetadata?(
+    collection: string,
+    key: string,
+    options?: TOptions,
+  ): Promise<EngineGetResult | null>;
 
   /**
    * Creates a new document. Must reject with EngineDocumentAlreadyExistsError
@@ -266,8 +279,18 @@ export interface QueryEngine<TOptions = Record<string, unknown>> {
   delete(collection: string, key: string, options?: TOptions): Promise<void>;
 
   query(collection: string, params: QueryParams, options?: TOptions): Promise<EngineQueryResult>;
+  queryWithMetadata?(
+    collection: string,
+    params: QueryParams,
+    options?: TOptions,
+  ): Promise<EngineQueryResult>;
 
   batchGet(collection: string, keys: string[], options?: TOptions): Promise<KeyedDocument[]>;
+  batchGetWithMetadata?(
+    collection: string,
+    keys: string[],
+    options?: TOptions,
+  ): Promise<KeyedDocument[]>;
   batchSet(collection: string, items: BatchSetItem[], options?: TOptions): Promise<void>;
   batchSetWithResult?(
     collection: string,

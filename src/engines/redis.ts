@@ -398,6 +398,19 @@ export function redisEngine(options: RedisEngineOptions): RedisQueryEngine {
       return structuredClone(record.doc);
     },
 
+    async getWithMetadata(collection, key) {
+      const record = await loadDocumentRecord(client, keyPrefix, collection, key);
+
+      if (!record) {
+        return null;
+      }
+
+      return {
+        doc: structuredClone(record.doc),
+        writeToken: String(record.writeVersion),
+      };
+    },
+
     async create(collection, key, doc, indexes, _options, migrationMetadata) {
       const result = await upsertDocument(
         client,
@@ -470,6 +483,13 @@ export function redisEngine(options: RedisEngineOptions): RedisQueryEngine {
       return paginate(matched, params);
     },
 
+    async queryWithMetadata(collection, params) {
+      const records = await listCollectionDocuments(client, keyPrefix, collection);
+      const matched = matchDocuments(records, params);
+
+      return paginateWithWriteTokens(matched, params);
+    },
+
     async batchGet(collection, keys) {
       const fetched = new Map<string, StoredDocumentRecord>();
       const results: KeyedDocument[] = [];
@@ -494,6 +514,37 @@ export function redisEngine(options: RedisEngineOptions): RedisQueryEngine {
         results.push({
           key,
           doc: structuredClone(record.doc),
+        });
+      }
+
+      return results;
+    },
+
+    async batchGetWithMetadata(collection, keys) {
+      const fetched = new Map<string, StoredDocumentRecord>();
+      const results: KeyedDocument[] = [];
+
+      for (const key of uniqueStrings(keys)) {
+        const record = await loadDocumentRecord(client, keyPrefix, collection, key);
+
+        if (!record) {
+          continue;
+        }
+
+        fetched.set(key, record);
+      }
+
+      for (const key of keys) {
+        const record = fetched.get(key);
+
+        if (!record) {
+          continue;
+        }
+
+        results.push({
+          key,
+          doc: structuredClone(record.doc),
+          writeToken: String(record.writeVersion),
         });
       }
 
@@ -1521,6 +1572,47 @@ function paginate(records: StoredDocumentRecord[], params: QueryParams): EngineQ
     documents: page.map((record) => ({
       key: record.key,
       doc: structuredClone(record.doc),
+    })),
+    cursor,
+  };
+}
+
+function paginateWithWriteTokens(
+  records: StoredDocumentRecord[],
+  params: QueryParams,
+): EngineQueryResult {
+  let startIndex = 0;
+
+  if (params.cursor) {
+    const cursorIndex = records.findIndex((record) => record.key === params.cursor);
+
+    if (cursorIndex !== -1) {
+      startIndex = cursorIndex + 1;
+    }
+  }
+
+  const normalizedLimit = normalizeLimit(params.limit);
+  const limit = normalizedLimit ?? records.length;
+  const hasLimit = normalizedLimit !== null;
+
+  if (limit <= 0) {
+    return {
+      documents: [],
+      cursor: null,
+    };
+  }
+
+  const page = records.slice(startIndex, startIndex + limit);
+  const cursor =
+    page.length > 0 && hasLimit && startIndex + limit < records.length
+      ? page[page.length - 1]!.key
+      : null;
+
+  return {
+    documents: page.map((record) => ({
+      key: record.key,
+      doc: structuredClone(record.doc),
+      writeToken: String(record.writeVersion),
     })),
     cursor,
   };

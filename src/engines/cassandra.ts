@@ -148,6 +148,21 @@ export function cassandraEngine(options: CassandraEngineOptions): CassandraQuery
       return structuredClone(row.doc);
     },
 
+    async getWithMetadata(collection, key) {
+      await ready;
+
+      const row = await getDocumentRow(client, documentsTable, collection, key);
+
+      if (!row) {
+        return null;
+      }
+
+      return {
+        doc: structuredClone(row.doc),
+        writeToken: String(row.writeVersion),
+      };
+    },
+
     async create(collection, key, doc, indexes, _options, migrationMetadata) {
       await ready;
 
@@ -228,6 +243,15 @@ export function cassandraEngine(options: CassandraEngineOptions): CassandraQuery
       return paginate(matched, params);
     },
 
+    async queryWithMetadata(collection, params) {
+      await ready;
+
+      const rows = await listCollectionDocuments(client, documentsTable, collection);
+      const matched = matchDocuments(rows, params);
+
+      return paginateWithWriteTokens(matched, params);
+    },
+
     async batchGet(collection, keys) {
       await ready;
 
@@ -242,6 +266,29 @@ export function cassandraEngine(options: CassandraEngineOptions): CassandraQuery
         }
 
         results.push({ key, doc: structuredClone(row.doc) });
+      }
+
+      return results;
+    },
+
+    async batchGetWithMetadata(collection, keys) {
+      await ready;
+
+      const fetched = await batchGetDocuments(client, documentsTable, collection, keys);
+      const results: KeyedDocument[] = [];
+
+      for (const key of keys) {
+        const row = fetched.get(key);
+
+        if (!row) {
+          continue;
+        }
+
+        results.push({
+          key,
+          doc: structuredClone(row.doc),
+          writeToken: String(row.writeVersion),
+        });
       }
 
       return results;
@@ -2068,6 +2115,47 @@ function paginate(records: StoredDocumentRow[], params: QueryParams): EngineQuer
     documents: page.map((record) => ({
       key: record.key,
       doc: structuredClone(record.doc),
+    })),
+    cursor,
+  };
+}
+
+function paginateWithWriteTokens(
+  records: StoredDocumentRow[],
+  params: QueryParams,
+): EngineQueryResult {
+  let startIndex = 0;
+
+  if (params.cursor) {
+    const cursorIndex = records.findIndex((record) => record.key === params.cursor);
+
+    if (cursorIndex !== -1) {
+      startIndex = cursorIndex + 1;
+    }
+  }
+
+  const normalizedLimit = normalizeLimit(params.limit);
+  const limit = normalizedLimit ?? records.length;
+  const hasLimit = normalizedLimit !== null;
+
+  if (limit <= 0) {
+    return {
+      documents: [],
+      cursor: null,
+    };
+  }
+
+  const page = records.slice(startIndex, startIndex + limit);
+  const cursor =
+    page.length > 0 && hasLimit && startIndex + limit < records.length
+      ? page[page.length - 1]!.key
+      : null;
+
+  return {
+    documents: page.map((record) => ({
+      key: record.key,
+      doc: structuredClone(record.doc),
+      writeToken: String(record.writeVersion),
     })),
     cursor,
   };

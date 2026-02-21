@@ -4,6 +4,7 @@ import {
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
   EngineUniqueConstraintError,
+  type EngineGetResult,
   type MigrationDocumentMetadata,
   type MigrationLock,
   type QueryEngine,
@@ -65,7 +66,7 @@ export type ProjectionSkipOperation = "findByKey" | "query" | "batchGet" | "upda
 export interface ProjectionSkippedEvent {
   readonly model: string;
   readonly key: string;
-  readonly reason: ProjectionSkipReason;
+  readonly reason: MigrationSkipReason;
   readonly operation: ProjectionSkipOperation;
   readonly error?: unknown;
 }
@@ -375,13 +376,13 @@ class BoundModelImpl<
   }
 
   async findByKey(key: string, options?: TOptions): Promise<T | null> {
-    const raw = await this.engine.get(this.model.name, key, options);
+    const stored = await this.getWithOptionalWriteToken(key, options);
 
-    if (raw === null || raw === undefined) {
+    if (!stored) {
       return null;
     }
 
-    const projected = await this.model.projectToLatest(raw as Record<string, unknown>);
+    const projected = await this.model.projectToLatest(stored.doc);
 
     if (!projected.ok) {
       await this.handleProjectionFailure(projected.reason, key, "findByKey", projected.error);
@@ -389,7 +390,11 @@ class BoundModelImpl<
     }
 
     if (projected.migrated) {
-      await this.writebackMany([{ key, value: projected.value }], options);
+      await this.writebackMany(
+        [{ key, value: projected.value, expectedWriteToken: stored.writeToken }],
+        "findByKey",
+        options,
+      );
     }
 
     return projected.value;
@@ -400,11 +405,13 @@ class BoundModelImpl<
     options?: TOptions,
   ): Promise<QueryResult<T>> {
     const resolved = this.resolveQuery(params);
-    const raw = await this.engine.query(this.model.name, resolved, options);
+    const raw = this.engine.queryWithMetadata
+      ? await this.engine.queryWithMetadata(this.model.name, resolved, options)
+      : await this.engine.query(this.model.name, resolved, options);
     const documents: T[] = [];
-    const writebacks: { key: string; value: T }[] = [];
+    const writebacks: { key: string; value: T; expectedWriteToken?: string }[] = [];
 
-    for (const { key, doc: rawDoc } of raw.documents) {
+    for (const { key, doc: rawDoc, writeToken } of raw.documents) {
       const projected = await this.model.projectToLatest(rawDoc as Record<string, unknown>);
 
       if (!projected.ok) {
@@ -413,13 +420,17 @@ class BoundModelImpl<
       }
 
       if (projected.migrated) {
-        writebacks.push({ key, value: projected.value });
+        writebacks.push({
+          key,
+          value: projected.value,
+          expectedWriteToken: this.normalizeWriteToken(writeToken),
+        });
       }
 
       documents.push(projected.value);
     }
 
-    await this.writebackMany(writebacks, options);
+    await this.writebackMany(writebacks, "query", options);
 
     return { documents, cursor: raw.cursor };
   }
@@ -527,11 +538,13 @@ class BoundModelImpl<
   }
 
   async batchGet(keys: string[], options?: TOptions): Promise<T[]> {
-    const rawDocs = await this.engine.batchGet(this.model.name, keys, options);
+    const rawDocs = this.engine.batchGetWithMetadata
+      ? await this.engine.batchGetWithMetadata(this.model.name, keys, options)
+      : await this.engine.batchGet(this.model.name, keys, options);
     const results: T[] = [];
-    const writebacks: { key: string; value: T }[] = [];
+    const writebacks: { key: string; value: T; expectedWriteToken?: string }[] = [];
 
-    for (const { key, doc: rawDoc } of rawDocs) {
+    for (const { key, doc: rawDoc, writeToken } of rawDocs) {
       const projected = await this.model.projectToLatest(rawDoc as Record<string, unknown>);
 
       if (!projected.ok) {
@@ -540,13 +553,17 @@ class BoundModelImpl<
       }
 
       if (projected.migrated) {
-        writebacks.push({ key, value: projected.value });
+        writebacks.push({
+          key,
+          value: projected.value,
+          expectedWriteToken: this.normalizeWriteToken(writeToken),
+        });
       }
 
       results.push(projected.value);
     }
 
-    await this.writebackMany(writebacks, options);
+    await this.writebackMany(writebacks, "batchGet", options);
 
     return results;
   }
@@ -688,6 +705,46 @@ class BoundModelImpl<
   // Private helpers
   // ---------------------------------------------------------------------------
 
+  private async getWithOptionalWriteToken(
+    key: string,
+    options?: TOptions,
+  ): Promise<{ doc: Record<string, unknown>; writeToken?: string } | null> {
+    if (this.engine.getWithMetadata) {
+      const raw: EngineGetResult | null = await this.engine.getWithMetadata(
+        this.model.name,
+        key,
+        options,
+      );
+
+      if (raw === null || raw === undefined) {
+        return null;
+      }
+
+      return {
+        doc: raw.doc as Record<string, unknown>,
+        writeToken: this.normalizeWriteToken(raw.writeToken),
+      };
+    }
+
+    const raw = await this.engine.get(this.model.name, key, options);
+
+    if (raw === null || raw === undefined) {
+      return null;
+    }
+
+    return {
+      doc: raw as Record<string, unknown>,
+    };
+  }
+
+  private normalizeWriteToken(raw: unknown): string | undefined {
+    if (typeof raw !== "string" || raw.length === 0) {
+      return undefined;
+    }
+
+    return raw;
+  }
+
   // Stamps the version and index names onto a document for storage.
   private stamp(data: object, key: string): Record<string, unknown> {
     const stamped = {
@@ -716,7 +773,8 @@ class BoundModelImpl<
   // writes are not permitted, eager because migration is expected to happen
   // via migrateAll() rather than on individual reads.
   private async writebackMany(
-    items: { key: string; value: T }[],
+    items: { key: string; value: T; expectedWriteToken?: string }[],
+    operation: ProjectionSkipOperation,
     options?: TOptions,
   ): Promise<void> {
     if (this.model.options.migration !== "lazy") {
@@ -733,19 +791,31 @@ class BoundModelImpl<
       indexes: this.model.resolveIndexKeys(item.value),
       uniqueIndexes: this.model.resolveUniqueIndexKeys(item.value),
       migrationMetadata: this.currentMigrationMetadata(),
+      expectedWriteToken: this.normalizeWriteToken(item.expectedWriteToken),
     }));
 
+    let conflictedKeys: string[] = [];
+
     try {
-      await this.withUniqueConstraintGuard(
+      const result = await this.withUniqueConstraintGuard(
         prepared.map((item) => ({
           key: item.key,
           uniqueIndexes: item.uniqueIndexes,
         })),
         options,
         async () => {
+          if (this.engine.batchSetWithResult) {
+            return this.engine.batchSetWithResult(this.model.name, prepared, options);
+          }
+
           await this.engine.batchSet(this.model.name, prepared, options);
+          return null;
         },
       );
+
+      if (result) {
+        conflictedKeys = result.conflictedKeys;
+      }
     } catch (error) {
       if (error instanceof EngineUniqueConstraintError) {
         throw new UniqueConstraintError(
@@ -758,6 +828,19 @@ class BoundModelImpl<
       }
 
       throw error;
+    }
+
+    if (conflictedKeys.length > 0) {
+      await Promise.all(
+        conflictedKeys.map((key) =>
+          this.runProjectionHook({
+            model: this.model.name,
+            key,
+            reason: "concurrent_write",
+            operation,
+          }),
+        ),
+      );
     }
   }
 

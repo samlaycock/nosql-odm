@@ -56,6 +56,7 @@ export interface MySqlQueryEngine extends QueryEngine<never> {}
 interface QueryRow {
   key: string;
   doc: Record<string, unknown>;
+  writeToken?: string;
 }
 
 interface CursorRow {
@@ -91,7 +92,7 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
 
       const row = await fetchOptionalRow(client, {
         sql: `
-          SELECT doc_key AS \`key\`, doc_json
+          SELECT doc_key AS \`key\`, doc_json, write_version
           FROM ${refs.documentsTable}
           WHERE collection = ? AND doc_key = ?
           LIMIT 1
@@ -105,6 +106,32 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
       }
 
       return parseQueryRow(row, collection).doc;
+    },
+
+    async getWithMetadata(collection, key) {
+      await ready;
+
+      const row = await fetchOptionalRow(client, {
+        sql: `
+          SELECT doc_key AS \`key\`, doc_json, write_version
+          FROM ${refs.documentsTable}
+          WHERE collection = ? AND doc_key = ?
+          LIMIT 1
+        `,
+        params: [collection, key],
+        errorMessage: "MySQL returned an invalid document row",
+      });
+
+      if (!row) {
+        return null;
+      }
+
+      const parsed = parseQueryRow(row, collection);
+
+      return {
+        doc: structuredClone(parsed.doc),
+        writeToken: parsed.writeToken,
+      };
     },
 
     async create(collection, key, doc, indexes, _options, migrationMetadata) {
@@ -207,6 +234,16 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
       return queryByIndex(client, refs, collection, params);
     },
 
+    async queryWithMetadata(collection, params) {
+      await ready;
+
+      if (!params.index || !params.filter) {
+        return queryByCollectionScan(client, refs, collection, params, true);
+      }
+
+      return queryByIndex(client, refs, collection, params, true);
+    },
+
     async batchGet(collection, keys) {
       await ready;
 
@@ -219,7 +256,7 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
       const placeholders = createPlaceholders(uniqueKeys.length);
       const rows = await fetchRows(client, {
         sql: `
-          SELECT doc_key AS \`key\`, doc_json
+          SELECT doc_key AS \`key\`, doc_json, write_version
           FROM ${refs.documentsTable}
           WHERE collection = ? AND doc_key IN (${placeholders})
         `,
@@ -227,25 +264,71 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
         errorMessage: "MySQL returned an invalid batch get result",
       });
 
-      const fetched = new Map<string, Record<string, unknown>>();
+      const fetched = new Map<string, QueryRow>();
 
       for (const row of rows) {
         const parsed = parseQueryRow(row, collection);
-        fetched.set(parsed.key, parsed.doc);
+        fetched.set(parsed.key, parsed);
       }
 
       const results: KeyedDocument[] = [];
 
       for (const key of keys) {
-        const doc = fetched.get(key);
+        const parsed = fetched.get(key);
 
-        if (!doc) {
+        if (!parsed) {
           continue;
         }
 
         results.push({
           key,
-          doc: structuredClone(doc),
+          doc: structuredClone(parsed.doc),
+        });
+      }
+
+      return results;
+    },
+
+    async batchGetWithMetadata(collection, keys) {
+      await ready;
+
+      const uniqueKeys = uniqueStrings(keys);
+
+      if (uniqueKeys.length === 0) {
+        return [];
+      }
+
+      const placeholders = createPlaceholders(uniqueKeys.length);
+      const rows = await fetchRows(client, {
+        sql: `
+          SELECT doc_key AS \`key\`, doc_json, write_version
+          FROM ${refs.documentsTable}
+          WHERE collection = ? AND doc_key IN (${placeholders})
+        `,
+        params: [collection, ...uniqueKeys],
+        errorMessage: "MySQL returned an invalid batch get result",
+      });
+
+      const fetched = new Map<string, QueryRow>();
+
+      for (const row of rows) {
+        const parsed = parseQueryRow(row, collection);
+        fetched.set(parsed.key, parsed);
+      }
+
+      const results: KeyedDocument[] = [];
+
+      for (const key of keys) {
+        const parsed = fetched.get(key);
+
+        if (!parsed) {
+          continue;
+        }
+
+        results.push({
+          key,
+          doc: structuredClone(parsed.doc),
+          writeToken: parsed.writeToken,
         });
       }
 
@@ -454,6 +537,7 @@ async function queryByCollectionScan(
   refs: TableRefs,
   collection: string,
   params: QueryParams,
+  includeWriteTokens = false,
 ): Promise<EngineQueryResult> {
   const limit = normalizeLimit(params.limit);
 
@@ -468,7 +552,7 @@ async function queryByCollectionScan(
   const values: (string | number)[] = [collection, cursorId];
 
   let sql = `
-    SELECT doc_key AS \`key\`, doc_json
+    SELECT doc_key AS \`key\`, doc_json, write_version
     FROM ${refs.documentsTable}
     WHERE collection = ? AND id > ?
     ORDER BY id ASC
@@ -485,7 +569,7 @@ async function queryByCollectionScan(
     errorMessage: "MySQL returned an invalid query result",
   });
 
-  return formatPage(rows, limit, collection);
+  return formatPage(rows, limit, collection, includeWriteTokens);
 }
 
 async function queryByIndex(
@@ -493,6 +577,7 @@ async function queryByIndex(
   refs: TableRefs,
   collection: string,
   params: QueryParams,
+  includeWriteTokens = false,
 ): Promise<EngineQueryResult> {
   const limit = normalizeLimit(params.limit);
 
@@ -554,7 +639,7 @@ async function queryByIndex(
         : `ORDER BY d.id ASC`;
 
   let sql = `
-    SELECT d.doc_key AS \`key\`, d.doc_json
+    SELECT d.doc_key AS \`key\`, d.doc_json, d.write_version
     FROM ${refs.indexesTable} ix
     INNER JOIN ${refs.documentsTable} d
       ON d.collection = ix.collection
@@ -573,7 +658,7 @@ async function queryByIndex(
     errorMessage: "MySQL returned an invalid query result",
   });
 
-  return formatPage(rows, limit, collection);
+  return formatPage(rows, limit, collection, includeWriteTokens);
 }
 
 async function resolveIndexedCursor(
@@ -625,6 +710,7 @@ function formatPage(
   rows: Record<string, unknown>[],
   limit: number | null,
   collection: string,
+  includeWriteTokens = false,
 ): EngineQueryResult {
   const hasLimit = limit !== null;
   const hasMore = hasLimit && rows.length > limit;
@@ -633,10 +719,18 @@ function formatPage(
   return {
     documents: pageRows.map((row) => {
       const parsed = parseQueryRow(row, collection);
-
-      return {
+      const document = {
         key: parsed.key,
         doc: structuredClone(parsed.doc),
+      };
+
+      if (!includeWriteTokens || parsed.writeToken === undefined) {
+        return document;
+      }
+
+      return {
+        ...document,
+        writeToken: parsed.writeToken,
       };
     }),
     cursor: hasMore
@@ -1104,10 +1198,15 @@ async function fetchOptionalRow(
 
 function parseQueryRow(raw: Record<string, unknown>, collection: string): QueryRow {
   const key = readStringField(raw, "key", "MySQL returned an invalid query result");
+  const writeToken =
+    raw.write_version === undefined || raw.write_version === null
+      ? undefined
+      : String(readFiniteInteger(raw, "write_version", "MySQL returned an invalid query result"));
 
   return {
     key,
     doc: parseStoredDocument(raw.doc_json, collection, key),
+    writeToken,
   };
 }
 

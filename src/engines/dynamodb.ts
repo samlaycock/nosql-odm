@@ -229,6 +229,19 @@ export function dynamoDbEngine(options: DynamoDbEngineOptions): DynamoDbQueryEng
       return structuredClone(item.doc);
     },
 
+    async getWithMetadata(collection, key) {
+      const item = await getDocumentItem(client, tableName, keyConfig, collection, key);
+
+      if (!item) {
+        return null;
+      }
+
+      return {
+        doc: structuredClone(item.doc),
+        writeToken: String(item.writeVersion),
+      };
+    },
+
     async create(collection, key, doc, indexes, _options, migrationMetadata) {
       const createdAt = await nextSequence(client, tableName, keyConfig, collection);
       const item = createDocumentItem(collection, key, createdAt, 1, doc, indexes);
@@ -305,6 +318,13 @@ export function dynamoDbEngine(options: DynamoDbEngineOptions): DynamoDbQueryEng
       return paginate(matched, params);
     },
 
+    async queryWithMetadata(collection, params) {
+      const records = await listDocuments(client, tableName, keyConfig, collection);
+      const matched = matchDocuments(records, params);
+
+      return paginateWithWriteTokens(matched, params);
+    },
+
     async batchGet(collection, keys) {
       const results: KeyedDocument[] = [];
       const fetched = await batchGetDocuments(client, tableName, keyConfig, collection, keys);
@@ -317,6 +337,27 @@ export function dynamoDbEngine(options: DynamoDbEngineOptions): DynamoDbQueryEng
         }
 
         results.push({ key, doc: structuredClone(record.doc) });
+      }
+
+      return results;
+    },
+
+    async batchGetWithMetadata(collection, keys) {
+      const results: KeyedDocument[] = [];
+      const fetched = await batchGetDocuments(client, tableName, keyConfig, collection, keys);
+
+      for (const key of keys) {
+        const record = fetched.get(key);
+
+        if (!record) {
+          continue;
+        }
+
+        results.push({
+          key,
+          doc: structuredClone(record.doc),
+          writeToken: String(record.writeVersion),
+        });
       }
 
       return results;
@@ -1665,6 +1706,47 @@ function paginate(records: StoredDocumentItem[], params: QueryParams): EngineQue
     documents: page.map((record) => ({
       key: record.key,
       doc: structuredClone(record.doc),
+    })),
+    cursor,
+  };
+}
+
+function paginateWithWriteTokens(
+  records: StoredDocumentItem[],
+  params: QueryParams,
+): EngineQueryResult {
+  let startIndex = 0;
+
+  if (params.cursor) {
+    const cursorIndex = records.findIndex((record) => record.key === params.cursor);
+
+    if (cursorIndex !== -1) {
+      startIndex = cursorIndex + 1;
+    }
+  }
+
+  const normalizedLimit = normalizeLimit(params.limit);
+  const limit = normalizedLimit ?? records.length;
+  const hasLimit = normalizedLimit !== null;
+
+  if (limit <= 0) {
+    return {
+      documents: [],
+      cursor: null,
+    };
+  }
+
+  const page = records.slice(startIndex, startIndex + limit);
+  const cursor =
+    page.length > 0 && hasLimit && startIndex + limit < records.length
+      ? page[page.length - 1]!.key
+      : null;
+
+  return {
+    documents: page.map((record) => ({
+      key: record.key,
+      doc: structuredClone(record.doc),
+      writeToken: String(record.writeVersion),
     })),
     cursor,
   };
