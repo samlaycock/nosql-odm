@@ -601,6 +601,97 @@ describe("unique indexes", () => {
     expect(releasedLocks).toHaveLength(1);
     expect(releasedLocks[0]?.id).toBe(`renewed-lock-${String(lockEvents.renewals)}`);
   });
+
+  test("fails fast when lock renewal fails during a long unique-guarded write", async () => {
+    const lockEvents = {
+      initial: 0,
+      renewalAttempts: 0,
+    };
+    const releasedLocks: MigrationLock[] = [];
+    let createCompleted = false;
+
+    const trackingEngine: QueryEngine<never> = {
+      capabilities: {
+        uniqueConstraints: "atomic",
+      },
+      async get() {
+        return null;
+      },
+      async create() {
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, 180);
+        });
+        createCompleted = true;
+      },
+      async put() {},
+      async update() {},
+      async delete() {},
+      async query() {
+        return { documents: [], cursor: null };
+      },
+      async batchGet() {
+        return [];
+      },
+      async batchSet() {},
+      async batchDelete() {},
+      migration: {
+        async acquireLock(collection, options) {
+          if (collection !== "user::__unique_constraints") {
+            return {
+              id: "other-lock",
+              collection,
+              acquiredAt: Date.now(),
+            };
+          }
+
+          if (options?.ttl === 0) {
+            lockEvents.renewalAttempts += 1;
+            return null;
+          }
+
+          lockEvents.initial += 1;
+          return {
+            id: "initial-lock",
+            collection,
+            acquiredAt: Date.now(),
+          };
+        },
+        async releaseLock(lock) {
+          releasedLocks.push(lock);
+        },
+        async getOutdated() {
+          return { documents: [], cursor: null };
+        },
+      },
+    };
+
+    const store = createStore(trackingEngine, [buildUserV1WithUniqueEmail()], {
+      uniqueConstraintLock: {
+        ttlMs: 40,
+        maxAttempts: 1,
+        retryDelayMs: 0,
+        heartbeatIntervalMs: 20,
+      },
+    });
+
+    const startedAt = Date.now();
+    await expectReject(
+      store.user.create("u1", {
+        id: "u1",
+        name: "Sam",
+        email: "sam@example.com",
+      }),
+      /lock renewal failed/i,
+    );
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(lockEvents.initial).toBe(1);
+    expect(lockEvents.renewalAttempts).toBeGreaterThan(0);
+    expect(elapsedMs).toBeLessThan(160);
+    expect(createCompleted).toBe(false);
+    expect(releasedLocks).toHaveLength(1);
+    expect(releasedLocks[0]?.id).toBe("initial-lock");
+  });
 });
 
 // ---------------------------------------------------------------------------
