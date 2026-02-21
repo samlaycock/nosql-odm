@@ -272,6 +272,72 @@ async function expectReject(
   expect(error).toBeInstanceOf(expected);
 }
 
+interface UniquePrecheckTracker {
+  inFlight: number;
+  maxInFlight: number;
+  values: string[];
+  waiters: Array<() => void>;
+}
+
+function createUniquePrecheckTrackingEngine(precheck: UniquePrecheckTracker): QueryEngine<never> {
+  return {
+    capabilities: {
+      uniqueConstraints: "atomic",
+    },
+    async get() {
+      return null;
+    },
+    async create() {},
+    async put() {},
+    async update() {},
+    async delete() {},
+    async query(_collection, params) {
+      const indexValue = (params.filter as { value?: string } | undefined)?.value;
+      if (typeof indexValue === "string") {
+        precheck.values.push(indexValue);
+      }
+
+      precheck.inFlight += 1;
+      precheck.maxInFlight = Math.max(precheck.maxInFlight, precheck.inFlight);
+
+      const gate = new Promise<void>((resolve) => {
+        precheck.waiters.push(resolve);
+      });
+
+      queueMicrotask(() => {
+        const waiters = precheck.waiters.splice(0);
+
+        for (const resolve of waiters) {
+          resolve();
+        }
+      });
+
+      await gate;
+      precheck.inFlight -= 1;
+
+      return { documents: [], cursor: null };
+    },
+    async batchGet() {
+      return [];
+    },
+    async batchSet() {},
+    async batchDelete() {},
+    migration: {
+      async acquireLock(collection) {
+        return {
+          id: "lock-1",
+          collection,
+          acquiredAt: Date.now(),
+        };
+      },
+      async releaseLock() {},
+      async getOutdated() {
+        return { documents: [], cursor: null };
+      },
+    },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // createStore basics
 // ---------------------------------------------------------------------------
@@ -308,6 +374,16 @@ describe("createStore()", () => {
         },
       });
     }).toThrow(/migrator.*migrationHooks.*cannot be provided together/i);
+  });
+
+  test("throws when uniqueConstraintPrecheck.concurrency is invalid", () => {
+    expect(() => {
+      createStore(engine, [buildUserV1()], {
+        uniqueConstraintPrecheck: {
+          concurrency: 0,
+        },
+      });
+    }).toThrow(/uniqueConstraintPrecheck\.concurrency/i);
   });
 });
 
@@ -393,6 +469,57 @@ describe("unique indexes", () => {
 
     expect(await store.user.findByKey("u1")).toBeNull();
     expect(await store.user.findByKey("u2")).toBeNull();
+  });
+
+  test("batchSet runs unique pre-check queries in parallel", async () => {
+    const precheck: UniquePrecheckTracker = {
+      inFlight: 0,
+      maxInFlight: 0,
+      values: [],
+      waiters: [],
+    };
+    const trackingEngine = createUniquePrecheckTrackingEngine(precheck);
+
+    const store = createStore(trackingEngine, [buildUserV1WithUniqueEmail()]);
+
+    await store.user.batchSet([
+      { key: "u1", data: { id: "u1", name: "Sam", email: "sam@example.com" } },
+      { key: "u2", data: { id: "u2", name: "Jamie", email: "jamie@example.com" } },
+      { key: "u3", data: { id: "u3", name: "Casey", email: "casey@example.com" } },
+      { key: "u4", data: { id: "u4", name: "Robin", email: "robin@example.com" } },
+    ]);
+
+    expect(precheck.values.sort()).toEqual([
+      "casey@example.com",
+      "jamie@example.com",
+      "robin@example.com",
+      "sam@example.com",
+    ]);
+    expect(precheck.maxInFlight).toBeGreaterThan(1);
+  });
+
+  test("batchSet bounds unique pre-check query concurrency", async () => {
+    const precheck: UniquePrecheckTracker = {
+      inFlight: 0,
+      maxInFlight: 0,
+      values: [],
+      waiters: [],
+    };
+    const trackingEngine = createUniquePrecheckTrackingEngine(precheck);
+    const store = createStore(trackingEngine, [buildUserV1WithUniqueEmail()], {
+      uniqueConstraintPrecheck: {
+        concurrency: 2,
+      },
+    });
+
+    await store.user.batchSet([
+      { key: "u1", data: { id: "u1", name: "Sam", email: "sam@example.com" } },
+      { key: "u2", data: { id: "u2", name: "Jamie", email: "jamie@example.com" } },
+      { key: "u3", data: { id: "u3", name: "Casey", email: "casey@example.com" } },
+      { key: "u4", data: { id: "u4", name: "Robin", email: "robin@example.com" } },
+    ]);
+
+    expect(precheck.maxInFlight).toBe(2);
   });
 
   test("create allows multiple documents with missing optional unique index values", async () => {
