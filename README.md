@@ -1234,6 +1234,11 @@ const User = model("user", {
 - `migrator`: uses `engine.migrator` when present; otherwise migration APIs throw `MissingMigratorError`.
 - `migrationHooks`: disabled unless provided.
 - `projectionHooks`: disabled unless provided.
+- `uniqueConstraintLock`:
+  - `ttlMs`: `30000`
+  - `maxAttempts`: `200`
+  - `retryDelayMs`: `10`
+  - `heartbeatIntervalMs`: `ttlMs / 2` (set `null` to disable renewal)
 
 ### User-facing error types
 
@@ -1270,6 +1275,22 @@ Built-in engine capability matrix (`capabilities.uniqueConstraints`):
 | Firestore | `nosql-odm/engines/firestore` | `atomic`           |
 | MySQL     | `nosql-odm/engines/mysql`     | `atomic`           |
 | Postgres  | `nosql-odm/engines/postgres`  | `atomic`           |
+
+Unique-constraint lock behavior is configurable per store:
+
+```ts
+const store = createStore(engine, [User], {
+  uniqueConstraintLock: {
+    ttlMs: 120_000,
+    maxAttempts: 500,
+    retryDelayMs: 25,
+    heartbeatIntervalMs: 15_000, // or null to disable lock renewal
+  },
+});
+```
+
+For high-latency backends, set `ttlMs` above your longest expected guarded write
+duration and keep `heartbeatIntervalMs <= ttlMs`.
 
 ## Engine Contract (Adapter Authors)
 

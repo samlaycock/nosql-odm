@@ -5,6 +5,7 @@ import { memoryEngine, type MemoryQueryEngine } from "../../src/engines/memory";
 import {
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
+  type MigrationLock,
   type QueryEngine,
 } from "../../src/engines/types";
 import { DefaultMigrator } from "../../src/migrator";
@@ -420,6 +421,185 @@ describe("unique indexes", () => {
       }),
       UniqueConstraintError,
     );
+  });
+
+  test("uses configured unique-constraint lock retry settings", async () => {
+    const originalSetTimeout = globalThis.setTimeout;
+    const scheduledDelays: number[] = [];
+    const requestedTtls: number[] = [];
+    const releasedLockIds: string[] = [];
+    const lockState = {
+      attempts: 0,
+    };
+
+    globalThis.setTimeout = ((
+      handler: (...handlerArgs: unknown[]) => void,
+      timeout?: number,
+      ...args: unknown[]
+    ) => {
+      scheduledDelays.push(typeof timeout === "number" ? timeout : 0);
+      handler(...args);
+      return originalSetTimeout(() => {}, 0);
+    }) as typeof globalThis.setTimeout;
+
+    try {
+      const trackingEngine: QueryEngine<never> = {
+        capabilities: {
+          uniqueConstraints: "atomic",
+        },
+        async get() {
+          return null;
+        },
+        async create() {},
+        async put() {},
+        async update() {},
+        async delete() {},
+        async query() {
+          return { documents: [], cursor: null };
+        },
+        async batchGet() {
+          return [];
+        },
+        async batchSet() {},
+        async batchDelete() {},
+        migration: {
+          async acquireLock(collection, options) {
+            if (collection !== "user::__unique_constraints") {
+              return {
+                id: "other-lock",
+                collection,
+                acquiredAt: Date.now(),
+              };
+            }
+
+            lockState.attempts += 1;
+            requestedTtls.push(options?.ttl ?? -1);
+
+            if (lockState.attempts < 3) {
+              return null;
+            }
+
+            return {
+              id: `lock-${String(lockState.attempts)}`,
+              collection,
+              acquiredAt: Date.now(),
+            };
+          },
+          async releaseLock(lock) {
+            releasedLockIds.push(lock.id);
+          },
+          async getOutdated() {
+            return { documents: [], cursor: null };
+          },
+        },
+      };
+
+      const store = createStore(trackingEngine, [buildUserV1WithUniqueEmail()], {
+        uniqueConstraintLock: {
+          ttlMs: 12_000,
+          maxAttempts: 3,
+          retryDelayMs: 7,
+          heartbeatIntervalMs: null,
+        },
+      });
+
+      await store.user.create("u1", {
+        id: "u1",
+        name: "Sam",
+        email: "sam@example.com",
+      });
+
+      expect(requestedTtls).toEqual([12_000, 12_000, 12_000]);
+      expect(scheduledDelays).toEqual([7, 7]);
+      expect(releasedLockIds).toEqual(["lock-3"]);
+    } finally {
+      globalThis.setTimeout = originalSetTimeout;
+    }
+  });
+
+  test("renews unique-constraint locks during long writes by default", async () => {
+    const lockEvents = {
+      initial: 0,
+      renewals: 0,
+    };
+    const releasedLocks: MigrationLock[] = [];
+
+    const trackingEngine: QueryEngine<never> = {
+      capabilities: {
+        uniqueConstraints: "atomic",
+      },
+      async get() {
+        return null;
+      },
+      async create() {
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, 65);
+        });
+      },
+      async put() {},
+      async update() {},
+      async delete() {},
+      async query() {
+        return { documents: [], cursor: null };
+      },
+      async batchGet() {
+        return [];
+      },
+      async batchSet() {},
+      async batchDelete() {},
+      migration: {
+        async acquireLock(collection, options) {
+          if (collection !== "user::__unique_constraints") {
+            return {
+              id: "other-lock",
+              collection,
+              acquiredAt: Date.now(),
+            };
+          }
+
+          if (options?.ttl === 0) {
+            lockEvents.renewals += 1;
+            return {
+              id: `renewed-lock-${String(lockEvents.renewals)}`,
+              collection,
+              acquiredAt: Date.now(),
+            };
+          }
+
+          lockEvents.initial += 1;
+          return {
+            id: "initial-lock",
+            collection,
+            acquiredAt: Date.now(),
+          };
+        },
+        async releaseLock(lock) {
+          releasedLocks.push(lock);
+        },
+        async getOutdated() {
+          return { documents: [], cursor: null };
+        },
+      },
+    };
+
+    const store = createStore(trackingEngine, [buildUserV1WithUniqueEmail()], {
+      uniqueConstraintLock: {
+        ttlMs: 40,
+        maxAttempts: 1,
+        retryDelayMs: 0,
+      },
+    });
+
+    await store.user.create("u1", {
+      id: "u1",
+      name: "Sam",
+      email: "sam@example.com",
+    });
+
+    expect(lockEvents.initial).toBe(1);
+    expect(lockEvents.renewals).toBeGreaterThan(0);
+    expect(releasedLocks).toHaveLength(1);
+    expect(releasedLocks[0]?.id).toBe(`renewed-lock-${String(lockEvents.renewals)}`);
   });
 });
 

@@ -38,6 +38,7 @@ export {
   type MigrationRunProgress,
   type MigrationNextPageResult,
   type CreateStoreOptions,
+  type UniqueConstraintLockOptions,
   type Migrator,
   type MigrationHooks,
   type BoundModel,
