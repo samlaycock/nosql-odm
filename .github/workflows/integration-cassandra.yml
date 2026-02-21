@@ -9,6 +9,8 @@ on:
       - "src/model.ts"
       - "src/migrator.ts"
       - "src/engines/types.ts"
+      - "tests/integration/helpers.ts"
+      - "tests/integration/migration-suite.ts"
       # Adapter-specific files
       - "src/engines/cassandra.ts"
       - "tests/integration/cassandra-engine.test.ts"
