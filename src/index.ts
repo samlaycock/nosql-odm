@@ -55,6 +55,7 @@ export type {
   ComparableVersion,
   ResolvedIndexKeys,
   BatchSetItem,
+  EngineGetResult,
   FieldCondition,
   QueryFilter,
   WhereFilter,

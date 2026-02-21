@@ -3814,6 +3814,11 @@ describe("engine options passthrough", () => {
     calls: unknown[],
     methods: {
       get?: (_collection: string, _id: string, options?: { trace: string }) => Promise<unknown>;
+      getWithMetadata?: (
+        _collection: string,
+        _id: string,
+        options?: { trace: string },
+      ) => Promise<{ doc: unknown; writeToken?: string } | null>;
       create?: (
         _collection: string,
         _id: string,
@@ -3834,15 +3839,37 @@ describe("engine options passthrough", () => {
         _params: unknown,
         options?: { trace: string },
       ) => Promise<{
-        documents: [];
-        cursor: null;
+        documents: { key: string; doc: unknown; writeToken?: string }[];
+        cursor: string | null;
       }>;
-      batchGet?: (_collection: string, _ids: string[], options?: { trace: string }) => Promise<[]>;
+      queryWithMetadata?: (
+        _collection: string,
+        _params: unknown,
+        options?: { trace: string },
+      ) => Promise<{
+        documents: { key: string; doc: unknown; writeToken?: string }[];
+        cursor: string | null;
+      }>;
+      batchGet?: (
+        _collection: string,
+        _ids: string[],
+        options?: { trace: string },
+      ) => Promise<{ key: string; doc: unknown; writeToken?: string }[]>;
+      batchGetWithMetadata?: (
+        _collection: string,
+        _ids: string[],
+        options?: { trace: string },
+      ) => Promise<{ key: string; doc: unknown; writeToken?: string }[]>;
       batchSet?: (
         _collection: string,
         _items: unknown[],
         options?: { trace: string },
       ) => Promise<void>;
+      batchSetWithResult?: (
+        _collection: string,
+        _items: unknown[],
+        options?: { trace: string },
+      ) => Promise<{ persistedKeys: string[]; conflictedKeys: string[] }>;
       batchDelete?: (
         _collection: string,
         _ids: string[],
@@ -3850,7 +3877,7 @@ describe("engine options passthrough", () => {
       ) => Promise<void>;
     } = {},
   ): QueryEngine<{ trace: string }> {
-    return {
+    const engine: QueryEngine<{ trace: string }> = {
       async get(collection, id, options) {
         if (methods.get) {
           return methods.get(collection, id, options);
@@ -3908,6 +3935,28 @@ describe("engine options passthrough", () => {
         },
       },
     };
+
+    if (methods.getWithMetadata) {
+      engine.getWithMetadata = async (collection, id, options) =>
+        methods.getWithMetadata!(collection, id, options);
+    }
+
+    if (methods.batchSetWithResult) {
+      engine.batchSetWithResult = async (collection, items, options) =>
+        methods.batchSetWithResult!(collection, items, options);
+    }
+
+    if (methods.queryWithMetadata) {
+      engine.queryWithMetadata = async (collection, params, options) =>
+        methods.queryWithMetadata!(collection, params, options);
+    }
+
+    if (methods.batchGetWithMetadata) {
+      engine.batchGetWithMetadata = async (collection, ids, options) =>
+        methods.batchGetWithMetadata!(collection, ids, options);
+    }
+
+    return engine;
   }
 
   test("findByKey passes options to engine.get", async () => {
@@ -3955,6 +4004,282 @@ describe("engine options passthrough", () => {
       trace: "lazy-writeback-trace",
     });
     expect((calls[1] as any).items).toBe(1);
+  });
+
+  test("findByKey lazy writeback includes expectedWriteToken from engine.getWithMetadata", async () => {
+    const calls: unknown[] = [];
+    const trackingEngine = buildTrackingEngine(calls, {
+      async getWithMetadata(_collection, _id, options) {
+        calls.push({ method: "getWithMetadata", options });
+        return {
+          doc: {
+            __v: 1,
+            __indexes: ["byEmail", "primary"],
+            id: "u1",
+            name: "Sam Laycock",
+            email: "sam@example.com",
+          },
+          writeToken: "token-u1-v1",
+        };
+      },
+      async batchSetWithResult(_collection, items, options) {
+        calls.push({ method: "batchSetWithResult", options, items });
+        return {
+          persistedKeys: ["u1"],
+          conflictedKeys: [],
+        };
+      },
+    });
+
+    const store = createStore(trackingEngine, [buildUserV2()]);
+    await store.user.findByKey("u1", { trace: "lazy-writeback-token-trace" });
+
+    expect(calls).toHaveLength(2);
+    expect((calls[0] as any).options).toEqual({
+      trace: "lazy-writeback-token-trace",
+    });
+    expect((calls[1] as any).options).toEqual({
+      trace: "lazy-writeback-token-trace",
+    });
+    expect((calls[1] as any).items).toEqual([
+      expect.objectContaining({
+        key: "u1",
+        expectedWriteToken: "token-u1-v1",
+      }),
+    ]);
+  });
+
+  test("query lazy writeback includes expectedWriteToken per migrated document", async () => {
+    const calls: unknown[] = [];
+    const trackingEngine = buildTrackingEngine(calls, {
+      async query(_collection, _params, options) {
+        calls.push({ method: "query", options });
+        return {
+          documents: [
+            {
+              key: "u1",
+              doc: {
+                __v: 1,
+                __indexes: ["byEmail", "primary"],
+                id: "u1",
+                name: "Sam Laycock",
+                email: "sam@example.com",
+              },
+              writeToken: "token-u1-v1",
+            },
+          ],
+          cursor: null,
+        };
+      },
+      async batchSetWithResult(_collection, items, options) {
+        calls.push({ method: "batchSetWithResult", options, items });
+        return {
+          persistedKeys: ["u1"],
+          conflictedKeys: [],
+        };
+      },
+    });
+
+    const store = createStore(trackingEngine, [buildUserV2()]);
+    const result = await store.user.query(
+      {
+        index: "byEmail",
+        filter: { value: "sam@example.com" },
+      },
+      { trace: "query-lazy-writeback-token-trace" },
+    );
+
+    expect(result.documents).toHaveLength(1);
+    expect(calls).toHaveLength(2);
+    expect((calls[1] as any).items).toEqual([
+      expect.objectContaining({
+        key: "u1",
+        expectedWriteToken: "token-u1-v1",
+      }),
+    ]);
+  });
+
+  test("query lazy writeback prefers engine.queryWithMetadata when available", async () => {
+    const calls: unknown[] = [];
+    const trackingEngine = buildTrackingEngine(calls, {
+      async queryWithMetadata(_collection, _params, options) {
+        calls.push({ method: "queryWithMetadata", options });
+        return {
+          documents: [
+            {
+              key: "u1",
+              doc: {
+                __v: 1,
+                __indexes: ["byEmail", "primary"],
+                id: "u1",
+                name: "Sam Laycock",
+                email: "sam@example.com",
+              },
+              writeToken: "token-u1-v1",
+            },
+          ],
+          cursor: null,
+        };
+      },
+      async query(_collection, _params, options) {
+        calls.push({ method: "query", options });
+        return { documents: [], cursor: null };
+      },
+      async batchSetWithResult(_collection, items) {
+        calls.push({ method: "batchSetWithResult", items });
+        return {
+          persistedKeys: ["u1"],
+          conflictedKeys: [],
+        };
+      },
+    });
+
+    const store = createStore(trackingEngine, [buildUserV2()]);
+    await store.user.query({
+      index: "byEmail",
+      filter: { value: "sam@example.com" },
+    });
+
+    expect(calls).toEqual([
+      expect.objectContaining({ method: "queryWithMetadata" }),
+      expect.objectContaining({ method: "batchSetWithResult" }),
+    ]);
+  });
+
+  test("batchGet lazy writeback includes expectedWriteToken per migrated document", async () => {
+    const calls: unknown[] = [];
+    const trackingEngine = buildTrackingEngine(calls, {
+      async batchGet(_collection, _ids, options) {
+        calls.push({ method: "batchGet", options });
+        return [
+          {
+            key: "u1",
+            doc: {
+              __v: 1,
+              __indexes: ["byEmail", "primary"],
+              id: "u1",
+              name: "Sam Laycock",
+              email: "sam@example.com",
+            },
+            writeToken: "token-u1-v1",
+          },
+        ];
+      },
+      async batchSetWithResult(_collection, items, options) {
+        calls.push({ method: "batchSetWithResult", options, items });
+        return {
+          persistedKeys: ["u1"],
+          conflictedKeys: [],
+        };
+      },
+    });
+
+    const store = createStore(trackingEngine, [buildUserV2()]);
+    const result = await store.user.batchGet(["u1"], {
+      trace: "batch-get-lazy-writeback-token-trace",
+    });
+
+    expect(result).toHaveLength(1);
+    expect(calls).toHaveLength(2);
+    expect((calls[1] as any).items).toEqual([
+      expect.objectContaining({
+        key: "u1",
+        expectedWriteToken: "token-u1-v1",
+      }),
+    ]);
+  });
+
+  test("batchGet lazy writeback prefers engine.batchGetWithMetadata when available", async () => {
+    const calls: unknown[] = [];
+    const trackingEngine = buildTrackingEngine(calls, {
+      async batchGetWithMetadata(_collection, _ids, options) {
+        calls.push({ method: "batchGetWithMetadata", options });
+        return [
+          {
+            key: "u1",
+            doc: {
+              __v: 1,
+              __indexes: ["byEmail", "primary"],
+              id: "u1",
+              name: "Sam Laycock",
+              email: "sam@example.com",
+            },
+            writeToken: "token-u1-v1",
+          },
+        ];
+      },
+      async batchGet(_collection, _ids, options) {
+        calls.push({ method: "batchGet", options });
+        return [];
+      },
+      async batchSetWithResult(_collection, items) {
+        calls.push({ method: "batchSetWithResult", items });
+        return {
+          persistedKeys: ["u1"],
+          conflictedKeys: [],
+        };
+      },
+    });
+
+    const store = createStore(trackingEngine, [buildUserV2()]);
+    await store.user.batchGet(["u1"]);
+
+    expect(calls).toEqual([
+      expect.objectContaining({ method: "batchGetWithMetadata" }),
+      expect.objectContaining({ method: "batchSetWithResult" }),
+    ]);
+  });
+
+  test("lazy writeback skips conflicted writes from batchSetWithResult", async () => {
+    const events: ProjectionSkippedEvent[] = [];
+    const trackingEngine = buildTrackingEngine([], {
+      async query() {
+        return {
+          documents: [
+            {
+              key: "u1",
+              doc: {
+                __v: 1,
+                __indexes: ["byEmail", "primary"],
+                id: "u1",
+                name: "Sam Laycock",
+                email: "sam@example.com",
+              },
+              writeToken: "token-u1-v1",
+            },
+          ],
+          cursor: null,
+        };
+      },
+      async batchSetWithResult() {
+        return {
+          persistedKeys: [],
+          conflictedKeys: ["u1"],
+        };
+      },
+    });
+
+    const store = createStore(trackingEngine, [buildUserV2()], {
+      projectionHooks: {
+        onProjectionSkipped(event) {
+          events.push(event);
+        },
+      },
+    });
+
+    const result = await store.user.query({
+      index: "byEmail",
+      filter: { value: "sam@example.com" },
+    });
+
+    expect(result.documents).toHaveLength(1);
+    expect(events).toContainEqual({
+      model: "user",
+      key: "u1",
+      reason: "concurrent_write",
+      operation: "query",
+      error: undefined,
+    });
   });
 
   test("create passes options to engine.create", async () => {

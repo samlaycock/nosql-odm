@@ -34,6 +34,7 @@ interface DocumentRow {
 interface QueryRow {
   key: string;
   doc_json: string;
+  write_version: number;
 }
 
 interface CursorRow {
@@ -81,9 +82,10 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
   configureDatabase(db, options);
   runMigrations(db);
 
-  const selectDocumentByKeyStmt = db.prepare<[string, string], { doc_json: string } | undefined>(
-    `SELECT doc_json FROM documents WHERE collection = ? AND doc_key = ?`,
-  );
+  const selectDocumentByKeyStmt = db.prepare<
+    [string, string],
+    { doc_json: string; write_version: number } | undefined
+  >(`SELECT doc_json, write_version FROM documents WHERE collection = ? AND doc_key = ?`);
 
   const upsertDocumentStmt = db.prepare<[string, string, string]>(`
     INSERT INTO documents (collection, doc_key, doc_json)
@@ -148,7 +150,7 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
   );
 
   const queryScanPageStmt = db.prepare<[string, number, number], QueryRow>(`
-    SELECT doc_key AS key, doc_json
+    SELECT doc_key AS key, doc_json, write_version
     FROM documents
     WHERE collection = ? AND id > ?
     ORDER BY id ASC
@@ -509,6 +511,19 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
       return parseStoredDocument(row.doc_json, collection, key);
     },
 
+    async getWithMetadata(collection, key) {
+      const row = selectDocumentByKeyStmt.get(collection, key);
+
+      if (!row) {
+        return null;
+      }
+
+      return {
+        doc: parseStoredDocument(row.doc_json, collection, key),
+        writeToken: String(row.write_version),
+      };
+    },
+
     async create(collection, key, doc, indexes, _options, migrationMetadata, uniqueIndexes) {
       const docJson = serializeDocument(doc, collection, key);
       const metadata = normalizeMigrationMetadata(migrationMetadata) ?? deriveLegacyMetadata(doc);
@@ -553,6 +568,14 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
       return queryByIndex(collection, params);
     },
 
+    async queryWithMetadata(collection, params) {
+      if (!params.index || !params.filter) {
+        return queryByCollectionScan(collection, params, true);
+      }
+
+      return queryByIndex(collection, params, true);
+    },
+
     async batchGet(collection, keys) {
       const results: KeyedDocument[] = [];
 
@@ -566,6 +589,26 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
         results.push({
           key,
           doc: parseStoredDocument(row.doc_json, collection, key),
+        });
+      }
+
+      return results;
+    },
+
+    async batchGetWithMetadata(collection, keys) {
+      const results: KeyedDocument[] = [];
+
+      for (const key of keys) {
+        const row = selectDocumentByKeyStmt.get(collection, key);
+
+        if (!row) {
+          continue;
+        }
+
+        results.push({
+          key,
+          doc: parseStoredDocument(row.doc_json, collection, key),
+          writeToken: String(row.write_version),
         });
       }
 
@@ -656,7 +699,11 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
     },
   };
 
-  function queryByCollectionScan(collection: string, params: QueryParams): EngineQueryResult {
+  function queryByCollectionScan(
+    collection: string,
+    params: QueryParams,
+    includeWriteTokens = false,
+  ): EngineQueryResult {
     const limit = normalizeLimit(params.limit);
 
     if (limit === 0) {
@@ -667,10 +714,14 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
     const fetchLimit = limit === null ? Number.MAX_SAFE_INTEGER : limit + 1;
     const rows = queryScanPageStmt.all(collection, cursorId, fetchLimit);
 
-    return formatPage(rows, limit, collection);
+    return formatPage(rows, limit, collection, includeWriteTokens);
   }
 
-  function queryByIndex(collection: string, params: QueryParams): EngineQueryResult {
+  function queryByIndex(
+    collection: string,
+    params: QueryParams,
+    includeWriteTokens = false,
+  ): EngineQueryResult {
     const limit = normalizeLimit(params.limit);
 
     if (limit === 0) {
@@ -715,7 +766,7 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
 
     const fetchLimit = limit === null ? Number.MAX_SAFE_INTEGER : limit + 1;
     const sql = `
-      SELECT d.doc_key AS key, d.doc_json
+      SELECT d.doc_key AS key, d.doc_json, d.write_version
       FROM index_entries ix
       INNER JOIN documents d
         ON d.collection = ix.collection
@@ -727,7 +778,7 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
 
     const rows = db.prepare(sql).all(...args, fetchLimit) as QueryRow[];
 
-    return formatPage(rows, limit, collection);
+    return formatPage(rows, limit, collection, includeWriteTokens);
   }
 
   function resolveIndexedCursor(
@@ -763,16 +814,28 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
     rows: QueryRow[],
     limit: number | null,
     collection: string,
+    includeWriteTokens = false,
   ): EngineQueryResult {
     const hasLimit = limit !== null;
     const hasMore = hasLimit && rows.length > limit;
     const pageRows = hasMore ? rows.slice(0, limit) : rows;
 
     return {
-      documents: pageRows.map((row) => ({
-        key: row.key,
-        doc: parseStoredDocument(row.doc_json, collection, row.key),
-      })),
+      documents: pageRows.map((row) => {
+        const doc = {
+          key: row.key,
+          doc: parseStoredDocument(row.doc_json, collection, row.key),
+        };
+
+        if (!includeWriteTokens) {
+          return doc;
+        }
+
+        return {
+          ...doc,
+          writeToken: String(row.write_version),
+        };
+      }),
       cursor: hasMore ? (pageRows[pageRows.length - 1]?.key ?? null) : null,
     };
   }

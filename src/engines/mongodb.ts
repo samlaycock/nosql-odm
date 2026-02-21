@@ -141,6 +141,26 @@ export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine
       return structuredClone(record.doc);
     },
 
+    async getWithMetadata(collection, key) {
+      await ready;
+
+      const raw = await documentsCollection.findOne({
+        collection,
+        key,
+      });
+
+      if (!raw) {
+        return null;
+      }
+
+      const record = parseStoredDocumentRecord(raw);
+
+      return {
+        doc: structuredClone(record.doc),
+        writeToken: String(record.writeVersion),
+      };
+    },
+
     async create(collection, key, doc, indexes, _options, migrationMetadata) {
       await ready;
 
@@ -254,6 +274,15 @@ export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine
       return paginate(matched, params);
     },
 
+    async queryWithMetadata(collection, params) {
+      await ready;
+
+      const records = await listCollectionDocuments(documentsCollection, collection);
+      const matched = matchDocuments(records, params);
+
+      return paginateWithWriteTokens(matched, params);
+    },
+
     async batchGet(collection, keys) {
       await ready;
 
@@ -291,6 +320,50 @@ export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine
         results.push({
           key,
           doc: structuredClone(record.doc),
+        });
+      }
+
+      return results;
+    },
+
+    async batchGetWithMetadata(collection, keys) {
+      await ready;
+
+      const uniqueKeys = uniqueStrings(keys);
+
+      if (uniqueKeys.length === 0) {
+        return [];
+      }
+
+      const raws = await documentsCollection
+        .find({
+          collection,
+          key: {
+            $in: uniqueKeys,
+          },
+        })
+        .toArray();
+
+      const fetched = new Map<string, StoredDocumentRecord>();
+
+      for (const raw of raws) {
+        const record = parseStoredDocumentRecord(raw);
+        fetched.set(record.key, record);
+      }
+
+      const results: KeyedDocument[] = [];
+
+      for (const key of keys) {
+        const record = fetched.get(key);
+
+        if (!record) {
+          continue;
+        }
+
+        results.push({
+          key,
+          doc: structuredClone(record.doc),
+          writeToken: String(record.writeVersion),
         });
       }
 
@@ -1388,6 +1461,47 @@ function paginate(records: StoredDocumentRecord[], params: QueryParams): EngineQ
     documents: page.map((record) => ({
       key: record.key,
       doc: structuredClone(record.doc),
+    })),
+    cursor,
+  };
+}
+
+function paginateWithWriteTokens(
+  records: StoredDocumentRecord[],
+  params: QueryParams,
+): EngineQueryResult {
+  let startIndex = 0;
+
+  if (params.cursor) {
+    const cursorIndex = records.findIndex((record) => record.key === params.cursor);
+
+    if (cursorIndex !== -1) {
+      startIndex = cursorIndex + 1;
+    }
+  }
+
+  const normalizedLimit = normalizeLimit(params.limit);
+  const limit = normalizedLimit ?? records.length;
+  const hasLimit = normalizedLimit !== null;
+
+  if (limit <= 0) {
+    return {
+      documents: [],
+      cursor: null,
+    };
+  }
+
+  const page = records.slice(startIndex, startIndex + limit);
+  const cursor =
+    page.length > 0 && hasLimit && startIndex + limit < records.length
+      ? page[page.length - 1]!.key
+      : null;
+
+  return {
+    documents: page.map((record) => ({
+      key: record.key,
+      doc: structuredClone(record.doc),
+      writeToken: String(record.writeVersion),
     })),
     cursor,
   };
