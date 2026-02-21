@@ -242,6 +242,11 @@ export class MissingMigratorError extends Error {
 
 export { MigrationScopeConflictError };
 
+export interface UniqueConstraintPrecheckOptions {
+  /** Maximum number of unique pre-check queries to run in parallel. */
+  concurrency?: number;
+}
+
 export interface UniqueConstraintLockOptions {
   /** Lock TTL in milliseconds for unique-constraint guards. */
   ttlMs?: number;
@@ -260,6 +265,7 @@ export interface CreateStoreOptions<TOptions = Record<string, unknown>> {
   migrator?: Migrator<TOptions>;
   migrationHooks?: MigrationHooks;
   projectionHooks?: ProjectionHooks;
+  uniqueConstraintPrecheck?: UniqueConstraintPrecheckOptions;
   uniqueConstraintLock?: UniqueConstraintLockOptions;
 }
 
@@ -349,6 +355,26 @@ function resolveUniqueConstraintLockOptions(
 
 type JsonPrimitive = string | number | boolean | null;
 type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
+
+const DEFAULT_UNIQUE_CONSTRAINT_PRECHECK_CONCURRENCY = 8;
+
+function resolveUniqueConstraintPrecheckConcurrency(
+  options?: UniqueConstraintPrecheckOptions,
+): number {
+  const concurrency = options?.concurrency;
+
+  if (concurrency === undefined || concurrency === null) {
+    return DEFAULT_UNIQUE_CONSTRAINT_PRECHECK_CONCURRENCY;
+  }
+
+  if (!Number.isFinite(concurrency) || !Number.isInteger(concurrency) || concurrency < 1) {
+    throw new Error(
+      'createStore option "uniqueConstraintPrecheck.concurrency" must be an integer >= 1',
+    );
+  }
+
+  return concurrency;
+}
 
 function ensureJsonCompatibleDocument(
   value: object,
@@ -447,6 +473,60 @@ function ensureJsonCompatibleDocument(
   return value as Record<string, unknown>;
 }
 
+async function forEachWithConcurrencyLimit<T>(
+  items: readonly T[],
+  limit: number,
+  worker: (item: T) => Promise<void>,
+): Promise<void> {
+  if (items.length === 0) {
+    return;
+  }
+
+  const state: {
+    nextIndex: number;
+    firstError: Error | null;
+  } = {
+    nextIndex: 0,
+    firstError: null,
+  };
+
+  const runner = async (): Promise<void> => {
+    while (true) {
+      if (state.firstError !== null) {
+        return;
+      }
+
+      const index = state.nextIndex;
+
+      if (index >= items.length) {
+        return;
+      }
+
+      state.nextIndex = index + 1;
+
+      try {
+        await worker(items[index] as T);
+      } catch (error) {
+        if (state.firstError === null) {
+          state.firstError =
+            error instanceof Error
+              ? error
+              : new Error("Concurrent worker failed", {
+                  cause: error,
+                });
+        }
+        return;
+      }
+    }
+  };
+
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => runner()));
+
+  if (state.firstError !== null) {
+    throw state.firstError;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // BoundModel — a model bound to an engine
 // ---------------------------------------------------------------------------
@@ -461,6 +541,7 @@ class BoundModelImpl<
   private engine: QueryEngine<TOptions>;
   private migrator: Migrator<TOptions> | null;
   private projectionHooks: ProjectionHooks | undefined;
+  private uniqueConstraintPrecheckConcurrency: number;
   private uniqueConstraintLockOptions: ResolvedUniqueConstraintLockOptions;
 
   constructor(
@@ -469,6 +550,7 @@ class BoundModelImpl<
     migrator: Migrator<TOptions> | null,
     projectionHooks?: ProjectionHooks,
     uniqueConstraintLockOptions?: ResolvedUniqueConstraintLockOptions,
+    uniqueConstraintPrecheckConcurrency = DEFAULT_UNIQUE_CONSTRAINT_PRECHECK_CONCURRENCY,
   ) {
     this.model = model;
     this.engine = engine;
@@ -476,6 +558,7 @@ class BoundModelImpl<
     this.projectionHooks = projectionHooks;
     this.uniqueConstraintLockOptions =
       uniqueConstraintLockOptions ?? resolveUniqueConstraintLockOptions();
+    this.uniqueConstraintPrecheckConcurrency = uniqueConstraintPrecheckConcurrency;
   }
 
   async findByKey(key: string, options?: TOptions): Promise<T | null> {
@@ -1304,40 +1387,44 @@ class BoundModelImpl<
       }
     }
 
-    for (const [token, ownerKey] of ownerByIndexValue) {
-      const separator = token.indexOf("\u0000");
-      const indexName = token.slice(0, separator);
-      const indexValue = token.slice(separator + 1);
-      const result = await this.engine.query(
-        this.model.name,
-        {
-          index: indexName,
-          filter: { value: indexValue },
-          limit: 10,
-        },
-        options,
-      );
-
-      for (const { key: existingKey } of result.documents) {
-        if (existingKey === ownerKey) {
-          continue;
-        }
-
-        const plannedForExisting = candidateByKey.get(existingKey);
-
-        if (plannedForExisting && plannedForExisting[indexName] !== indexValue) {
-          continue;
-        }
-
-        throw new UniqueConstraintError(
+    await forEachWithConcurrencyLimit(
+      Array.from(ownerByIndexValue.entries()),
+      this.uniqueConstraintPrecheckConcurrency,
+      async ([token, ownerKey]) => {
+        const separator = token.indexOf("\u0000");
+        const indexName = token.slice(0, separator);
+        const indexValue = token.slice(separator + 1);
+        const result = await this.engine.query(
           this.model.name,
-          ownerKey,
-          indexName,
-          indexValue,
-          existingKey,
+          {
+            index: indexName,
+            filter: { value: indexValue },
+            limit: 10,
+          },
+          options,
         );
-      }
-    }
+
+        for (const { key: existingKey } of result.documents) {
+          if (existingKey === ownerKey) {
+            continue;
+          }
+
+          const plannedForExisting = candidateByKey.get(existingKey);
+
+          if (plannedForExisting && plannedForExisting[indexName] !== indexValue) {
+            continue;
+          }
+
+          throw new UniqueConstraintError(
+            this.model.name,
+            ownerKey,
+            indexName,
+            indexValue,
+            existingKey,
+          );
+        }
+      },
+    );
   }
 
   // Resolves query params: `where` shorthand → `index`/`filter`, or pass through
@@ -1471,6 +1558,9 @@ export function createStore<
   const uniqueConstraintLockOptions = resolveUniqueConstraintLockOptions(
     options?.uniqueConstraintLock,
   );
+  const uniqueConstraintPrecheckConcurrency = resolveUniqueConstraintPrecheckConcurrency(
+    options?.uniqueConstraintPrecheck,
+  );
   const boundModels = new Map<string, BoundModelImpl<any, TOptions, any, any>>();
 
   for (const modelDef of models) {
@@ -1494,6 +1584,7 @@ export function createStore<
         migrator,
         options?.projectionHooks,
         uniqueConstraintLockOptions,
+        uniqueConstraintPrecheckConcurrency,
       ),
     );
   }
