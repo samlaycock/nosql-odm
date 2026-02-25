@@ -240,14 +240,18 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
     },
 
     async query(collection, params) {
-      const records = await listCollectionDocuments(documentsCollection, collection);
+      const records =
+        (await listCollectionDocumentsByQuery(documentsCollection, collection, params)) ??
+        (await listCollectionDocuments(documentsCollection, collection));
       const matched = matchDocuments(records, params);
 
       return paginate(matched, params);
     },
 
     async queryWithMetadata(collection, params) {
-      const records = await listCollectionDocuments(documentsCollection, collection);
+      const records =
+        (await listCollectionDocumentsByQuery(documentsCollection, collection, params)) ??
+        (await listCollectionDocuments(documentsCollection, collection));
       const matched = matchDocuments(records, params);
 
       return paginateWithWriteTokens(matched, params);
@@ -688,6 +692,137 @@ async function listCollectionDocuments(
 
   return records;
 }
+
+async function listCollectionDocumentsByQuery(
+  documentsCollection: FirestoreCollectionLike,
+  collection: string,
+  params: QueryParams,
+): Promise<StoredDocumentRecord[] | null> {
+  if (!params.index || !params.filter) {
+    return null;
+  }
+
+  const filters = buildFirestoreWhereFilters(params.filter.value);
+
+  if (!filters) {
+    return null;
+  }
+
+  let query: FirestoreQueryLike = documentsCollection.where("collection", "==", collection);
+  const indexField = `indexes.${params.index}`;
+
+  for (const filter of filters) {
+    query = query.where(indexField, filter.op, filter.value);
+  }
+
+  const raw = await query.get();
+  const snapshot = parseQuerySnapshot(raw, "document record");
+  const records: StoredDocumentRecord[] = [];
+
+  for (const doc of snapshot.docs) {
+    records.push(parseStoredDocumentRecord(snapshotData(doc, "document record")));
+  }
+
+  records.sort((a, b) => {
+    if (a.createdAt !== b.createdAt) {
+      return a.createdAt - b.createdAt;
+    }
+
+    return a.key.localeCompare(b.key);
+  });
+
+  return records;
+}
+
+interface FirestoreWhereClause {
+  op: string;
+  value: unknown;
+}
+
+function buildFirestoreWhereFilters(
+  filter: string | number | FieldCondition,
+): FirestoreWhereClause[] | null {
+  if (typeof filter === "string" || typeof filter === "number") {
+    return [{ op: "==", value: String(filter) }];
+  }
+
+  const keys = Object.keys(filter);
+
+  if (keys.some((key) => !FIRESTORE_SUPPORTED_FILTER_KEYS.has(key))) {
+    return null;
+  }
+
+  const hasEq = filter.$eq !== undefined;
+  const hasBegins = filter.$begins !== undefined;
+  const hasBetween = filter.$between !== undefined;
+  const hasRange =
+    filter.$gt !== undefined ||
+    filter.$gte !== undefined ||
+    filter.$lt !== undefined ||
+    filter.$lte !== undefined;
+
+  if (hasEq && (hasBegins || hasBetween || hasRange)) {
+    return null;
+  }
+
+  if (hasBegins && (hasEq || hasBetween || hasRange)) {
+    return null;
+  }
+
+  if (hasBetween && (hasEq || hasBegins || hasRange)) {
+    return null;
+  }
+
+  if (hasEq) {
+    return [{ op: "==", value: String(filter.$eq as string | number) }];
+  }
+
+  if (hasBegins) {
+    return [
+      { op: ">=", value: filter.$begins },
+      { op: "<=", value: `${filter.$begins}\uf8ff` },
+    ];
+  }
+
+  if (hasBetween) {
+    const [low, high] = filter.$between as [string | number, string | number];
+
+    return [
+      { op: ">=", value: String(low) },
+      { op: "<=", value: String(high) },
+    ];
+  }
+
+  const clauses: FirestoreWhereClause[] = [];
+
+  if (filter.$gt !== undefined) {
+    clauses.push({ op: ">", value: String(filter.$gt as string | number) });
+  }
+
+  if (filter.$gte !== undefined) {
+    clauses.push({ op: ">=", value: String(filter.$gte as string | number) });
+  }
+
+  if (filter.$lt !== undefined) {
+    clauses.push({ op: "<", value: String(filter.$lt as string | number) });
+  }
+
+  if (filter.$lte !== undefined) {
+    clauses.push({ op: "<=", value: String(filter.$lte as string | number) });
+  }
+
+  return clauses.length > 0 ? clauses : null;
+}
+
+const FIRESTORE_SUPPORTED_FILTER_KEYS = new Set([
+  "$eq",
+  "$gt",
+  "$gte",
+  "$lt",
+  "$lte",
+  "$begins",
+  "$between",
+]);
 
 async function syncMigrationMetadataForCriteria(
   database: FirestoreLike,

@@ -268,6 +268,12 @@ export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine
     async query(collection, params) {
       await ready;
 
+      const native = await queryDocumentsNative(documentsCollection, collection, params);
+
+      if (native) {
+        return nativeToQueryResult(native.records, native.cursor, false);
+      }
+
       const records = await listCollectionDocuments(documentsCollection, collection);
       const matched = matchDocuments(records, params);
 
@@ -276,6 +282,12 @@ export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine
 
     async queryWithMetadata(collection, params) {
       await ready;
+
+      const native = await queryDocumentsNative(documentsCollection, collection, params);
+
+      if (native) {
+        return nativeToQueryResult(native.records, native.cursor, true);
+      }
 
       const records = await listCollectionDocuments(documentsCollection, collection);
       const matched = matchDocuments(records, params);
@@ -787,6 +799,279 @@ async function listCollectionDocuments(
     .toArray();
 
   return raws.map(parseStoredDocumentRecord);
+}
+
+interface MongoNativeQueryPlan {
+  indexName: string;
+  filter: Record<string, unknown>;
+  sort: Record<string, 1 | -1>;
+  limit: number | null;
+}
+
+interface MongoNativeQueryResult {
+  records: StoredDocumentRecord[];
+  cursor: string | null;
+}
+
+async function queryDocumentsNative(
+  documentsCollection: MongoCollectionLike,
+  collection: string,
+  params: QueryParams,
+): Promise<MongoNativeQueryResult | null> {
+  const plan = buildMongoNativeQueryPlan(collection, params);
+
+  if (!plan) {
+    return null;
+  }
+
+  if (plan.limit === 0) {
+    return {
+      records: [],
+      cursor: null,
+    };
+  }
+
+  let queryFilter = plan.filter;
+
+  if (params.cursor) {
+    const cursorRaw = await documentsCollection.findOne({
+      collection,
+      key: params.cursor,
+    });
+
+    if (cursorRaw) {
+      const cursorRecord = parseStoredDocumentRecord(cursorRaw);
+      const cursorPredicate = buildMongoCursorPredicate(cursorRecord, plan, params);
+
+      if (cursorPredicate) {
+        queryFilter = {
+          ...queryFilter,
+          ...cursorPredicate,
+        };
+      }
+    }
+  }
+
+  let cursor = documentsCollection.find(queryFilter).sort(plan.sort);
+  const requestedLimit = plan.limit;
+
+  if (requestedLimit !== null) {
+    cursor = cursor.limit(requestedLimit + 1);
+  }
+
+  const raws = await cursor.toArray();
+  const parsed = raws.map((raw) => parseStoredDocumentRecord(raw));
+
+  if (requestedLimit === null) {
+    return {
+      records: parsed,
+      cursor: null,
+    };
+  }
+
+  const hasMore = parsed.length > requestedLimit;
+  const records = hasMore ? parsed.slice(0, requestedLimit) : parsed;
+
+  return {
+    records,
+    cursor: hasMore && records.length > 0 ? records[records.length - 1]!.key : null,
+  };
+}
+
+function buildMongoNativeQueryPlan(
+  collection: string,
+  params: QueryParams,
+): MongoNativeQueryPlan | null {
+  if (!params.index || !params.filter) {
+    return null;
+  }
+
+  const mongoIndexFilter = buildMongoIndexFilter(params.filter.value);
+
+  if (!mongoIndexFilter) {
+    return null;
+  }
+
+  const indexField = `indexes.${params.index}`;
+
+  return {
+    indexName: params.index,
+    filter: {
+      collection,
+      [indexField]: mongoIndexFilter,
+    },
+    sort:
+      params.sort && params.index
+        ? {
+            [indexField]: params.sort === "desc" ? -1 : 1,
+            createdAt: 1,
+            key: 1,
+          }
+        : {
+            createdAt: 1,
+            key: 1,
+          },
+    limit: normalizeLimit(params.limit),
+  };
+}
+
+function buildMongoIndexFilter(
+  filter: string | number | FieldCondition,
+): Record<string, unknown> | string | null {
+  if (typeof filter === "string" || typeof filter === "number") {
+    return String(filter);
+  }
+
+  const keys = Object.keys(filter);
+
+  if (keys.some((key) => !MONGO_SUPPORTED_FILTER_KEYS.has(key))) {
+    return null;
+  }
+
+  const hasEq = filter.$eq !== undefined;
+  const hasBegins = filter.$begins !== undefined;
+  const hasBetween = filter.$between !== undefined;
+  const hasRange =
+    filter.$gt !== undefined ||
+    filter.$gte !== undefined ||
+    filter.$lt !== undefined ||
+    filter.$lte !== undefined;
+
+  if (hasEq && (hasBegins || hasBetween || hasRange)) {
+    return null;
+  }
+
+  if (hasBegins && (hasEq || hasBetween || hasRange)) {
+    return null;
+  }
+
+  if (hasBetween && (hasEq || hasBegins || hasRange)) {
+    return null;
+  }
+
+  if (hasEq) {
+    return String(filter.$eq as string | number);
+  }
+
+  if (hasBegins) {
+    return {
+      $regex: `^${escapeMongoRegex(filter.$begins as string)}`,
+    };
+  }
+
+  if (hasBetween) {
+    const [low, high] = filter.$between as [string | number, string | number];
+
+    return {
+      $gte: String(low),
+      $lte: String(high),
+    };
+  }
+
+  const mongoFilter: Record<string, unknown> = {};
+
+  if (filter.$gt !== undefined) {
+    mongoFilter.$gt = String(filter.$gt as string | number);
+  }
+
+  if (filter.$gte !== undefined) {
+    mongoFilter.$gte = String(filter.$gte as string | number);
+  }
+
+  if (filter.$lt !== undefined) {
+    mongoFilter.$lt = String(filter.$lt as string | number);
+  }
+
+  if (filter.$lte !== undefined) {
+    mongoFilter.$lte = String(filter.$lte as string | number);
+  }
+
+  return Object.keys(mongoFilter).length > 0 ? mongoFilter : null;
+}
+
+function buildMongoCursorPredicate(
+  cursorRecord: StoredDocumentRecord,
+  plan: MongoNativeQueryPlan,
+  params: QueryParams,
+): Record<string, unknown> | null {
+  const cursorIndexValue = cursorRecord.indexes[plan.indexName];
+
+  if (cursorIndexValue === undefined || !matchesFilter(cursorIndexValue, params.filter!.value)) {
+    return null;
+  }
+
+  if (!params.sort) {
+    return {
+      $or: [
+        {
+          createdAt: {
+            $gt: cursorRecord.createdAt,
+          },
+        },
+        {
+          createdAt: cursorRecord.createdAt,
+          key: {
+            $gt: cursorRecord.key,
+          },
+        },
+      ],
+    };
+  }
+
+  const indexField = `indexes.${plan.indexName}`;
+  const primaryOp = params.sort === "desc" ? "$lt" : "$gt";
+
+  return {
+    $or: [
+      {
+        [indexField]: {
+          [primaryOp]: cursorIndexValue,
+        },
+      },
+      {
+        [indexField]: cursorIndexValue,
+        createdAt: {
+          $gt: cursorRecord.createdAt,
+        },
+      },
+      {
+        [indexField]: cursorIndexValue,
+        createdAt: cursorRecord.createdAt,
+        key: {
+          $gt: cursorRecord.key,
+        },
+      },
+    ],
+  };
+}
+
+function nativeToQueryResult(
+  records: StoredDocumentRecord[],
+  cursor: string | null,
+  includeWriteTokens: boolean,
+): EngineQueryResult {
+  return {
+    documents: records.map((record) => ({
+      key: record.key,
+      doc: structuredClone(record.doc),
+      ...(includeWriteTokens ? { writeToken: String(record.writeVersion) } : {}),
+    })),
+    cursor,
+  };
+}
+
+const MONGO_SUPPORTED_FILTER_KEYS = new Set([
+  "$eq",
+  "$gt",
+  "$gte",
+  "$lt",
+  "$lte",
+  "$begins",
+  "$between",
+]);
+
+function escapeMongoRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 async function syncMigrationMetadataForCriteria(
