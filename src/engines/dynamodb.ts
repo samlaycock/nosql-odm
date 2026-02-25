@@ -312,14 +312,18 @@ export function dynamoDbEngine(options: DynamoDbEngineOptions): DynamoDbQueryEng
     },
 
     async query(collection, params) {
-      const records = await listDocuments(client, tableName, keyConfig, collection);
+      const records =
+        (await listDocumentsByQuery(client, tableName, keyConfig, collection, params)) ??
+        (await listDocuments(client, tableName, keyConfig, collection));
       const matched = matchDocuments(records, params);
 
       return paginate(matched, params);
     },
 
     async queryWithMetadata(collection, params) {
-      const records = await listDocuments(client, tableName, keyConfig, collection);
+      const records =
+        (await listDocumentsByQuery(client, tableName, keyConfig, collection, params)) ??
+        (await listDocuments(client, tableName, keyConfig, collection));
       const matched = matchDocuments(records, params);
 
       return paginateWithWriteTokens(matched, params);
@@ -1042,6 +1046,195 @@ async function listDocuments(
 
   return records;
 }
+
+async function listDocumentsByQuery(
+  client: DynamoDbDocumentClientLike,
+  tableName: string,
+  keyConfig: DynamoKeyConfig,
+  collection: string,
+  params: QueryParams,
+): Promise<StoredDocumentItem[] | null> {
+  if (!params.index || !params.filter) {
+    return null;
+  }
+
+  const filterExpression = buildDynamoFilterExpression(params.filter.value);
+
+  if (!filterExpression) {
+    return null;
+  }
+
+  const pk = collectionPartitionKey(collection);
+  const records: StoredDocumentItem[] = [];
+  let cursor: Record<string, unknown> | undefined;
+
+  do {
+    const input: QueryCommandInput = {
+      TableName: tableName,
+      KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :docPrefix)",
+      FilterExpression: filterExpression.expression,
+      ExpressionAttributeNames: {
+        "#pk": keyConfig.hashKeyName,
+        "#sk": keyConfig.sortKeyName,
+        "#indexes": "indexes",
+        "#indexName": params.index,
+        ...filterExpression.expressionAttributeNames,
+      },
+      ExpressionAttributeValues: {
+        ":pk": pk,
+        ":docPrefix": "DOC#",
+        ...filterExpression.expressionAttributeValues,
+      },
+      ExclusiveStartKey: cursor,
+    };
+
+    const response = (await client.send(new QueryCommand(input))) as {
+      Items?: unknown[];
+      LastEvaluatedKey?: Record<string, unknown>;
+    };
+
+    for (const item of response.Items ?? []) {
+      records.push(parseDocumentItem(item, keyConfig));
+    }
+
+    cursor = response.LastEvaluatedKey;
+  } while (cursor);
+
+  records.sort((a, b) => {
+    if (a.createdAt !== b.createdAt) {
+      return a.createdAt - b.createdAt;
+    }
+
+    return a.key.localeCompare(b.key);
+  });
+
+  return records;
+}
+
+interface DynamoFilterExpression {
+  expression: string;
+  expressionAttributeNames: Record<string, string>;
+  expressionAttributeValues: Record<string, unknown>;
+}
+
+function buildDynamoFilterExpression(
+  filter: string | number | FieldCondition,
+): DynamoFilterExpression | null {
+  const fieldRef = "#indexes.#indexName";
+
+  if (typeof filter === "string" || typeof filter === "number") {
+    return {
+      expression: `${fieldRef} = :f_eq`,
+      expressionAttributeNames: {},
+      expressionAttributeValues: {
+        ":f_eq": String(filter),
+      },
+    };
+  }
+
+  const keys = Object.keys(filter);
+
+  if (keys.some((key) => !DYNAMO_SUPPORTED_FILTER_KEYS.has(key))) {
+    return null;
+  }
+
+  const hasEq = filter.$eq !== undefined;
+  const hasBegins = filter.$begins !== undefined;
+  const hasBetween = filter.$between !== undefined;
+  const hasRange =
+    filter.$gt !== undefined ||
+    filter.$gte !== undefined ||
+    filter.$lt !== undefined ||
+    filter.$lte !== undefined;
+
+  if (hasEq && (hasBegins || hasBetween || hasRange)) {
+    return null;
+  }
+
+  if (hasBegins && (hasEq || hasBetween || hasRange)) {
+    return null;
+  }
+
+  if (hasBetween && (hasEq || hasBegins || hasRange)) {
+    return null;
+  }
+
+  if (hasEq) {
+    return {
+      expression: `${fieldRef} = :f_eq`,
+      expressionAttributeNames: {},
+      expressionAttributeValues: {
+        ":f_eq": String(filter.$eq as string | number),
+      },
+    };
+  }
+
+  if (hasBegins) {
+    return {
+      expression: `begins_with(${fieldRef}, :f_begins)`,
+      expressionAttributeNames: {},
+      expressionAttributeValues: {
+        ":f_begins": filter.$begins,
+      },
+    };
+  }
+
+  if (hasBetween) {
+    const [low, high] = filter.$between as [string | number, string | number];
+
+    return {
+      expression: `${fieldRef} BETWEEN :f_low AND :f_high`,
+      expressionAttributeNames: {},
+      expressionAttributeValues: {
+        ":f_low": String(low),
+        ":f_high": String(high),
+      },
+    };
+  }
+
+  const clauses: string[] = [];
+  const values: Record<string, unknown> = {};
+
+  if (filter.$gt !== undefined) {
+    clauses.push(`${fieldRef} > :f_gt`);
+    values[":f_gt"] = String(filter.$gt as string | number);
+  }
+
+  if (filter.$gte !== undefined) {
+    clauses.push(`${fieldRef} >= :f_gte`);
+    values[":f_gte"] = String(filter.$gte as string | number);
+  }
+
+  if (filter.$lt !== undefined) {
+    clauses.push(`${fieldRef} < :f_lt`);
+    values[":f_lt"] = String(filter.$lt as string | number);
+  }
+
+  if (filter.$lte !== undefined) {
+    clauses.push(`${fieldRef} <= :f_lte`);
+    values[":f_lte"] = String(filter.$lte as string | number);
+  }
+
+  if (clauses.length === 0) {
+    return null;
+  }
+
+  return {
+    expression: clauses.join(" AND "),
+    expressionAttributeNames: {},
+    expressionAttributeValues: values,
+  };
+}
+
+const DYNAMO_SUPPORTED_FILTER_KEYS = new Set([
+  "$eq",
+  "$gt",
+  "$gte",
+  "$lt",
+  "$lte",
+  "$begins",
+  "$between",
+]);
 
 async function batchGetDocuments(
   client: DynamoDbDocumentClientLike,
