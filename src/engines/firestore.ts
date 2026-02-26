@@ -1,5 +1,9 @@
 import { DefaultMigrator } from "../migrator";
-import { encodeQueryPageCursor, resolveQueryPageStartIndex } from "./query-cursor";
+import {
+  encodeQueryPageCursor,
+  resolveQueryPageStartIndex,
+  validateQueryPageCursor,
+} from "./query-cursor";
 import {
   type BatchSetResult,
   EngineDocumentAlreadyExistsError,
@@ -241,6 +245,7 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
     },
 
     async query(collection, params) {
+      validateQueryPageCursor(collection, params);
       const records =
         (await listCollectionDocumentsByQuery(documentsCollection, collection, params)) ??
         (await listCollectionDocuments(documentsCollection, collection));
@@ -250,6 +255,7 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
     },
 
     async queryWithMetadata(collection, params) {
+      validateQueryPageCursor(collection, params);
       const records =
         (await listCollectionDocumentsByQuery(documentsCollection, collection, params)) ??
         (await listCollectionDocuments(documentsCollection, collection));

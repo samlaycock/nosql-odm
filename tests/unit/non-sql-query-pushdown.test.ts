@@ -249,6 +249,7 @@ class FakeFirestoreQuery {
   constructor(
     protected readonly docs: AnyRecord[],
     protected readonly whereCalls: Array<{ field: string; op: string; value: unknown }>,
+    protected readonly onGet: () => void = () => {},
   ) {}
 
   where(fieldPath: string, opStr: string, value: unknown) {
@@ -280,7 +281,7 @@ class FakeFirestoreQuery {
       throw new Error(`Unsupported op ${opStr}`);
     });
 
-    return new FakeFirestoreQuery(filtered, this.whereCalls);
+    return new FakeFirestoreQuery(filtered, this.whereCalls, this.onGet);
   }
 
   limit(_limit: number) {
@@ -288,6 +289,7 @@ class FakeFirestoreQuery {
   }
 
   async get() {
+    this.onGet();
     const snapshots: FakeFirestoreDocSnapshot[] = this.docs.map((doc) => ({
       exists: true,
       id: String(doc.key),
@@ -299,8 +301,12 @@ class FakeFirestoreQuery {
 }
 
 class FakeFirestoreCollection extends FakeFirestoreQuery {
-  constructor(docs: AnyRecord[], whereCalls: Array<{ field: string; op: string; value: unknown }>) {
-    super(docs, whereCalls);
+  constructor(
+    docs: AnyRecord[],
+    whereCalls: Array<{ field: string; op: string; value: unknown }>,
+    onGet?: () => void,
+  ) {
+    super(docs, whereCalls, onGet);
   }
 
   doc(id: string = "x") {
@@ -315,10 +321,13 @@ class FakeFirestoreCollection extends FakeFirestoreQuery {
 
 class FakeFirestoreDatabase {
   readonly documentWhereCalls: Array<{ field: string; op: string; value: unknown }> = [];
+  documentGetCalls = 0;
   readonly docsCollection: FakeFirestoreCollection;
 
   constructor(docs: AnyRecord[]) {
-    this.docsCollection = new FakeFirestoreCollection(docs, this.documentWhereCalls);
+    this.docsCollection = new FakeFirestoreCollection(docs, this.documentWhereCalls, () => {
+      this.documentGetCalls += 1;
+    });
   }
 
   collection(path: string) {
@@ -454,6 +463,26 @@ describe("non-SQL query pushdown", () => {
       { field: "indexes.byEmail", op: "<=", value: "a\uf8ff" },
     ]);
     expect(result.documents.map((doc) => doc.key)).toEqual(["u2"]);
+  });
+
+  test("firestore query rejects malformed cursor before backend query", async () => {
+    const db = new FakeFirestoreDatabase([
+      makeEngineDoc("u1", 1, { byEmail: "a@example.com" }, { id: "u1" }),
+    ]);
+    const engine = firestoreEngine({
+      database: db as unknown as Parameters<typeof firestoreEngine>[0]["database"],
+    });
+
+    expect(
+      engine.query("users", {
+        index: "byEmail",
+        filter: { value: { $begins: "a" } },
+        sort: "asc",
+        cursor: "u1",
+        limit: 1,
+      }),
+    ).rejects.toThrow(/cursor/i);
+    expect(db.documentGetCalls).toBe(0);
   });
 
   test("dynamodb query adds a filter expression for index filters", async () => {

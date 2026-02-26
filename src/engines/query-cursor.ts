@@ -92,6 +92,19 @@ export function resolveQueryPageStartIndex<TRecord>(
   return index === -1 ? records.length : index;
 }
 
+export function validateQueryPageCursor(collection: string, params: QueryParams): void {
+  if (!params.cursor) {
+    return;
+  }
+
+  const payload = decodeQueryPageCursor(params.cursor);
+  const expectedSignature = buildQueryCursorSignature(collection, params);
+
+  if (payload.signature !== expectedSignature) {
+    throw new Error("Query cursor does not match the requested query");
+  }
+}
+
 function buildCursorPosition(
   params: QueryParams,
   position: QueryCursorRecordPosition,
