@@ -460,13 +460,24 @@ describe("postgresEngine integration", () => {
       limit: 1.9,
     });
 
-    const invalidCursor = engine.query(collection, {
-      index: "byRole",
-      filter: { value: { $begins: "member#" } },
-      sort: "asc",
-      cursor: "unknown",
-      limit: 2,
-    });
+    expect(limitZero.documents).toHaveLength(0);
+    expect(limitZero.cursor).toBeNull();
+    expect(noLimit.documents).toHaveLength(3);
+    expect(noLimit.cursor).toBeNull();
+    expect(fractional.documents).toHaveLength(1);
+    expect(fractional.cursor).not.toBeNull();
+
+    await expectReject(
+      engine.query(collection, {
+        index: "byRole",
+        filter: { value: { $begins: "member#" } },
+        sort: "asc",
+        cursor: "unknown",
+        limit: 2,
+      }),
+      /cursor/i,
+    );
+
     const terminalPage = await engine.query(collection, {
       index: "byRole",
       filter: { value: { $begins: "member#" } },
@@ -475,13 +486,6 @@ describe("postgresEngine integration", () => {
       limit: 10,
     });
 
-    expect(limitZero.documents).toHaveLength(0);
-    expect(limitZero.cursor).toBeNull();
-    expect(noLimit.documents).toHaveLength(3);
-    expect(noLimit.cursor).toBeNull();
-    expect(fractional.documents).toHaveLength(1);
-    expect(fractional.cursor).not.toBeNull();
-    await expectReject(invalidCursor, /cursor/i);
     expect(terminalPage.documents.map((item) => item.key)).toEqual(["u2", "u3"]);
     expect(terminalPage.cursor).toBeNull();
   });
