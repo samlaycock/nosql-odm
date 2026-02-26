@@ -1,5 +1,27 @@
 # nosql-odm
 
+## 0.9.0
+
+### Minor Changes
+
+- 071191f: Add an explicit `allowStoreManagedUniqueConstraints` `createStore()` option to allow models with unique indexes when an engine declares `capabilities.uniqueConstraints = "none"`.
+
+  When enabled, the store accepts those models and relies on the existing store-managed lock + uniqueness pre-check guard path instead of requiring engine-level atomic unique constraints.
+
+### Patch Changes
+
+- 2891701: Prevent `store.update()` from silently overwriting concurrent writes when the engine exposes optimistic write tokens.
+
+  `update()` now reads via `getWithMetadata()` when available and performs a conditional single-document write using `batchSetWithResult()`. When the conditional write conflicts, the store throws a new `ConcurrentWriteError` instead of silently clobbering the newer document state.
+
+- 7a0fb3d: Fix SQL engine query pagination cursors (MySQL, Postgres, SQLite) to use opaque, query-bound cursors that remain stable when the previous page's last row is deleted between requests.
+
+  This aligns SQL pagination behavior with the shared cursor helpers used by other adapters and adds regression coverage for deleted-cursor-row continuation.
+
+- 22fb55e: Prevent `store.query()` from silently falling back to a full collection scan when `index` is provided without `filter`.
+
+  The store now validates `index` and `filter` as a required pair before resolving query params, and throws a clear error for malformed queries instead of passing them through to engine scan paths.
+
 ## 0.8.0
 
 ### Minor Changes
