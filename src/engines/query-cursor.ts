@@ -1,6 +1,6 @@
 import type { QueryParams } from "./types";
 
-type QueryCursorPosition =
+export type QueryCursorPosition =
   | {
       kind: "key";
       key: string;
@@ -51,16 +51,10 @@ export function resolveQueryPageStartIndex<TRecord>(
   params: QueryParams,
   getPosition: (record: TRecord, params: QueryParams) => QueryCursorRecordPosition,
 ): number {
-  if (!params.cursor) {
+  const cursorPosition = resolveQueryPageCursorPosition(collection, params);
+
+  if (!cursorPosition) {
     return 0;
-  }
-
-  const payload = decodeQueryPageCursor(params.cursor);
-  const expectedSignature = buildQueryCursorSignature(collection, params);
-  const cursorPosition = payload.position;
-
-  if (payload.signature !== expectedSignature) {
-    throw new Error("Query cursor does not match the requested query");
   }
 
   if (cursorPosition.kind === "key") {
@@ -93,8 +87,15 @@ export function resolveQueryPageStartIndex<TRecord>(
 }
 
 export function validateQueryPageCursor(collection: string, params: QueryParams): void {
+  resolveQueryPageCursorPosition(collection, params);
+}
+
+export function resolveQueryPageCursorPosition(
+  collection: string,
+  params: QueryParams,
+): QueryCursorPosition | null {
   if (!params.cursor) {
-    return;
+    return null;
   }
 
   const payload = decodeQueryPageCursor(params.cursor);
@@ -103,6 +104,8 @@ export function validateQueryPageCursor(collection: string, params: QueryParams)
   if (payload.signature !== expectedSignature) {
     throw new Error("Query cursor does not match the requested query");
   }
+
+  return payload.position;
 }
 
 function buildCursorPosition(
