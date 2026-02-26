@@ -1,5 +1,51 @@
 # nosql-odm
 
+## 0.8.0
+
+### Minor Changes
+
+- 8b93a49: Parallelize unique-index pre-check queries during unique-guarded writes and add bounded concurrency via `createStore(..., { uniqueConstraintPrecheck: { concurrency } })`.
+
+  This reduces serialized pre-check round trips for large `batchSet` operations while preserving uniqueness correctness and allowing callers to cap backend load.
+
+- da18cfd: Adopt opaque, query-bound query cursors for in-memory paginated adapters (memory, IndexedDB, DynamoDB, Firestore, Redis, and Cassandra) so continuation stays stable across duplicate sort values and cursor-row deletions.
+
+  Query cursors are now opaque tokens rather than raw document keys, and invalid or mismatched cursors are rejected explicitly instead of silently restarting from the beginning.
+
+- 51b77a5: Add configurable unique-constraint lock behavior in `createStore()` via
+  `uniqueConstraintLock` options (`ttlMs`, `maxAttempts`, `retryDelayMs`, and
+  `heartbeatIntervalMs`) so high-latency workloads can tune lock acquisition and
+  long-running writes can renew locks safely.
+- ac428d3: Add `encodeNumericIndexValue()` as a first-class helper for building numeric
+  index values and numeric query bounds that preserve numeric ordering under the
+  library's lexicographic string comparisons. Includes tests and README guidance
+  for usage and reindexing existing data.
+
+### Patch Changes
+
+- d750904: Add a nightly GitHub Actions full integration matrix that runs every adapter test regardless of PR path filters, with manual dispatch support for on-demand validation.
+
+  Document the CI coverage model in the README so contributors understand the fast PR path versus the scheduled full-matrix safety net.
+
+- 94d59fe: Reduce non-SQL adapter query materialization for indexed queries by pushing
+  filtering into Firestore and DynamoDB queries and adding a MongoDB native query
+  path that pushes filter, sort, and cursor/limit pagination when the filter
+  shape is supported.
+- 16935bd: Expand adapter integration workflow `pull_request.paths` filters to include shared integration helper files.
+
+  This ensures CI integration workflows run when `tests/integration/helpers.ts` or `tests/integration/migration-suite.ts` changes.
+
+- f1495f8: Add and export `DocumentNotFoundError` for `store.update()` missing-document paths, including concurrent delete handling when the engine reports not found.
+- e329120: Protect lazy migration writebacks from clobbering concurrent updates by propagating optimistic write tokens through store read paths and using conditional `batchSetWithResult` writes (including conflict skip hooks).
+- 7e869d6: Fix optional field index resolution to skip missing values instead of storing the literal strings `"undefined"` or `"null"`.
+
+  Field-based indexes now omit entries when the indexed field is `undefined` or `null`, which prevents false query matches and avoids unique index conflicts for documents where optional indexed fields are not present.
+
+  Includes regression tests covering:
+
+  - querying an optional index with `"undefined"`
+  - optional unique indexes allowing multiple documents with missing values
+
 ## 0.7.1
 
 ### Patch Changes
@@ -46,6 +92,7 @@
 - 43fd641: Improve migration throughput and consistency across all engines by adding adaptive paging hints, reducing redundant metadata sync work, and tightening migrator execution behavior.
 
   ### Added
+
   - Optional migration criteria hints for engines:
     - `pageSizeHint`
     - `skipMetadataSyncHint`
@@ -55,12 +102,14 @@
     - `onDocumentsPersisted({ persistedKeys, conflictedKeys, ... })`
 
   ### Changed
+
   - Engines now honor dynamic page-size hints for outdated-document paging.
   - Engines with metadata sync paths can skip redundant sync on continuation pages.
   - Store-scope conflict checks in the default migrator now resolve model scope activity concurrently.
   - Migration run-state parsing now validates persisted page-size hints.
 
   ### Tooling / Docs
+
   - Removed the aggregate `test:integration` npm script because it is not reliable in constrained shared-runner environments.
   - README test runner examples now point to per-engine integration scripts only.
 
@@ -71,6 +120,7 @@
 - 990e9e2: Overhaul migration orchestration around a new `Migrator` abstraction with run upsert, page-by-page execution, scope-aware conflict checks, and durable progress tracking.
 
   ### Added
+
   - `DefaultMigrator` and `Migrator` interfaces for custom migration workflows.
   - Model and store migration APIs for paged workflows:
     - `getOrCreateMigration()`
@@ -80,6 +130,7 @@
   - Built-in engines now expose `engine.migrator` by default.
 
   ### Changed
+
   - `migrateAll()` now executes through migrator runs/pages and enforces scope conflicts between model-level and store-level migrations.
   - Store-wide migrations fail fast when scope is already covered by another active migration run.
 
@@ -88,6 +139,7 @@
 ### Minor Changes
 
 - 1d256bf: Add a new Postgres engine adapter using `pg`.
+
   - Introduce `postgresEngine` with full `QueryEngine` support for CRUD, query filters/sorting/pagination, batch operations, and migration lock/checkpoint flows.
   - Add package export `nosql-odm/engines/postgres`.
   - Add Postgres integration coverage and local Docker service/test scripts.
@@ -96,11 +148,13 @@
 - 755a3de: Add a new MySQL engine via `nosql-odm/engines/mysql` backed by `mysql2`.
 
   This release introduces first-class MySQL support with:
+
   - Full `QueryEngine` contract coverage for create/get/update/delete, `batchGet`, and paginated queries.
   - Migration primitives (locks, checkpoints, and outdated migration discovery).
   - Support for custom internal table names used for metadata and migration state.
 
   Also includes:
+
   - Integration test coverage for MySQL parity with the other engines.
   - Docker Compose service wiring and test scripts for local MySQL integration runs.
   - Updated package exports and documentation for MySQL setup/usage.
