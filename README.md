@@ -597,7 +597,13 @@ const page2 = await store.user.query({
 `query()` returns:
 
 - `documents`: typed model documents
-- `cursor`: `string | null` for keyset pagination
+- `cursor`: `string | null` opaque continuation token for keyset pagination
+
+Cursor contract:
+
+- Treat cursors as opaque values (do not parse or construct them manually).
+- Reuse the cursor with the same query shape (`index`/`filter`/`where` resolution + `sort`).
+- Invalid or mismatched cursors are rejected with an error instead of silently restarting pagination.
 
 Field-based `where` shorthand is also supported (requires an index on that field):
 

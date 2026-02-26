@@ -877,7 +877,8 @@ describe("query() pagination", () => {
     });
 
     expect(page1.documents.map((d: any) => d.doc.id)).toEqual(["a", "b"]);
-    expect(page1.cursor).toBe("b");
+    expect(page1.cursor).not.toBeNull();
+    expect(page1.cursor).not.toBe("b");
 
     const page2 = await engine.query("sorted-items", {
       index: "byDate",
@@ -905,7 +906,8 @@ describe("query() pagination", () => {
     });
 
     expect(page1.documents.map((d: any) => d.doc.id)).toEqual(["d", "c"]);
-    expect(page1.cursor).toBe("c");
+    expect(page1.cursor).not.toBeNull();
+    expect(page1.cursor).not.toBe("c");
 
     const page2 = await engine.query("sorted-items", {
       index: "byDate",
@@ -959,15 +961,65 @@ describe("query() pagination", () => {
     expect(results.cursor).toBeNull();
   });
 
-  test("invalid cursor starts from beginning", async () => {
-    const results = await engine.query("items", {
+  test("invalid cursor is rejected explicitly", async () => {
+    expect(
+      engine.query("items", {
+        index: "all",
+        filter: { value: "yes" },
+        limit: 3,
+        cursor: "not-a-number",
+      }),
+    ).rejects.toThrow(/cursor/i);
+  });
+
+  test("cursor is query-bound and rejects mismatched query parameters", async () => {
+    const firstPage = await engine.query("items", {
       index: "all",
       filter: { value: "yes" },
-      limit: 3,
-      cursor: "not-a-number",
+      sort: "asc",
+      limit: 2,
     });
 
-    expect(results.documents).toHaveLength(3);
+    expect(
+      engine.query("items", {
+        index: "all",
+        filter: { value: "yes" },
+        sort: "desc",
+        limit: 2,
+        cursor: firstPage.cursor!,
+      }),
+    ).rejects.toThrow(/does not match/i);
+  });
+
+  test("sorted pagination remains stable when cursor row is deleted between pages", async () => {
+    await engine.put("stable-items", "a", { id: "a" }, { byGroup: "g" });
+    await engine.put("stable-items", "b", { id: "b" }, { byGroup: "g" });
+    await engine.put("stable-items", "c", { id: "c" }, { byGroup: "g" });
+    await engine.put("stable-items", "d", { id: "d" }, { byGroup: "h" });
+
+    const page1 = await engine.query("stable-items", {
+      index: "byGroup",
+      filter: { value: { $gte: "g" } },
+      sort: "asc",
+      limit: 2,
+    });
+
+    expect(page1.documents.map((d: any) => d.doc.id)).toEqual(["a", "b"]);
+    expect(page1.cursor).not.toBeNull();
+
+    await engine.delete("stable-items", "b");
+    await engine.put("stable-items", "ab", { id: "ab" }, { byGroup: "g" });
+    await engine.put("stable-items", "bc", { id: "bc" }, { byGroup: "g" });
+
+    const page2 = await engine.query("stable-items", {
+      index: "byGroup",
+      filter: { value: { $gte: "g" } },
+      sort: "asc",
+      limit: 2,
+      cursor: page1.cursor!,
+    });
+
+    expect(page2.documents.map((d: any) => d.doc.id)).toEqual(["c", "ab"]);
   });
 });
 
@@ -1167,14 +1219,14 @@ describe("query() with no filter", () => {
     expect(doc2.nested.v).toBe(1);
   });
 
-  test("invalid cursor starts from beginning", async () => {
+  test("invalid cursor is rejected explicitly", async () => {
     for (let i = 0; i < 5; i++) {
       await engine.put("users", `user-${i}`, { id: `user-${i}` }, {});
     }
 
-    const page = await engine.query("users", { cursor: "nonexistent-cursor" });
-
-    expect(page.documents).toHaveLength(5);
+    expect(engine.query("users", { cursor: "nonexistent-cursor" })).rejects.toThrow(
+      /cursor/i,
+    );
   });
 });
 
@@ -1732,28 +1784,26 @@ describe("query() pagination edge cases", () => {
     expect(page.cursor).not.toBeNull();
   });
 
-  test("cursor of last item returns empty page", async () => {
-    // item-4 is the last item — nothing comes after it
-    const results = await engine.query("items", {
-      index: "all",
-      filter: { value: "yes" },
-      limit: 3,
-      cursor: "item-4",
-    });
-
-    expect(results.documents).toHaveLength(0);
-    expect(results.cursor).toBeNull();
+  test("raw key cursors are rejected", async () => {
+    expect(
+      engine.query("items", {
+        index: "all",
+        filter: { value: "yes" },
+        limit: 3,
+        cursor: "item-4",
+      }),
+    ).rejects.toThrow(/cursor/i);
   });
 
-  test("unrecognised cursor starts from the beginning", async () => {
-    const results = await engine.query("items", {
-      index: "all",
-      filter: { value: "yes" },
-      limit: 3,
-      cursor: "nonexistent-key",
-    });
-
-    expect(results.documents).toHaveLength(3);
+  test("unrecognised cursors are rejected", async () => {
+    expect(
+      engine.query("items", {
+        index: "all",
+        filter: { value: "yes" },
+        limit: 3,
+        cursor: "nonexistent-key",
+      }),
+    ).rejects.toThrow(/cursor/i);
   });
 
   test("cursor at exact boundary returns remaining documents", async () => {

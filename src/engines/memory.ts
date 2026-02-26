@@ -1,4 +1,5 @@
 import { DefaultMigrator } from "../migrator";
+import { encodeQueryPageCursor, resolveQueryPageStartIndex } from "./query-cursor";
 import {
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
@@ -17,6 +18,7 @@ import {
 // ---------------------------------------------------------------------------
 
 interface StoredDocument {
+  createdAt: number;
   doc: Record<string, unknown>;
   indexes: ResolvedIndexKeys;
   uniqueIndexes: ResolvedIndexKeys;
@@ -43,6 +45,7 @@ export function memoryEngine(options?: MemoryEngineOptions): MemoryQueryEngine {
   const uniqueOwnership = new Map<string, Map<string, Map<string, string>>>();
   const locks = new Map<string, MigrationLock>();
   const checkpoints = new Map<string, string>();
+  let createdAtSequence = 0;
   let engineOptions = options ?? {};
 
   function getCollection(collection: string): Map<string, StoredDocument> {
@@ -153,6 +156,7 @@ export function memoryEngine(options?: MemoryEngineOptions): MemoryQueryEngine {
       reserveUniqueIndexes(collection, key, uniqueIndexes ?? {}, collectionUniqueState);
 
       col.set(key, {
+        createdAt: ++createdAtSequence,
         doc: structuredClone(doc) as Record<string, unknown>,
         indexes: { ...indexes },
         uniqueIndexes: { ...uniqueIndexes },
@@ -164,10 +168,12 @@ export function memoryEngine(options?: MemoryEngineOptions): MemoryQueryEngine {
 
       const col = getCollection(collection);
       const collectionUniqueState = getCollectionUniqueOwnership(collection);
+      const existing = col.get(key);
 
       reserveUniqueIndexes(collection, key, uniqueIndexes ?? {}, collectionUniqueState);
 
       col.set(key, {
+        createdAt: existing?.createdAt ?? ++createdAtSequence,
         doc: structuredClone(doc) as Record<string, unknown>,
         indexes: { ...indexes },
         uniqueIndexes: { ...uniqueIndexes },
@@ -180,13 +186,16 @@ export function memoryEngine(options?: MemoryEngineOptions): MemoryQueryEngine {
       const col = getCollection(collection);
       const collectionUniqueState = getCollectionUniqueOwnership(collection);
 
-      if (!col.has(key)) {
+      const existing = col.get(key);
+
+      if (!existing) {
         throw new EngineDocumentNotFoundError(collection, key);
       }
 
       reserveUniqueIndexes(collection, key, uniqueIndexes ?? {}, collectionUniqueState);
 
       col.set(key, {
+        createdAt: existing.createdAt,
         doc: structuredClone(doc) as Record<string, unknown>,
         indexes: { ...indexes },
         uniqueIndexes: { ...uniqueIndexes },
@@ -209,7 +218,7 @@ export function memoryEngine(options?: MemoryEngineOptions): MemoryQueryEngine {
       const col = getCollection(collection);
       const results = matchDocuments(col, params);
 
-      return paginate(results, params);
+      return paginateQuery(collection, results, params);
     },
 
     async batchGet(collection, keys) {
@@ -241,8 +250,10 @@ export function memoryEngine(options?: MemoryEngineOptions): MemoryQueryEngine {
         engineOptions.onBeforePut?.(collection, item.key, item.doc);
 
         reserveUniqueIndexes(collection, item.key, item.uniqueIndexes ?? {}, collectionUniqueState);
+        const existing = col.get(item.key);
 
         col.set(item.key, {
+          createdAt: existing?.createdAt ?? ++createdAtSequence,
           doc: structuredClone(item.doc) as Record<string, unknown>,
           indexes: { ...item.indexes },
           uniqueIndexes: { ...item.uniqueIndexes },
@@ -431,8 +442,17 @@ function matchDocuments(
     results.sort((a, b) => {
       const aVal = a.stored.indexes[indexName] ?? "";
       const bVal = b.stored.indexes[indexName] ?? "";
+      const base = params.sort === "desc" ? bVal.localeCompare(aVal) : aVal.localeCompare(bVal);
 
-      return params.sort === "desc" ? bVal.localeCompare(aVal) : aVal.localeCompare(bVal);
+      if (base !== 0) {
+        return base;
+      }
+
+      if (a.stored.createdAt !== b.stored.createdAt) {
+        return a.stored.createdAt - b.stored.createdAt;
+      }
+
+      return a.key.localeCompare(b.key);
     });
   }
 
@@ -609,8 +629,55 @@ function normalizeNumericVersion(value: string): number | null {
 // Pagination
 // ---------------------------------------------------------------------------
 
-// Pagination uses key-based cursors: the cursor is always the key of the last
-// item on the previous page. The next page starts after that key.
+// Query pagination uses opaque, query-bound cursors so continuation remains
+// stable when the previous page's last item is removed.
+function paginateQuery(
+  collection: string,
+  results: KeyedStoredDocument[],
+  params: QueryParams,
+): EngineQueryResult {
+  const startIndex = resolveQueryPageStartIndex(
+    results,
+    collection,
+    params,
+    (record, queryParams) => ({
+      key: record.key,
+      createdAt: record.stored.createdAt,
+      indexValue: queryParams.index ? (record.stored.indexes[queryParams.index] ?? "") : undefined,
+    }),
+  );
+  const normalizedLimit = normalizeLimit(params.limit);
+  const limit = normalizedLimit ?? results.length;
+  const hasLimit = normalizedLimit !== null;
+
+  if (limit <= 0) {
+    return {
+      documents: [],
+      cursor: null,
+    };
+  }
+
+  const page = results.slice(startIndex, startIndex + limit);
+  const cursor =
+    page.length > 0 && hasLimit && startIndex + limit < results.length
+      ? encodeQueryPageCursor(collection, params, {
+          key: page[page.length - 1]!.key,
+          createdAt: page[page.length - 1]!.stored.createdAt,
+          indexValue: params.index
+            ? (page[page.length - 1]!.stored.indexes[params.index] ?? "")
+            : undefined,
+        })
+      : null;
+
+  return {
+    documents: page.map(({ key, stored }) => ({
+      key,
+      doc: structuredClone(stored.doc),
+    })),
+    cursor,
+  };
+}
+
 function paginate(results: KeyedStoredDocument[], params: QueryParams): EngineQueryResult {
   let startIndex = 0;
 

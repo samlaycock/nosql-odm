@@ -1,4 +1,5 @@
 import { DefaultMigrator } from "../migrator";
+import { encodeQueryPageCursor, resolveQueryPageStartIndex } from "./query-cursor";
 import {
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
@@ -272,7 +273,7 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
       const records = await listCollectionDocuments(db, collection);
       const matched = matchDocuments(records, params);
 
-      return paginate(matched, params);
+      return paginateQuery(collection, matched, params);
     },
 
     async batchGet(collection, keys) {
@@ -623,6 +624,53 @@ function paginate(records: StoredDocumentRecord[], params: QueryParams): EngineQ
   const cursor =
     page.length > 0 && hasLimit && startIndex + limit < records.length
       ? page[page.length - 1]!.key
+      : null;
+
+  return {
+    documents: page.map((record) => ({
+      key: record.key,
+      doc: structuredClone(record.doc),
+    })),
+    cursor,
+  };
+}
+
+function paginateQuery(
+  collection: string,
+  records: StoredDocumentRecord[],
+  params: QueryParams,
+): EngineQueryResult {
+  const startIndex = resolveQueryPageStartIndex(
+    records,
+    collection,
+    params,
+    (record, queryParams) => ({
+      key: record.key,
+      createdAt: record.createdAt,
+      indexValue: queryParams.index ? (record.indexes[queryParams.index] ?? "") : undefined,
+    }),
+  );
+  const normalizedLimit = normalizeLimit(params.limit);
+  const limit = normalizedLimit ?? records.length;
+  const hasLimit = normalizedLimit !== null;
+
+  if (limit <= 0) {
+    return {
+      documents: [],
+      cursor: null,
+    };
+  }
+
+  const page = records.slice(startIndex, startIndex + limit);
+  const cursor =
+    page.length > 0 && hasLimit && startIndex + limit < records.length
+      ? encodeQueryPageCursor(collection, params, {
+          key: page[page.length - 1]!.key,
+          createdAt: page[page.length - 1]!.createdAt,
+          indexValue: params.index
+            ? (page[page.length - 1]!.indexes[params.index] ?? "")
+            : undefined,
+        })
       : null;
 
   return {
