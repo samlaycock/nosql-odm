@@ -277,6 +277,13 @@ export interface CreateStoreOptions<TOptions = Record<string, unknown>> {
   migrator?: Migrator<TOptions>;
   migrationHooks?: MigrationHooks;
   projectionHooks?: ProjectionHooks;
+  /**
+   * Allows models with `unique: true` indexes when the engine explicitly
+   * reports `capabilities.uniqueConstraints = "none"`. The store will use its
+   * lock + pre-check guard path instead of relying on engine-enforced atomic
+   * uniqueness.
+   */
+  allowStoreManagedUniqueConstraints?: boolean;
   uniqueConstraintPrecheck?: UniqueConstraintPrecheckOptions;
   uniqueConstraintLock?: UniqueConstraintLockOptions;
 }
@@ -1606,6 +1613,7 @@ export function createStore<
   const uniqueConstraintPrecheckConcurrency = resolveUniqueConstraintPrecheckConcurrency(
     options?.uniqueConstraintPrecheck,
   );
+  const allowStoreManagedUniqueConstraints = options?.allowStoreManagedUniqueConstraints === true;
   const boundModels = new Map<string, BoundModelImpl<any, TOptions, any, any>>();
 
   for (const modelDef of models) {
@@ -1615,9 +1623,19 @@ export function createStore<
 
     const hasUniqueIndexes = modelDef.indexes.some((index) => index.unique === true);
 
-    if (hasUniqueIndexes && engine.capabilities?.uniqueConstraints !== "atomic") {
+    const uniqueConstraintCapability = engine.capabilities?.uniqueConstraints;
+    const supportsAtomicUniqueConstraints = uniqueConstraintCapability === "atomic";
+    const supportsStoreManagedUniqueConstraints =
+      uniqueConstraintCapability === "none" && allowStoreManagedUniqueConstraints;
+
+    if (
+      hasUniqueIndexes &&
+      !supportsAtomicUniqueConstraints &&
+      !supportsStoreManagedUniqueConstraints
+    ) {
       throw new Error(
-        `Model "${modelDef.name}" declares unique indexes, but the configured engine does not support atomic unique constraints`,
+        `Model "${modelDef.name}" declares unique indexes, but the configured engine does not support atomic unique constraints. ` +
+          `Use createStore(..., { allowStoreManagedUniqueConstraints: true }) to opt into store-managed unique guards for engines that declare capabilities.uniqueConstraints = "none".`,
       );
     }
 

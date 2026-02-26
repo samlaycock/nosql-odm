@@ -339,6 +339,26 @@ function createUniquePrecheckTrackingEngine(precheck: UniquePrecheckTracker): Qu
   };
 }
 
+function createNonAtomicUniqueEngine(): QueryEngine<never> {
+  const base = memoryEngine();
+
+  return {
+    ...base,
+    capabilities: {
+      uniqueConstraints: "none",
+    },
+    async create(collection, key, doc, indexes, options, migrationMetadata, _uniqueIndexes) {
+      await base.create(collection, key, doc, indexes, options, migrationMetadata);
+    },
+    async put(collection, key, doc, indexes, options, migrationMetadata, _uniqueIndexes) {
+      await base.put(collection, key, doc, indexes, options, migrationMetadata);
+    },
+    async update(collection, key, doc, indexes, options, migrationMetadata, _uniqueIndexes) {
+      await base.update(collection, key, doc, indexes, options, migrationMetadata);
+    },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // createStore basics
 // ---------------------------------------------------------------------------
@@ -401,6 +421,27 @@ describe("unique indexes", () => {
 
     expect(() => createStore(noUniqueEngine, [buildUserV1WithUniqueEmail()])).toThrow(
       /does not support atomic unique constraints/i,
+    );
+  });
+
+  test("createStore can opt into store-managed unique constraints for non-atomic engines", async () => {
+    const store = createStore(createNonAtomicUniqueEngine(), [buildUserV1WithUniqueEmail()], {
+      allowStoreManagedUniqueConstraints: true,
+    });
+
+    await store.user.create("u1", {
+      id: "u1",
+      name: "Sam",
+      email: "sam@example.com",
+    });
+
+    await expectReject(
+      store.user.create("u2", {
+        id: "u2",
+        name: "Other",
+        email: "sam@example.com",
+      }),
+      UniqueConstraintError,
     );
   });
 
