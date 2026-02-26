@@ -1195,6 +1195,20 @@ describe("store.query()", () => {
     expect(results.documents).toHaveLength(2);
   });
 
+  test('throws when "index" is provided without "filter"', async () => {
+    const store = createStore(engine, [buildUserV1()]);
+
+    await store.user.create("u1", {
+      id: "u1",
+      name: "Sam",
+      email: "sam@example.com",
+    });
+
+    expect(store.user.query({ index: "byEmail" })).rejects.toThrow(
+      'query params with "index" must also include "filter"',
+    );
+  });
+
   test("paginates all documents with no filter", async () => {
     const store = createStore(engine, [buildUserV1()]);
 
