@@ -1,4 +1,5 @@
 import { DefaultMigrator } from "../migrator";
+import { encodeQueryPageCursor, resolveQueryPageStartIndex } from "./query-cursor";
 import {
   type BatchSetItem,
   type BatchSetResult,
@@ -58,11 +59,6 @@ interface QueryRow {
   key: string;
   doc: Record<string, unknown>;
   writeToken?: string;
-}
-
-interface CursorRow {
-  id: number;
-  indexValue: string;
 }
 
 interface LockRow {
@@ -574,19 +570,18 @@ async function queryByCollectionScan(
     };
   }
 
-  const cursorId = await resolveCursorId(client, refs, collection, params.cursor);
-  const values: (string | number)[] = [collection, cursorId];
+  const values: (string | number)[] = [collection];
 
   let sql = `
-    SELECT doc_key AS key, doc_json, write_version
+    SELECT id AS cursor_id, doc_key AS key, doc_json, write_version
     FROM ${refs.documentsTable}
-    WHERE collection = $1 AND id > $2
+    WHERE collection = $1
     ORDER BY id ASC
   `;
 
-  if (limit !== null) {
+  if (limit !== null && !params.cursor) {
     values.push(limit + 1);
-    sql += ` LIMIT $3`;
+    sql += ` LIMIT $2`;
   }
 
   const rows = await fetchRows(client, {
@@ -595,7 +590,7 @@ async function queryByCollectionScan(
     errorMessage: "Postgres returned an invalid query result",
   });
 
-  return formatPage(rows, limit, collection, includeWriteTokens);
+  return formatPage(rows, params, collection, includeWriteTokens);
 }
 
 async function queryByIndex(
@@ -629,46 +624,17 @@ async function queryByIndex(
     whereClauses.push(filterSql);
   }
 
-  const cursor = params.cursor
-    ? await resolveIndexedCursor(client, refs, collection, index, params.cursor, filter)
-    : null;
-
-  if (cursor) {
-    if (sort === "asc") {
-      const valueArg = builder.push(cursor.indexValue);
-      const valueTieArg = builder.push(cursor.indexValue);
-      const idArg = builder.push(cursor.id);
-
-      whereClauses.push(
-        `(ix.index_value > ${valueArg} OR (ix.index_value = ${valueTieArg} AND d.id > ${idArg}))`,
-      );
-    } else if (sort === "desc") {
-      const valueArg = builder.push(cursor.indexValue);
-      const valueTieArg = builder.push(cursor.indexValue);
-      const idArg = builder.push(cursor.id);
-
-      // Descending queries still advance by d.id for deterministic tie-breaking
-      // when multiple rows share the same index value.
-      whereClauses.push(
-        `(ix.index_value < ${valueArg} OR (ix.index_value = ${valueTieArg} AND d.id > ${idArg}))`,
-      );
-    } else {
-      const idArg = builder.push(cursor.id);
-      whereClauses.push(`d.id > ${idArg}`);
-    }
-  }
-
   const orderBy =
     sort === "asc"
       ? `ORDER BY ix.index_value ASC, d.id ASC`
       : sort === "desc"
-        ? // Keep id ascending in both directions so the cursor predicate and
-          // ORDER BY use the same tie-break dimension.
+        ? // Keep id ascending in both directions for deterministic tie-breaking
+          // when multiple rows share the same index value.
           `ORDER BY ix.index_value DESC, d.id ASC`
         : `ORDER BY d.id ASC`;
 
   let sql = `
-    SELECT d.doc_key AS key, d.doc_json, d.write_version
+    SELECT d.id AS cursor_id, ix.index_value AS cursor_index_value, d.doc_key AS key, d.doc_json, d.write_version
     FROM ${refs.indexesTable} ix
     INNER JOIN ${refs.documentsTable} d
       ON d.collection = ix.collection
@@ -677,7 +643,7 @@ async function queryByIndex(
     ${orderBy}
   `;
 
-  if (limit !== null) {
+  if (limit !== null && !params.cursor) {
     sql += ` LIMIT ${builder.push(limit + 1)}`;
   }
 
@@ -687,67 +653,56 @@ async function queryByIndex(
     errorMessage: "Postgres returned an invalid query result",
   });
 
-  return formatPage(rows, limit, collection, includeWriteTokens);
-}
-
-async function resolveIndexedCursor(
-  client: PostgresQueryableLike,
-  refs: TableRefs,
-  collection: string,
-  index: string,
-  key: string,
-  filter: string | number | FieldCondition,
-): Promise<CursorRow | null> {
-  const builder = createSqlBuilder();
-  const whereClauses = [
-    `ix.collection = ${builder.push(collection)}`,
-    `ix.index_name = ${builder.push(index)}`,
-    `d.doc_key = ${builder.push(key)}`,
-  ];
-
-  const filterSql = buildFilterSql(filter, builder);
-
-  if (filterSql.length > 0) {
-    whereClauses.push(filterSql);
-  }
-
-  const row = await fetchOptionalRow(client, {
-    sql: `
-      SELECT d.id, ix.index_value
-      FROM ${refs.indexesTable} ix
-      INNER JOIN ${refs.documentsTable} d
-        ON d.collection = ix.collection
-       AND d.doc_key = ix.doc_key
-      WHERE ${whereClauses.join(" AND ")}
-      LIMIT 1
-    `,
-    params: builder.values,
-    errorMessage: "Postgres returned an invalid indexed cursor row",
-  });
-
-  if (!row) {
-    return null;
-  }
-
-  return {
-    id: readFiniteInteger(row, "id", "Postgres returned an invalid indexed cursor row"),
-    indexValue: readStringField(
-      row,
-      "index_value",
-      "Postgres returned an invalid indexed cursor row",
-    ),
-  };
+  return formatPage(rows, params, collection, includeWriteTokens);
 }
 
 function formatPage(
   rows: Record<string, unknown>[],
-  limit: number | null,
+  params: QueryParams,
   collection: string,
   includeWriteTokens = false,
 ): EngineQueryResult {
-  const hasLimit = limit !== null;
-  const hasMore = hasLimit && rows.length > limit;
-  const pageRows = hasMore ? rows.slice(0, limit) : rows;
+  const normalizedLimit = normalizeLimit(params.limit);
+  const limit = normalizedLimit ?? rows.length;
+  const hasLimit = normalizedLimit !== null;
+
+  if (limit <= 0) {
+    return {
+      documents: [],
+      cursor: null,
+    };
+  }
+
+  const startIndex = resolveQueryPageStartIndex(rows, collection, params, (row, queryParams) => ({
+    key: readStringField(row, "key", "Postgres returned an invalid query result"),
+    createdAt: readFiniteInteger(row, "cursor_id", "Postgres returned an invalid query result"),
+    indexValue: queryParams.index
+      ? readStringField(row, "cursor_index_value", "Postgres returned an invalid query result")
+      : undefined,
+  }));
+  const pageRows = rows.slice(startIndex, startIndex + limit);
+  const cursor =
+    pageRows.length > 0 && hasLimit && startIndex + limit < rows.length
+      ? encodeQueryPageCursor(collection, params, {
+          key: readStringField(
+            pageRows[pageRows.length - 1]!,
+            "key",
+            "Postgres returned an invalid query result",
+          ),
+          createdAt: readFiniteInteger(
+            pageRows[pageRows.length - 1]!,
+            "cursor_id",
+            "Postgres returned an invalid query result",
+          ),
+          indexValue: params.index
+            ? readStringField(
+                pageRows[pageRows.length - 1]!,
+                "cursor_index_value",
+                "Postgres returned an invalid query result",
+              )
+            : undefined,
+        })
+      : null;
 
   return {
     documents: pageRows.map((row) => {
@@ -766,13 +721,7 @@ function formatPage(
         writeToken: parsed.writeToken,
       };
     }),
-    cursor: hasMore
-      ? readStringField(
-          pageRows[pageRows.length - 1]!,
-          "key",
-          "Postgres returned an invalid query result",
-        )
-      : null,
+    cursor,
   };
 }
 

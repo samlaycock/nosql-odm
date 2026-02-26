@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 
 import { DefaultMigrator } from "../migrator";
+import { encodeQueryPageCursor, resolveQueryPageStartIndex } from "./query-cursor";
 import {
   type BatchSetResult,
   EngineDocumentAlreadyExistsError,
@@ -32,14 +33,11 @@ interface DocumentRow {
 }
 
 interface QueryRow {
+  cursor_id: number;
+  cursor_index_value?: string;
   key: string;
   doc_json: string;
   write_version: number;
-}
-
-interface CursorRow {
-  id: number;
-  index_value: string;
 }
 
 interface UniqueConflictRow {
@@ -150,7 +148,7 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
   );
 
   const queryScanPageStmt = db.prepare<[string, number, number], QueryRow>(`
-    SELECT doc_key AS key, doc_json, write_version
+    SELECT id AS cursor_id, doc_key AS key, doc_json, write_version
     FROM documents
     WHERE collection = ? AND id > ?
     ORDER BY id ASC
@@ -710,11 +708,10 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
       return { documents: [], cursor: null };
     }
 
-    const cursorId = resolveCursorId(collection, params.cursor, selectDocumentIdByKeyStmt);
-    const fetchLimit = limit === null ? Number.MAX_SAFE_INTEGER : limit + 1;
-    const rows = queryScanPageStmt.all(collection, cursorId, fetchLimit);
+    const fetchLimit = params.cursor || limit === null ? Number.MAX_SAFE_INTEGER : limit + 1;
+    const rows = queryScanPageStmt.all(collection, 0, fetchLimit);
 
-    return formatPage(rows, limit, collection, includeWriteTokens);
+    return formatPage(rows, params, collection, includeWriteTokens);
   }
 
   function queryByIndex(
@@ -732,29 +729,12 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
     const filter = buildFilterSql(params.filter!.value);
     const sort = params.sort;
 
-    const cursor = params.cursor
-      ? resolveIndexedCursor(collection, index, params.cursor, filter)
-      : null;
-
     const whereParts = [`ix.collection = ?`, `ix.index_name = ?`];
     const args: (string | number)[] = [collection, index];
 
     if (filter.sql) {
       whereParts.push(filter.sql);
       args.push(...filter.args);
-    }
-
-    if (cursor) {
-      if (sort === "asc") {
-        whereParts.push(`(ix.index_value > ? OR (ix.index_value = ? AND d.id > ?))`);
-        args.push(cursor.index_value, cursor.index_value, cursor.id);
-      } else if (sort === "desc") {
-        whereParts.push(`(ix.index_value < ? OR (ix.index_value = ? AND d.id > ?))`);
-        args.push(cursor.index_value, cursor.index_value, cursor.id);
-      } else {
-        whereParts.push(`d.id > ?`);
-        args.push(cursor.id);
-      }
     }
 
     const orderBy =
@@ -764,9 +744,9 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
           ? `ORDER BY ix.index_value DESC, d.id ASC`
           : `ORDER BY d.id ASC`;
 
-    const fetchLimit = limit === null ? Number.MAX_SAFE_INTEGER : limit + 1;
+    const fetchLimit = params.cursor || limit === null ? Number.MAX_SAFE_INTEGER : limit + 1;
     const sql = `
-      SELECT d.doc_key AS key, d.doc_json, d.write_version
+      SELECT d.id AS cursor_id, ix.index_value AS cursor_index_value, d.doc_key AS key, d.doc_json, d.write_version
       FROM index_entries ix
       INNER JOIN documents d
         ON d.collection = ix.collection
@@ -778,47 +758,39 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
 
     const rows = db.prepare(sql).all(...args, fetchLimit) as QueryRow[];
 
-    return formatPage(rows, limit, collection, includeWriteTokens);
-  }
-
-  function resolveIndexedCursor(
-    collection: string,
-    index: string,
-    key: string,
-    filter: SqlFilter,
-  ): CursorRow | null {
-    const whereParts = [`ix.collection = ?`, `ix.index_name = ?`, `d.doc_key = ?`];
-    const args: (string | number)[] = [collection, index, key];
-
-    if (filter.sql) {
-      whereParts.push(filter.sql);
-      args.push(...filter.args);
-    }
-
-    const row = db
-      .prepare(`
-        SELECT d.id, ix.index_value
-        FROM index_entries ix
-        INNER JOIN documents d
-          ON d.collection = ix.collection
-         AND d.doc_key = ix.doc_key
-        WHERE ${whereParts.join(" AND ")}
-        LIMIT 1
-      `)
-      .get(...args) as CursorRow | undefined;
-
-    return row ?? null;
+    return formatPage(rows, params, collection, includeWriteTokens);
   }
 
   function formatPage(
     rows: QueryRow[],
-    limit: number | null,
+    params: QueryParams,
     collection: string,
     includeWriteTokens = false,
   ): EngineQueryResult {
-    const hasLimit = limit !== null;
-    const hasMore = hasLimit && rows.length > limit;
-    const pageRows = hasMore ? rows.slice(0, limit) : rows;
+    const normalizedLimit = normalizeLimit(params.limit);
+    const limit = normalizedLimit ?? rows.length;
+    const hasLimit = normalizedLimit !== null;
+
+    if (limit <= 0) {
+      return { documents: [], cursor: null };
+    }
+
+    const startIndex = resolveQueryPageStartIndex(rows, collection, params, (row, queryParams) => ({
+      key: row.key,
+      createdAt: row.cursor_id,
+      indexValue: queryParams.index ? (row.cursor_index_value ?? "") : undefined,
+    }));
+    const pageRows = rows.slice(startIndex, startIndex + limit);
+    const cursor =
+      pageRows.length > 0 && hasLimit && startIndex + limit < rows.length
+        ? encodeQueryPageCursor(collection, params, {
+            key: pageRows[pageRows.length - 1]!.key,
+            createdAt: pageRows[pageRows.length - 1]!.cursor_id,
+            indexValue: params.index
+              ? (pageRows[pageRows.length - 1]!.cursor_index_value ?? "")
+              : undefined,
+          })
+        : null;
 
     return {
       documents: pageRows.map((row) => {
@@ -836,7 +808,7 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
           writeToken: String(row.write_version),
         };
       }),
-      cursor: hasMore ? (pageRows[pageRows.length - 1]?.key ?? null) : null,
+      cursor,
     };
   }
 
