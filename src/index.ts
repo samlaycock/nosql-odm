@@ -24,6 +24,7 @@ export {
 
 export {
   createStore,
+  ConcurrentWriteError,
   DocumentAlreadyExistsError,
   DocumentNotFoundError,
   MigrationProjectionError,

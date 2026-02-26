@@ -171,6 +171,18 @@ export class DocumentNotFoundError extends Error {
   }
 }
 
+export class ConcurrentWriteError extends Error {
+  readonly collection: string;
+  readonly key: string;
+
+  constructor(collection: string, key: string) {
+    super(`Concurrent write detected for document "${key}" in model "${collection}"`);
+    this.name = "ConcurrentWriteError";
+    this.collection = collection;
+    this.key = key;
+  }
+}
+
 export class UniqueConstraintError extends Error {
   readonly collection: string;
   readonly key: string;
@@ -661,13 +673,13 @@ class BoundModelImpl<
   }
 
   async update(key: string, data: ModelDataInputForUpdate<T>, options?: TOptions): Promise<T> {
-    const existing = await this.engine.get(this.model.name, key, options);
+    const existing = await this.getWithOptionalWriteToken(key, options);
 
     if (existing === null || existing === undefined) {
       throw new DocumentNotFoundError(this.model.name, key);
     }
 
-    const existingDoc = existing as Record<string, unknown>;
+    const existingDoc = existing.doc;
     let current: Record<string, unknown>;
     const projected = await this.model.projectToLatest(existingDoc);
 
@@ -686,9 +698,33 @@ class BoundModelImpl<
     const indexes = this.model.resolveIndexKeys(validated);
     const uniqueIndexes = this.model.resolveUniqueIndexKeys(validated);
     const migrationMetadata = this.currentMigrationMetadata();
+    const expectedWriteToken = this.normalizeWriteToken(existing.writeToken);
 
     try {
       await this.withUniqueConstraintGuard([{ key, uniqueIndexes }], options, async () => {
+        if (expectedWriteToken && this.engine.batchSetWithResult) {
+          const result = await this.engine.batchSetWithResult(
+            this.model.name,
+            [
+              {
+                key,
+                doc,
+                indexes,
+                uniqueIndexes,
+                migrationMetadata,
+                expectedWriteToken,
+              },
+            ],
+            options,
+          );
+
+          if (result.conflictedKeys.includes(key)) {
+            throw new ConcurrentWriteError(this.model.name, key);
+          }
+
+          return;
+        }
+
         await this.engine.update(
           this.model.name,
           key,
