@@ -64,7 +64,9 @@ export function resolveQueryPageStartIndex<TRecord>(
   }
 
   if (cursorPosition.kind === "key") {
-    const index = records.findIndex((record) => getPosition(record, params).key === cursorPosition.key);
+    const index = records.findIndex(
+      (record) => getPosition(record, params).key === cursorPosition.key,
+    );
 
     if (index === -1) {
       throw new Error("Query cursor no longer points to a valid result");

@@ -1224,9 +1224,7 @@ describe("query() with no filter", () => {
       await engine.put("users", `user-${i}`, { id: `user-${i}` }, {});
     }
 
-    expect(engine.query("users", { cursor: "nonexistent-cursor" })).rejects.toThrow(
-      /cursor/i,
-    );
+    expect(engine.query("users", { cursor: "nonexistent-cursor" })).rejects.toThrow(/cursor/i);
   });
 });
 
