@@ -6,6 +6,7 @@ import {
   EngineDocumentNotFoundError,
   type QueryEngine,
 } from "../../src/engines/types";
+import { encodeNumericIndexValue } from "../../src/index";
 import { createCollectionNameFactory } from "./helpers";
 import { runMigrationIntegrationSuite } from "./migration-suite";
 
@@ -1878,5 +1879,20 @@ describe("lexicographic sort edge cases", () => {
 
     expect(results.documents).toHaveLength(2);
     expect(results.documents.map((d: any) => d.doc.id)).toEqual(["a", "b"]);
+  });
+
+  test("encoded numeric index values sort numerically", async () => {
+    await engine.put("items", "a", { id: "a" }, { byNum: encodeNumericIndexValue(2) });
+    await engine.put("items", "b", { id: "b" }, { byNum: encodeNumericIndexValue(10) });
+    await engine.put("items", "c", { id: "c" }, { byNum: encodeNumericIndexValue(1) });
+    await engine.put("items", "d", { id: "d" }, { byNum: encodeNumericIndexValue(-5) });
+
+    const results = await engine.query("items", {
+      index: "byNum",
+      filter: { value: { $gte: encodeNumericIndexValue(-10) } },
+      sort: "asc",
+    });
+
+    expect(results.documents.map((d: any) => d.doc.id)).toEqual(["d", "c", "a", "b"]);
   });
 });

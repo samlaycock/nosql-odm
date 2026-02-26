@@ -677,9 +677,12 @@ const members = await store.user.query({
 
 All index values are strings. Sort/range comparisons are lexicographic.
 
-If you need numeric ordering, encode numeric values so lexicographic order matches numeric order:
+If you need numeric ordering, use `encodeNumericIndexValue()` so lexicographic
+order matches numeric order (including negatives/decimals):
 
 ```ts
+import { encodeNumericIndexValue, model } from "nosql-odm";
+
 const Product = model("product")
   .schema(
     1,
@@ -689,9 +692,23 @@ const Product = model("product")
     }),
   )
   .index({ name: "primary", value: "id" })
-  .index({ name: "byPrice", value: (p) => String(p.priceCents).padStart(12, "0") })
+  .index({ name: "byPrice", value: (p) => encodeNumericIndexValue(p.priceCents) })
   .build();
 ```
+
+Use the same encoding for query filters/range bounds:
+
+```ts
+const results = await store.product.query({
+  index: "byPrice",
+  filter: { value: { $gte: encodeNumericIndexValue(500) } },
+  sort: "asc",
+});
+```
+
+If you switch an existing index from raw strings/manual padding to
+`encodeNumericIndexValue()`, reindex stored documents (for example via
+`migrateAll()`) so persisted index entries use the new encoding.
 
 For dates/times, prefer sortable ISO-8601 strings (`2026-02-13T19:00:00.000Z`).
 
@@ -1352,7 +1369,8 @@ See `dist/index.d.ts` and `dist/engines/memory.d.ts` for full signatures.
 - `create` and `batchSet` require explicit string keys (the `key` parameter is the storage key, distinct from any `id` field in your data).
 - `create` throws if the key already exists (`DocumentAlreadyExistsError`), based on the adapter's atomic `engine.create` behavior.
 - `batchGet`, `batchSet`, and `batchDelete` are required adapter methods.
-- Query comparisons are lexicographic (index values are stored as strings).
+- Query comparisons are lexicographic (index values are stored as strings). Use
+  `encodeNumericIndexValue()` for numeric range/sort indexes.
 - Adding a new schema version resets builder indexes; re-add indexes for the latest shape.
 - `create`, `batchSet`, and `update` validate against the latest schema.
 - Unique indexes require an engine with atomic uniqueness support. `createStore()` throws if a model declares `unique: true` indexes and the selected engine cannot guarantee uniqueness.
