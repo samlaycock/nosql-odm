@@ -11,6 +11,7 @@ import {
 import { DefaultMigrator } from "../../src/migrator";
 import { model, ValidationError } from "../../src/model";
 import {
+  ConcurrentWriteError,
   createStore,
   DocumentAlreadyExistsError,
   DocumentNotFoundError,
@@ -4844,6 +4845,86 @@ describe("engine options passthrough", () => {
     expect(calls).toHaveLength(2);
     expect((calls[0] as any).options).toEqual({ trace: "update-trace-2" });
     expect((calls[1] as any).options).toEqual({ trace: "update-trace-2" });
+  });
+
+  test("update uses getWithMetadata and batchSetWithResult to pass expectedWriteToken", async () => {
+    const calls: unknown[] = [];
+    const trackingEngine = buildTrackingEngine(calls, {
+      async get() {
+        calls.push({ method: "get" });
+        return null;
+      },
+      async getWithMetadata(_collection, _id, options) {
+        calls.push({ method: "getWithMetadata", options });
+        return {
+          doc: {
+            __v: 1,
+            __indexes: ["primary", "byEmail"],
+            id: "u1",
+            name: "Sam",
+            email: "sam@example.com",
+          },
+          writeToken: "token-u1-v1",
+        };
+      },
+      async update(_collection, _id, _doc, _indexes, options) {
+        calls.push({ method: "update", options });
+      },
+      async batchSetWithResult(_collection, items, options) {
+        calls.push({ method: "batchSetWithResult", items, options });
+        return {
+          persistedKeys: ["u1"],
+          conflictedKeys: [],
+        };
+      },
+    });
+
+    const store = createStore(trackingEngine, [buildUserV1()]);
+    await store.user.update("u1", { name: "Sam Updated" }, { trace: "update-token-trace" });
+
+    expect(calls).toEqual([
+      expect.objectContaining({
+        method: "getWithMetadata",
+        options: { trace: "update-token-trace" },
+      }),
+      expect.objectContaining({
+        method: "batchSetWithResult",
+        options: { trace: "update-token-trace" },
+        items: [
+          expect.objectContaining({
+            key: "u1",
+            expectedWriteToken: "token-u1-v1",
+          }),
+        ],
+      }),
+    ]);
+  });
+
+  test("update throws ConcurrentWriteError when conditional write conflicts", async () => {
+    const trackingEngine = buildTrackingEngine([], {
+      async getWithMetadata() {
+        return {
+          doc: {
+            __v: 1,
+            __indexes: ["primary", "byEmail"],
+            id: "u1",
+            name: "Sam",
+            email: "sam@example.com",
+          },
+          writeToken: "token-u1-v1",
+        };
+      },
+      async batchSetWithResult() {
+        return {
+          persistedKeys: [],
+          conflictedKeys: ["u1"],
+        };
+      },
+    });
+
+    const store = createStore(trackingEngine, [buildUserV1()]);
+
+    await expectReject(store.user.update("u1", { name: "Sam Updated" }), ConcurrentWriteError);
   });
 
   test("delete passes options to engine.delete", async () => {
