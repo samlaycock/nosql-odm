@@ -424,7 +424,8 @@ describe("mySqlEngine integration", () => {
     });
 
     expect(first.documents.map((item) => item.key)).toEqual(["u1", "u3"]);
-    expect(first.cursor).toBe("u3");
+    expect(first.cursor).not.toBeNull();
+    expect(first.cursor).not.toBe("u3");
     expect(second.documents.map((item) => item.key)).toEqual(["u2"]);
     expect(second.cursor).toBeNull();
   });
@@ -480,20 +481,19 @@ describe("mySqlEngine integration", () => {
       limit: 1.9,
     });
 
-    const unknownCursor = await engine.query(collection, {
+    const invalidCursor = engine.query(collection, {
       index: "byRole",
       filter: { value: { $begins: "member#" } },
       sort: "asc",
       cursor: "unknown",
       limit: 2,
     });
-
-    const lastCursor = await engine.query(collection, {
+    const terminalPage = await engine.query(collection, {
       index: "byRole",
       filter: { value: { $begins: "member#" } },
       sort: "asc",
-      cursor: "u3",
-      limit: 2,
+      cursor: fractional.cursor ?? undefined,
+      limit: 10,
     });
 
     expect(limitZero.documents).toHaveLength(0);
@@ -501,10 +501,41 @@ describe("mySqlEngine integration", () => {
     expect(noLimit.documents).toHaveLength(3);
     expect(noLimit.cursor).toBeNull();
     expect(fractional.documents).toHaveLength(1);
-    expect(fractional.cursor).toBe("u1");
-    expect(unknownCursor.documents.map((item) => item.key)).toEqual(["u1", "u2"]);
-    expect(lastCursor.documents).toHaveLength(0);
-    expect(lastCursor.cursor).toBeNull();
+    expect(fractional.cursor).not.toBeNull();
+    await expectReject(invalidCursor, /cursor/i);
+    expect(terminalPage.documents.map((item) => item.key)).toEqual(["u2", "u3"]);
+    expect(terminalPage.cursor).toBeNull();
+  });
+
+  test("sorted pagination remains stable when cursor row is deleted between pages", async () => {
+    await engine.put(collection, "a", { id: "a" }, { byGroup: "g" });
+    await engine.put(collection, "b", { id: "b" }, { byGroup: "g" });
+    await engine.put(collection, "c", { id: "c" }, { byGroup: "g" });
+    await engine.put(collection, "d", { id: "d" }, { byGroup: "h" });
+
+    const page1 = await engine.query(collection, {
+      index: "byGroup",
+      filter: { value: { $gte: "g" } },
+      sort: "asc",
+      limit: 2,
+    });
+
+    expect(page1.documents.map((item) => item.key)).toEqual(["a", "b"]);
+    expect(page1.cursor).not.toBeNull();
+
+    await engine.delete(collection, "b");
+    await engine.put(collection, "ab", { id: "ab" }, { byGroup: "g" });
+    await engine.put(collection, "bc", { id: "bc" }, { byGroup: "g" });
+
+    const page2 = await engine.query(collection, {
+      index: "byGroup",
+      filter: { value: { $gte: "g" } },
+      sort: "asc",
+      limit: 2,
+      cursor: page1.cursor!,
+    });
+
+    expect(page2.documents.map((item) => item.key)).toEqual(["c", "ab"]);
   });
 
   test("migration lock/checkpoint/status semantics", async () => {
