@@ -13,6 +13,7 @@ export {
   type CompareVersions,
   type ProjectionSkipReason,
   type ProjectionResult,
+  encodeNumericIndexValue,
   type IndexValue,
   type IndexDefinition,
   type DynamicIndexDefinition,

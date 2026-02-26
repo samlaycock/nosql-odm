@@ -640,6 +640,41 @@ export class InitialModelBuilderImpl<
 // Helpers
 // ---------------------------------------------------------------------------
 
+const HEX_ALPHABET = "0123456789abcdef";
+
+/**
+ * Encodes a finite JavaScript number into a fixed-width string whose
+ * lexicographic order matches numeric order. Use this for numeric index values
+ * and query bounds because all index comparisons are string-based.
+ */
+export function encodeNumericIndexValue(value: number): string {
+  if (!Number.isFinite(value)) {
+    throw new Error(`Numeric index values must be finite numbers`);
+  }
+
+  const normalized = Object.is(value, -0) ? 0 : value;
+  const bytes = new Uint8Array(8);
+  const view = new DataView(bytes.buffer);
+
+  // Big-endian IEEE-754 bytes, transformed into a sortable byte sequence.
+  view.setFloat64(0, normalized, false);
+
+  if ((bytes[0]! & 0x80) !== 0) {
+    for (let i = 0; i < bytes.length; i++) {
+      bytes[i] = ~bytes[i]! & 0xff;
+    }
+  } else {
+    bytes[0] = (bytes[0]! ^ 0x80) & 0xff;
+  }
+
+  let encoded = "n:";
+  for (const byte of bytes) {
+    encoded += HEX_ALPHABET.charAt((byte >> 4) & 0x0f) + HEX_ALPHABET.charAt(byte & 0x0f);
+  }
+
+  return encoded;
+}
+
 function resolveIndexValue<T>(value: IndexValue<T>, data: T): string | undefined {
   if (typeof value === "function") {
     const resolved = value(data);

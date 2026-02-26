@@ -1,7 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import * as z from "zod";
 
-import { model, ModelDefinition, ValidationError, VersionError } from "../../src/model";
+import {
+  encodeNumericIndexValue,
+  model,
+  ModelDefinition,
+  ValidationError,
+  VersionError,
+} from "../../src/model";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -249,6 +255,27 @@ describe("builder validation", () => {
 // ---------------------------------------------------------------------------
 
 describe("indexes", () => {
+  test("encodes finite numbers into lexicographically sortable index values", () => {
+    const values = [-10, -2, -0.5, 0, 0.5, 2, 10];
+    const sortedNumerically = [...values].sort((a, b) => a - b);
+    const sortedLexicographically = [...values]
+      .map((value) => ({ value, encoded: encodeNumericIndexValue(value) }))
+      .sort((a, b) => a.encoded.localeCompare(b.encoded))
+      .map((entry) => entry.value);
+
+    expect(sortedLexicographically).toEqual(sortedNumerically);
+  });
+
+  test("normalizes -0 and 0 to the same encoded value", () => {
+    expect(encodeNumericIndexValue(-0)).toBe(encodeNumericIndexValue(0));
+  });
+
+  test("rejects non-finite numeric index values", () => {
+    expect(() => encodeNumericIndexValue(Number.NaN)).toThrow("finite");
+    expect(() => encodeNumericIndexValue(Number.POSITIVE_INFINITY)).toThrow("finite");
+    expect(() => encodeNumericIndexValue(Number.NEGATIVE_INFINITY)).toThrow("finite");
+  });
+
   test("registers static field indexes", () => {
     const m = model("user")
       .schema(
