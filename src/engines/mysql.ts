@@ -1,5 +1,9 @@
 import { DefaultMigrator } from "../migrator";
-import { encodeQueryPageCursor, resolveQueryPageStartIndex } from "./query-cursor";
+import {
+  encodeQueryPageCursor,
+  resolveQueryPageCursorPosition,
+  type QueryCursorPosition,
+} from "./query-cursor";
 import {
   type BatchSetItem,
   type BatchSetResult,
@@ -544,16 +548,23 @@ async function queryByCollectionScan(
     };
   }
 
-  const values: (string | number)[] = [collection];
+  const cursorPosition = resolveQueryPageCursorPosition(collection, params);
+  const cursorId =
+    cursorPosition === null
+      ? 0
+      : cursorPosition.kind === "key"
+        ? await resolveCursorId(client, refs, collection, cursorPosition.key)
+        : readSqlCursorRowId(cursorPosition);
+  const values: (string | number)[] = [collection, cursorId];
 
   let sql = `
     SELECT id AS cursor_id, doc_key AS \`key\`, doc_json, write_version
     FROM ${refs.documentsTable}
-    WHERE collection = ?
+    WHERE collection = ? AND id > ?
     ORDER BY id ASC
   `;
 
-  if (limit !== null && !params.cursor) {
+  if (limit !== null) {
     values.push(limit + 1);
     sql += ` LIMIT ?`;
   }
@@ -598,6 +609,42 @@ async function queryByIndex(
     whereClauses.push(filterSql);
   }
 
+  const cursorPosition = resolveQueryPageCursorPosition(collection, params);
+
+  if (cursorPosition) {
+    if (sort === "asc" || sort === "desc") {
+      if (cursorPosition.kind !== "sorted-index") {
+        throw new Error("Query cursor is missing sorted index metadata");
+      }
+
+      if (cursorPosition.createdAt === undefined) {
+        throw new Error("Query cursor is missing SQL row metadata");
+      }
+
+      const valueArg = builder.push(cursorPosition.indexValue);
+      const valueTieArg = builder.push(cursorPosition.indexValue);
+      const idArg = builder.push(cursorPosition.createdAt);
+
+      if (sort === "asc") {
+        whereClauses.push(
+          `(ix.index_value > ${valueArg} OR (ix.index_value = ${valueTieArg} AND d.id > ${idArg}))`,
+        );
+      } else {
+        whereClauses.push(
+          `(ix.index_value < ${valueArg} OR (ix.index_value = ${valueTieArg} AND d.id > ${idArg}))`,
+        );
+      }
+    } else {
+      const cursorId =
+        cursorPosition.kind === "key"
+          ? await resolveCursorId(client, refs, collection, cursorPosition.key)
+          : readSqlCursorRowId(cursorPosition);
+      const idArg = builder.push(cursorId);
+
+      whereClauses.push(`d.id > ${idArg}`);
+    }
+  }
+
   const orderBy =
     sort === "asc"
       ? `ORDER BY ix.index_value ASC, d.id ASC`
@@ -615,7 +662,7 @@ async function queryByIndex(
     ${orderBy}
   `;
 
-  if (limit !== null && !params.cursor) {
+  if (limit !== null) {
     sql += ` LIMIT ${builder.push(limit + 1)}`;
   }
 
@@ -634,47 +681,31 @@ function formatPage(
   collection: string,
   includeWriteTokens = false,
 ): EngineQueryResult {
-  const normalizedLimit = normalizeLimit(params.limit);
-  const limit = normalizedLimit ?? rows.length;
-  const hasLimit = normalizedLimit !== null;
-
-  if (limit <= 0) {
-    return {
-      documents: [],
-      cursor: null,
-    };
-  }
-
-  const startIndex = resolveQueryPageStartIndex(rows, collection, params, (row, queryParams) => ({
-    key: readStringField(row, "key", "MySQL returned an invalid query result"),
-    createdAt: readFiniteInteger(row, "cursor_id", "MySQL returned an invalid query result"),
-    indexValue: queryParams.index
-      ? readStringField(row, "cursor_index_value", "MySQL returned an invalid query result")
-      : undefined,
-  }));
-  const pageRows = rows.slice(startIndex, startIndex + limit);
-  const cursor =
-    pageRows.length > 0 && hasLimit && startIndex + limit < rows.length
-      ? encodeQueryPageCursor(collection, params, {
-          key: readStringField(
-            pageRows[pageRows.length - 1]!,
-            "key",
-            "MySQL returned an invalid query result",
-          ),
-          createdAt: readFiniteInteger(
-            pageRows[pageRows.length - 1]!,
-            "cursor_id",
-            "MySQL returned an invalid query result",
-          ),
-          indexValue: params.index
-            ? readStringField(
-                pageRows[pageRows.length - 1]!,
-                "cursor_index_value",
-                "MySQL returned an invalid query result",
-              )
-            : undefined,
-        })
-      : null;
+  const limit = normalizeLimit(params.limit);
+  const hasLimit = limit !== null;
+  const hasMore = hasLimit && rows.length > limit;
+  const pageRows = hasMore ? rows.slice(0, limit) : rows;
+  const cursor = hasMore
+    ? encodeQueryPageCursor(collection, params, {
+        key: readStringField(
+          pageRows[pageRows.length - 1]!,
+          "key",
+          "MySQL returned an invalid query result",
+        ),
+        createdAt: readFiniteInteger(
+          pageRows[pageRows.length - 1]!,
+          "cursor_id",
+          "MySQL returned an invalid query result",
+        ),
+        indexValue: params.index
+          ? readStringField(
+              pageRows[pageRows.length - 1]!,
+              "cursor_index_value",
+              "MySQL returned an invalid query result",
+            )
+          : undefined,
+      })
+    : null;
 
   return {
     documents: pageRows.map((row) => {
@@ -1240,6 +1271,42 @@ function normalizeIndexes(indexes: ResolvedIndexKeys): ResolvedIndexKeys {
   }
 
   return normalized;
+}
+
+function readSqlCursorRowId(cursorPosition: Exclude<QueryCursorPosition, { kind: "key" }>): number {
+  if (cursorPosition.createdAt === undefined) {
+    throw new Error("Query cursor is missing SQL row metadata");
+  }
+
+  return cursorPosition.createdAt;
+}
+
+async function resolveCursorId(
+  client: MySqlQueryableLike,
+  refs: TableRefs,
+  collection: string,
+  cursor: string | undefined,
+): Promise<number> {
+  if (!cursor) {
+    return 0;
+  }
+
+  const row = await fetchOptionalRow(client, {
+    sql: `
+      SELECT id
+      FROM ${refs.documentsTable}
+      WHERE collection = ? AND doc_key = ?
+      LIMIT 1
+    `,
+    params: [collection, cursor],
+    errorMessage: "MySQL returned an invalid cursor row",
+  });
+
+  if (!row) {
+    return 0;
+  }
+
+  return readFiniteInteger(row, "id", "MySQL returned an invalid cursor row");
 }
 
 function normalizeLimit(limit: number | undefined): number | null {

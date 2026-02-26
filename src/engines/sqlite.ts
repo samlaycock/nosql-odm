@@ -1,7 +1,11 @@
 import type Database from "better-sqlite3";
 
 import { DefaultMigrator } from "../migrator";
-import { encodeQueryPageCursor, resolveQueryPageStartIndex } from "./query-cursor";
+import {
+  encodeQueryPageCursor,
+  resolveQueryPageCursorPosition,
+  type QueryCursorPosition,
+} from "./query-cursor";
 import {
   type BatchSetResult,
   EngineDocumentAlreadyExistsError,
@@ -708,8 +712,15 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
       return { documents: [], cursor: null };
     }
 
-    const fetchLimit = params.cursor || limit === null ? Number.MAX_SAFE_INTEGER : limit + 1;
-    const rows = queryScanPageStmt.all(collection, 0, fetchLimit);
+    const cursorPosition = resolveQueryPageCursorPosition(collection, params);
+    const cursorId =
+      cursorPosition === null
+        ? 0
+        : cursorPosition.kind === "key"
+          ? resolveCursorId(collection, cursorPosition.key, selectDocumentIdByKeyStmt)
+          : readSqlCursorRowId(cursorPosition);
+    const fetchLimit = limit === null ? Number.MAX_SAFE_INTEGER : limit + 1;
+    const rows = queryScanPageStmt.all(collection, cursorId, fetchLimit);
 
     return formatPage(rows, params, collection, includeWriteTokens);
   }
@@ -737,6 +748,35 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
       args.push(...filter.args);
     }
 
+    const cursorPosition = resolveQueryPageCursorPosition(collection, params);
+
+    if (cursorPosition) {
+      if (sort === "asc" || sort === "desc") {
+        if (cursorPosition.kind !== "sorted-index") {
+          throw new Error("Query cursor is missing sorted index metadata");
+        }
+
+        if (cursorPosition.createdAt === undefined) {
+          throw new Error("Query cursor is missing SQL row metadata");
+        }
+
+        if (sort === "asc") {
+          whereParts.push(`(ix.index_value > ? OR (ix.index_value = ? AND d.id > ?))`);
+        } else {
+          whereParts.push(`(ix.index_value < ? OR (ix.index_value = ? AND d.id > ?))`);
+        }
+
+        args.push(cursorPosition.indexValue, cursorPosition.indexValue, cursorPosition.createdAt);
+      } else {
+        const cursorId =
+          cursorPosition.kind === "key"
+            ? resolveCursorId(collection, cursorPosition.key, selectDocumentIdByKeyStmt)
+            : readSqlCursorRowId(cursorPosition);
+        whereParts.push(`d.id > ?`);
+        args.push(cursorId);
+      }
+    }
+
     const orderBy =
       sort === "asc"
         ? `ORDER BY ix.index_value ASC, d.id ASC`
@@ -744,7 +784,7 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
           ? `ORDER BY ix.index_value DESC, d.id ASC`
           : `ORDER BY d.id ASC`;
 
-    const fetchLimit = params.cursor || limit === null ? Number.MAX_SAFE_INTEGER : limit + 1;
+    const fetchLimit = limit === null ? Number.MAX_SAFE_INTEGER : limit + 1;
     const sql = `
       SELECT d.id AS cursor_id, ix.index_value AS cursor_index_value, d.doc_key AS key, d.doc_json, d.write_version
       FROM index_entries ix
@@ -767,30 +807,19 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
     collection: string,
     includeWriteTokens = false,
   ): EngineQueryResult {
-    const normalizedLimit = normalizeLimit(params.limit);
-    const limit = normalizedLimit ?? rows.length;
-    const hasLimit = normalizedLimit !== null;
-
-    if (limit <= 0) {
-      return { documents: [], cursor: null };
-    }
-
-    const startIndex = resolveQueryPageStartIndex(rows, collection, params, (row, queryParams) => ({
-      key: row.key,
-      createdAt: row.cursor_id,
-      indexValue: queryParams.index ? (row.cursor_index_value ?? "") : undefined,
-    }));
-    const pageRows = rows.slice(startIndex, startIndex + limit);
-    const cursor =
-      pageRows.length > 0 && hasLimit && startIndex + limit < rows.length
-        ? encodeQueryPageCursor(collection, params, {
-            key: pageRows[pageRows.length - 1]!.key,
-            createdAt: pageRows[pageRows.length - 1]!.cursor_id,
-            indexValue: params.index
-              ? (pageRows[pageRows.length - 1]!.cursor_index_value ?? "")
-              : undefined,
-          })
-        : null;
+    const limit = normalizeLimit(params.limit);
+    const hasLimit = limit !== null;
+    const hasMore = hasLimit && rows.length > limit;
+    const pageRows = hasMore ? rows.slice(0, limit) : rows;
+    const cursor = hasMore
+      ? encodeQueryPageCursor(collection, params, {
+          key: pageRows[pageRows.length - 1]!.key,
+          createdAt: pageRows[pageRows.length - 1]!.cursor_id,
+          indexValue: params.index
+            ? (pageRows[pageRows.length - 1]!.cursor_index_value ?? "")
+            : undefined,
+        })
+      : null;
 
     return {
       documents: pageRows.map((row) => {
@@ -988,6 +1017,14 @@ function normalizeTtl(ttl: number | undefined): number | null {
   }
 
   return ttl;
+}
+
+function readSqlCursorRowId(cursorPosition: Exclude<QueryCursorPosition, { kind: "key" }>): number {
+  if (cursorPosition.createdAt === undefined) {
+    throw new Error("Query cursor is missing SQL row metadata");
+  }
+
+  return cursorPosition.createdAt;
 }
 
 interface SqlFilter {
