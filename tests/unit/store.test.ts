@@ -1314,6 +1314,7 @@ describe("store.query() with where", () => {
     const page2 = await store.user.query({
       where: { id: { $gte: "u1" } },
       limit: 2,
+      sort: "asc",
       cursor: page1.cursor!,
     });
 

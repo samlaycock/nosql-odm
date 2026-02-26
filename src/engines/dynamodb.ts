@@ -13,6 +13,7 @@ import {
 } from "@aws-sdk/lib-dynamodb";
 
 import { DefaultMigrator } from "../migrator";
+import { encodeQueryPageCursor, resolveQueryPageStartIndex } from "./query-cursor";
 import {
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
@@ -317,7 +318,7 @@ export function dynamoDbEngine(options: DynamoDbEngineOptions): DynamoDbQueryEng
         (await listDocuments(client, tableName, keyConfig, collection));
       const matched = matchDocuments(records, params);
 
-      return paginate(matched, params);
+      return paginate(collection, matched, params);
     },
 
     async queryWithMetadata(collection, params) {
@@ -326,7 +327,7 @@ export function dynamoDbEngine(options: DynamoDbEngineOptions): DynamoDbQueryEng
         (await listDocuments(client, tableName, keyConfig, collection));
       const matched = matchDocuments(records, params);
 
-      return paginateWithWriteTokens(matched, params);
+      return paginateWithWriteTokens(collection, matched, params);
     },
 
     async batchGet(collection, keys) {
@@ -1867,16 +1868,21 @@ function matchDocuments(records: StoredDocumentItem[], params: QueryParams): Sto
   return results;
 }
 
-function paginate(records: StoredDocumentItem[], params: QueryParams): EngineQueryResult {
-  let startIndex = 0;
-
-  if (params.cursor) {
-    const cursorIndex = records.findIndex((record) => record.key === params.cursor);
-
-    if (cursorIndex !== -1) {
-      startIndex = cursorIndex + 1;
-    }
-  }
+function paginate(
+  collection: string,
+  records: StoredDocumentItem[],
+  params: QueryParams,
+): EngineQueryResult {
+  const startIndex = resolveQueryPageStartIndex(
+    records,
+    collection,
+    params,
+    (record, queryParams) => ({
+      key: record.key,
+      createdAt: record.createdAt,
+      indexValue: queryParams.index ? (record.indexes[queryParams.index] ?? "") : undefined,
+    }),
+  );
 
   const normalizedLimit = normalizeLimit(params.limit);
   const limit = normalizedLimit ?? records.length;
@@ -1892,7 +1898,13 @@ function paginate(records: StoredDocumentItem[], params: QueryParams): EngineQue
   const page = records.slice(startIndex, startIndex + limit);
   const cursor =
     page.length > 0 && hasLimit && startIndex + limit < records.length
-      ? page[page.length - 1]!.key
+      ? encodeQueryPageCursor(collection, params, {
+          key: page[page.length - 1]!.key,
+          createdAt: page[page.length - 1]!.createdAt,
+          indexValue: params.index
+            ? (page[page.length - 1]!.indexes[params.index] ?? "")
+            : undefined,
+        })
       : null;
 
   return {
@@ -1905,18 +1917,20 @@ function paginate(records: StoredDocumentItem[], params: QueryParams): EngineQue
 }
 
 function paginateWithWriteTokens(
+  collection: string,
   records: StoredDocumentItem[],
   params: QueryParams,
 ): EngineQueryResult {
-  let startIndex = 0;
-
-  if (params.cursor) {
-    const cursorIndex = records.findIndex((record) => record.key === params.cursor);
-
-    if (cursorIndex !== -1) {
-      startIndex = cursorIndex + 1;
-    }
-  }
+  const startIndex = resolveQueryPageStartIndex(
+    records,
+    collection,
+    params,
+    (record, queryParams) => ({
+      key: record.key,
+      createdAt: record.createdAt,
+      indexValue: queryParams.index ? (record.indexes[queryParams.index] ?? "") : undefined,
+    }),
+  );
 
   const normalizedLimit = normalizeLimit(params.limit);
   const limit = normalizedLimit ?? records.length;
@@ -1932,7 +1946,13 @@ function paginateWithWriteTokens(
   const page = records.slice(startIndex, startIndex + limit);
   const cursor =
     page.length > 0 && hasLimit && startIndex + limit < records.length
-      ? page[page.length - 1]!.key
+      ? encodeQueryPageCursor(collection, params, {
+          key: page[page.length - 1]!.key,
+          createdAt: page[page.length - 1]!.createdAt,
+          indexValue: params.index
+            ? (page[page.length - 1]!.indexes[params.index] ?? "")
+            : undefined,
+        })
       : null;
 
   return {

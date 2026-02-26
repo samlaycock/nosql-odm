@@ -376,7 +376,8 @@ describe("redisEngine integration", () => {
     });
 
     expect(first.documents.map((item) => item.key)).toEqual(["u1", "u3"]);
-    expect(first.cursor).toBe("u3");
+    expect(first.cursor).not.toBeNull();
+    expect(first.cursor).not.toBe("u3");
     expect(second.documents.map((item) => item.key)).toEqual(["u2"]);
     expect(second.cursor).toBeNull();
   });
@@ -432,31 +433,31 @@ describe("redisEngine integration", () => {
       limit: 1.9,
     });
 
-    const unknownCursor = await engine.query(collection, {
-      index: "byRole",
-      filter: { value: { $begins: "member#" } },
-      sort: "asc",
-      cursor: "unknown",
-      limit: 2,
-    });
-
-    const lastCursor = await engine.query(collection, {
-      index: "byRole",
-      filter: { value: { $begins: "member#" } },
-      sort: "asc",
-      cursor: "u3",
-      limit: 2,
-    });
-
     expect(limitZero.documents).toHaveLength(0);
     expect(limitZero.cursor).toBeNull();
     expect(noLimit.documents).toHaveLength(3);
     expect(noLimit.cursor).toBeNull();
     expect(fractional.documents).toHaveLength(1);
-    expect(fractional.cursor).toBe("u1");
-    expect(unknownCursor.documents.map((item) => item.key)).toEqual(["u1", "u2"]);
-    expect(lastCursor.documents).toHaveLength(0);
-    expect(lastCursor.cursor).toBeNull();
+    expect(fractional.cursor).not.toBeNull();
+    expect(fractional.cursor).not.toBe("u1");
+    expect(
+      engine.query(collection, {
+        index: "byRole",
+        filter: { value: { $begins: "member#" } },
+        sort: "asc",
+        cursor: "unknown",
+        limit: 2,
+      }),
+    ).rejects.toThrow(/cursor/i);
+    expect(
+      engine.query(collection, {
+        index: "byRole",
+        filter: { value: { $begins: "member#" } },
+        sort: "asc",
+        cursor: "u3",
+        limit: 2,
+      }),
+    ).rejects.toThrow(/cursor/i);
   });
 
   test("query tolerates dangling order entries", async () => {

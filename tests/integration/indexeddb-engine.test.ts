@@ -425,32 +425,31 @@ describe("indexedDbEngine query behavior", () => {
     const results = await engine.query("users", { limit: 1.9 });
 
     expect(results.documents).toHaveLength(1);
-    expect(results.cursor).toBe("u1");
+    expect(results.cursor).not.toBeNull();
+    expect(results.cursor).not.toBe("u1");
   });
 
-  test("query with unrecognized cursor starts from beginning", async () => {
+  test("query with unrecognized cursor is rejected explicitly", async () => {
     await engine.put("users", "u1", { id: "u1" }, { primary: "u1" });
     await engine.put("users", "u2", { id: "u2" }, { primary: "u2" });
 
-    const results = await engine.query("users", {
-      cursor: "does-not-exist",
-      limit: 1,
-    });
-
-    expect(results.documents.map((item) => item.key)).toEqual(["u1"]);
-    expect(results.cursor).toBe("u1");
+    expect(
+      engine.query("users", {
+        cursor: "does-not-exist",
+        limit: 1,
+      }),
+    ).rejects.toThrow(/cursor/i);
   });
 
-  test("query cursor at last item returns empty page", async () => {
+  test("raw key query cursors are rejected", async () => {
     await engine.put("users", "u1", { id: "u1" }, { primary: "u1" });
 
-    const results = await engine.query("users", {
-      cursor: "u1",
-      limit: 10,
-    });
-
-    expect(results.documents).toHaveLength(0);
-    expect(results.cursor).toBeNull();
+    expect(
+      engine.query("users", {
+        cursor: "u1",
+        limit: 10,
+      }),
+    ).rejects.toThrow(/cursor/i);
   });
 
   test("query returns deep-cloned documents", async () => {
