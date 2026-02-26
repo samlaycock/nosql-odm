@@ -1471,10 +1471,19 @@ class BoundModelImpl<
     params: ModelQueryParams<TStaticIndexNames, THasDynamicIndexes>,
   ): QueryParams {
     const hasIndex = params.index !== undefined;
+    const hasFilter = params.filter !== undefined;
     const hasWhere = params.where !== undefined;
 
-    if (hasIndex && hasWhere) {
+    if ((hasIndex || hasFilter) && hasWhere) {
       throw new Error(`Cannot use both "index"/"filter" and "where" in the same query`);
+    }
+
+    if (hasIndex !== hasFilter) {
+      if (hasIndex) {
+        throw new Error('query params with "index" must also include "filter"');
+      }
+
+      throw new Error('query params with "filter" must also include "index"');
     }
 
     if (hasWhere) {
