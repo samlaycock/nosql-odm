@@ -277,6 +277,7 @@ interface UniquePrecheckTracker {
   inFlight: number;
   maxInFlight: number;
   values: string[];
+  lockAcquisitions: number;
   waiters: Array<() => void>;
 }
 
@@ -325,6 +326,7 @@ function createUniquePrecheckTrackingEngine(precheck: UniquePrecheckTracker): Qu
     async batchDelete() {},
     migration: {
       async acquireLock(collection) {
+        precheck.lockAcquisitions += 1;
         return {
           id: "lock-1",
           collection,
@@ -445,6 +447,27 @@ describe("unique indexes", () => {
     );
   });
 
+  test("atomic engines skip store-managed unique guards by default", async () => {
+    const precheck: UniquePrecheckTracker = {
+      inFlight: 0,
+      maxInFlight: 0,
+      values: [],
+      lockAcquisitions: 0,
+      waiters: [],
+    };
+    const trackingEngine = createUniquePrecheckTrackingEngine(precheck);
+    const store = createStore(trackingEngine, [buildUserV1WithUniqueEmail()]);
+
+    await store.user.create("u1", {
+      id: "u1",
+      name: "Sam",
+      email: "sam@example.com",
+    });
+
+    expect(precheck.values).toEqual([]);
+    expect(precheck.lockAcquisitions).toBe(0);
+  });
+
   test("create enforces unique index values", async () => {
     const store = createStore(engine, [buildUserV1WithUniqueEmail()]);
 
@@ -518,11 +541,13 @@ describe("unique indexes", () => {
       inFlight: 0,
       maxInFlight: 0,
       values: [],
+      lockAcquisitions: 0,
       waiters: [],
     };
     const trackingEngine = createUniquePrecheckTrackingEngine(precheck);
-
-    const store = createStore(trackingEngine, [buildUserV1WithUniqueEmail()]);
+    const store = createStore(trackingEngine, [buildUserV1WithUniqueEmail()], {
+      allowStoreManagedUniqueConstraints: true,
+    });
 
     await store.user.batchSet([
       { key: "u1", data: { id: "u1", name: "Sam", email: "sam@example.com" } },
@@ -545,10 +570,12 @@ describe("unique indexes", () => {
       inFlight: 0,
       maxInFlight: 0,
       values: [],
+      lockAcquisitions: 0,
       waiters: [],
     };
     const trackingEngine = createUniquePrecheckTrackingEngine(precheck);
     const store = createStore(trackingEngine, [buildUserV1WithUniqueEmail()], {
+      allowStoreManagedUniqueConstraints: true,
       uniqueConstraintPrecheck: {
         concurrency: 2,
       },
@@ -664,6 +691,7 @@ describe("unique indexes", () => {
       };
 
       const store = createStore(trackingEngine, [buildUserV1WithUniqueEmail()], {
+        allowStoreManagedUniqueConstraints: true,
         uniqueConstraintLock: {
           ttlMs: 12_000,
           maxAttempts: 3,
@@ -752,6 +780,7 @@ describe("unique indexes", () => {
     };
 
     const store = createStore(trackingEngine, [buildUserV1WithUniqueEmail()], {
+      allowStoreManagedUniqueConstraints: true,
       uniqueConstraintLock: {
         ttlMs: 40,
         maxAttempts: 1,
@@ -835,6 +864,7 @@ describe("unique indexes", () => {
     };
 
     const store = createStore(trackingEngine, [buildUserV1WithUniqueEmail()], {
+      allowStoreManagedUniqueConstraints: true,
       uniqueConstraintLock: {
         ttlMs: 40,
         maxAttempts: 1,
