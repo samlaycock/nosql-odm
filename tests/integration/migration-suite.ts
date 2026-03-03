@@ -228,7 +228,9 @@ export function runMigrationIntegrationSuite<TOptions>(
       const engine = options.getEngine();
       const collection = options.nextCollection("users_unique_create");
       const User = buildUniqueUserModel(collection);
-      const store = createStore(engine, [User]);
+      const store = createStore(engine, [User], {
+        allowStoreManagedUniqueConstraints: true,
+      });
       const users = getBoundModel(store, collection);
 
       await users.create("u1", {
@@ -251,7 +253,9 @@ export function runMigrationIntegrationSuite<TOptions>(
       const engine = options.getEngine();
       const collection = options.nextCollection("users_unique_update");
       const User = buildUniqueUserModel(collection);
-      const store = createStore(engine, [User]);
+      const store = createStore(engine, [User], {
+        allowStoreManagedUniqueConstraints: true,
+      });
       const users = getBoundModel(store, collection);
 
       await users.create("u1", {
@@ -277,7 +281,9 @@ export function runMigrationIntegrationSuite<TOptions>(
       const engine = options.getEngine();
       const collection = options.nextCollection("users_unique_batch");
       const User = buildUniqueUserModel(collection);
-      const store = createStore(engine, [User]);
+      const store = createStore(engine, [User], {
+        allowStoreManagedUniqueConstraints: true,
+      });
       const users = getBoundModel(store, collection);
 
       await expectReject(
