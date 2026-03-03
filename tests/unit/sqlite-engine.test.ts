@@ -74,8 +74,10 @@ interface SqlStatementCall {
 
 class TracedBunBetterSqliteCompat extends BunBetterSqliteCompat {
   readonly calls: SqlStatementCall[] = [];
+  readonly preparedSources: string[] = [];
 
   override prepare(source: string) {
+    this.preparedSources.push(source);
     const statement = super.prepare(source);
 
     const track = (method: SqlStatementMethod) => {
@@ -102,6 +104,10 @@ class TracedBunBetterSqliteCompat extends BunBetterSqliteCompat {
     return this.calls.filter(
       (call) => pattern.test(call.source) && (method === undefined || call.method === method),
     ).length;
+  }
+
+  countPrepares(pattern: RegExp): number {
+    return this.preparedSources.filter((source) => pattern.test(source)).length;
   }
 }
 
@@ -758,6 +764,27 @@ describe("batchGetWithMetadata()", () => {
         ),
       ).toBe(0);
       expect(tracedDb.countCalls(/doc_key IN \(/, "all")).toBe(1);
+    } finally {
+      tracedEngine.close();
+    }
+  });
+
+  test("reuses prepared batched select statements across calls", async () => {
+    const tracedDb = new TracedBunBetterSqliteCompat(":memory:");
+    const tracedEngine = sqliteEngine({
+      database: tracedDb as unknown as BetterSqlite3.Database,
+    });
+
+    try {
+      await tracedEngine.put("users", "a", { id: "a" }, {});
+      await tracedEngine.put("users", "b", { id: "b" }, {});
+      await tracedEngine.put("users", "c", { id: "c" }, {});
+
+      await tracedEngine.batchGet("users", ["a", "b", "c"]);
+      await tracedEngine.batchGetWithMetadata!("users", ["c", "b", "a"]);
+
+      expect(tracedDb.countPrepares(/doc_key IN \(/)).toBe(1);
+      expect(tracedDb.countCalls(/doc_key IN \(/, "all")).toBe(2);
     } finally {
       tracedEngine.close();
     }

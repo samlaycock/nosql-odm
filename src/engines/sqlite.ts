@@ -250,6 +250,31 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
     LIMIT ?
   `);
 
+  const selectDocumentsByKeysStmtCache = new Map<
+    number,
+    Database.Statement<unknown[], BatchGetRow>
+  >();
+
+  const getSelectDocumentsByKeysStmt = (
+    chunkSize: number,
+  ): Database.Statement<unknown[], BatchGetRow> => {
+    const cached = selectDocumentsByKeysStmtCache.get(chunkSize);
+
+    if (cached) {
+      return cached;
+    }
+
+    const placeholders = createPlaceholders(chunkSize);
+    const statement = db.prepare<unknown[], BatchGetRow>(`
+      SELECT doc_key AS key, doc_json, write_version
+      FROM documents
+      WHERE collection = ? AND doc_key IN (${placeholders})
+    `);
+
+    selectDocumentsByKeysStmtCache.set(chunkSize, statement);
+    return statement;
+  };
+
   const selectDocumentsByKeys = (collection: string, keys: string[]): Map<string, BatchGetRow> => {
     const uniqueKeys = uniqueStrings(keys);
 
@@ -261,12 +286,7 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
 
     for (let index = 0; index < uniqueKeys.length; index += SQLITE_BATCH_GET_KEYS_PER_QUERY) {
       const chunk = uniqueKeys.slice(index, index + SQLITE_BATCH_GET_KEYS_PER_QUERY);
-      const placeholders = createPlaceholders(chunk.length);
-      const statement = db.prepare(`
-        SELECT doc_key AS key, doc_json, write_version
-        FROM documents
-        WHERE collection = ? AND doc_key IN (${placeholders})
-      `);
+      const statement = getSelectDocumentsByKeysStmt(chunk.length);
       const rows = statement.all(collection, ...chunk) as BatchGetRow[];
 
       for (const row of rows) {
