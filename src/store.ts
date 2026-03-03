@@ -1451,7 +1451,7 @@ class BoundModelImpl<
           {
             index: indexName,
             filter: { value: indexValue },
-            limit: 10,
+            limit: 1,
           },
           options,
         );
