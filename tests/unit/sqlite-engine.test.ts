@@ -65,6 +65,46 @@ class BunBetterSqliteCompat {
   }
 }
 
+type SqlStatementMethod = "run" | "get" | "all";
+
+interface SqlStatementCall {
+  readonly source: string;
+  readonly method: SqlStatementMethod;
+}
+
+class TracedBunBetterSqliteCompat extends BunBetterSqliteCompat {
+  readonly calls: SqlStatementCall[] = [];
+
+  override prepare(source: string) {
+    const statement = super.prepare(source);
+
+    const track = (method: SqlStatementMethod) => {
+      this.calls.push({ source, method });
+    };
+
+    return {
+      run: (...params: unknown[]) => {
+        track("run");
+        return statement.run(...params);
+      },
+      get: (...params: unknown[]) => {
+        track("get");
+        return statement.get(...params);
+      },
+      all: (...params: unknown[]) => {
+        track("all");
+        return statement.all(...params);
+      },
+    };
+  }
+
+  countCalls(pattern: RegExp, method?: SqlStatementMethod): number {
+    return this.calls.filter(
+      (call) => pattern.test(call.source) && (method === undefined || call.method === method),
+    ).length;
+  }
+}
+
 let engine: QueryEngine<never>;
 let sqlite: ReturnType<typeof sqliteEngine>;
 
@@ -654,6 +694,73 @@ describe("batchGet()", () => {
 
     expect(results).toHaveLength(2);
     expect(results[0]!.doc).not.toBe(results[1]!.doc);
+  });
+
+  test("uses one batched document select for multi-key reads", async () => {
+    const tracedDb = new TracedBunBetterSqliteCompat(":memory:");
+    const tracedEngine = sqliteEngine({
+      database: tracedDb as unknown as BetterSqlite3.Database,
+    });
+
+    try {
+      await tracedEngine.put("users", "a", { id: "a" }, {});
+      await tracedEngine.put("users", "b", { id: "b" }, {});
+      await tracedEngine.put("users", "c", { id: "c" }, {});
+
+      const documents = await tracedEngine.batchGet("users", ["a", "missing", "c"]);
+
+      expect(documents).toEqual([
+        { key: "a", doc: { id: "a" } },
+        { key: "c", doc: { id: "c" } },
+      ]);
+      expect(
+        tracedDb.countCalls(
+          /SELECT doc_json, write_version FROM documents WHERE collection = \? AND doc_key = \?/,
+          "get",
+        ),
+      ).toBe(0);
+      expect(tracedDb.countCalls(/doc_key IN \(/, "all")).toBe(1);
+    } finally {
+      tracedEngine.close();
+    }
+  });
+});
+
+describe("batchGetWithMetadata()", () => {
+  test("uses one batched document select for multi-key reads", async () => {
+    const tracedDb = new TracedBunBetterSqliteCompat(":memory:");
+    const tracedEngine = sqliteEngine({
+      database: tracedDb as unknown as BetterSqlite3.Database,
+    });
+
+    try {
+      await tracedEngine.put("users", "a", { id: "a" }, {});
+      await tracedEngine.put("users", "b", { id: "b" }, {});
+      await tracedEngine.put("users", "c", { id: "c" }, {});
+
+      const documents = await tracedEngine.batchGetWithMetadata!("users", ["a", "missing", "c"]);
+
+      expect(documents).toHaveLength(2);
+      expect(documents[0]).toEqual({
+        key: "a",
+        doc: { id: "a" },
+        writeToken: expect.any(String),
+      });
+      expect(documents[1]).toEqual({
+        key: "c",
+        doc: { id: "c" },
+        writeToken: expect.any(String),
+      });
+      expect(
+        tracedDb.countCalls(
+          /SELECT doc_json, write_version FROM documents WHERE collection = \? AND doc_key = \?/,
+          "get",
+        ),
+      ).toBe(0);
+      expect(tracedDb.countCalls(/doc_key IN \(/, "all")).toBe(1);
+    } finally {
+      tracedEngine.close();
+    }
   });
 });
 

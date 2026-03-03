@@ -28,6 +28,8 @@ import {
 const LATEST_SCHEMA_VERSION = 2;
 const OUTDATED_PAGE_LIMIT = 100;
 const OUTDATED_SCAN_CHUNK_SIZE = 256;
+const SQLITE_MAX_VARIABLES = 999;
+const SQLITE_BATCH_GET_KEYS_PER_QUERY = SQLITE_MAX_VARIABLES - 1;
 
 interface DocumentRow {
   id: number;
@@ -39,6 +41,12 @@ interface DocumentRow {
 interface QueryRow {
   cursor_id: number;
   cursor_index_value?: string;
+  key: string;
+  doc_json: string;
+  write_version: number;
+}
+
+interface BatchGetRow {
   key: string;
   doc_json: string;
   write_version: number;
@@ -241,6 +249,33 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
     ORDER BY d.id ASC
     LIMIT ?
   `);
+
+  const selectDocumentsByKeys = (collection: string, keys: string[]): Map<string, BatchGetRow> => {
+    const uniqueKeys = uniqueStrings(keys);
+
+    if (uniqueKeys.length === 0) {
+      return new Map();
+    }
+
+    const rowsByKey = new Map<string, BatchGetRow>();
+
+    for (let index = 0; index < uniqueKeys.length; index += SQLITE_BATCH_GET_KEYS_PER_QUERY) {
+      const chunk = uniqueKeys.slice(index, index + SQLITE_BATCH_GET_KEYS_PER_QUERY);
+      const placeholders = createPlaceholders(chunk.length);
+      const statement = db.prepare(`
+        SELECT doc_key AS key, doc_json, write_version
+        FROM documents
+        WHERE collection = ? AND doc_key IN (${placeholders})
+      `);
+      const rows = statement.all(collection, ...chunk) as BatchGetRow[];
+
+      for (const row of rows) {
+        rowsByKey.set(row.key, row);
+      }
+    }
+
+    return rowsByKey;
+  };
 
   const scanMissingMetadataStmt = db.prepare<
     [string, number, number],
@@ -579,42 +614,37 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
     },
 
     async batchGet(collection, keys) {
-      const results: KeyedDocument[] = [];
+      const fetched = selectDocumentsByKeys(collection, keys);
 
-      for (const key of keys) {
-        const row = selectDocumentByKeyStmt.get(collection, key);
+      return keys.flatMap((key) => {
+        const row = fetched.get(key);
 
         if (!row) {
-          continue;
+          return [];
         }
 
-        results.push({
-          key,
-          doc: parseStoredDocument(row.doc_json, collection, key),
-        });
-      }
-
-      return results;
+        return [{ key, doc: parseStoredDocument(row.doc_json, collection, key) }];
+      });
     },
 
     async batchGetWithMetadata(collection, keys) {
-      const results: KeyedDocument[] = [];
+      const fetched = selectDocumentsByKeys(collection, keys);
 
-      for (const key of keys) {
-        const row = selectDocumentByKeyStmt.get(collection, key);
+      return keys.flatMap((key) => {
+        const row = fetched.get(key);
 
         if (!row) {
-          continue;
+          return [];
         }
 
-        results.push({
-          key,
-          doc: parseStoredDocument(row.doc_json, collection, key),
-          writeToken: String(row.write_version),
-        });
-      }
-
-      return results;
+        return [
+          {
+            key,
+            doc: parseStoredDocument(row.doc_json, collection, key),
+            writeToken: String(row.write_version),
+          },
+        ];
+      });
     },
 
     async batchSet(collection, items) {
@@ -1483,4 +1513,12 @@ function normalizeNumericVersion(value: string): number | null {
   const parsed = Number(match[1]);
 
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values)];
+}
+
+function createPlaceholders(count: number): string {
+  return Array.from({ length: count }, () => "?").join(", ");
 }
