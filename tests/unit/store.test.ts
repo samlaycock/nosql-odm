@@ -277,6 +277,7 @@ interface UniquePrecheckTracker {
   inFlight: number;
   maxInFlight: number;
   values: string[];
+  limits: number[];
   lockAcquisitions: number;
   waiters: Array<() => void>;
 }
@@ -297,6 +298,9 @@ function createUniquePrecheckTrackingEngine(precheck: UniquePrecheckTracker): Qu
       const indexValue = (params.filter as { value?: string } | undefined)?.value;
       if (typeof indexValue === "string") {
         precheck.values.push(indexValue);
+      }
+      if (typeof params.limit === "number") {
+        precheck.limits.push(params.limit);
       }
 
       precheck.inFlight += 1;
@@ -452,6 +456,7 @@ describe("unique indexes", () => {
       inFlight: 0,
       maxInFlight: 0,
       values: [],
+      limits: [],
       lockAcquisitions: 0,
       waiters: [],
     };
@@ -541,6 +546,7 @@ describe("unique indexes", () => {
       inFlight: 0,
       maxInFlight: 0,
       values: [],
+      limits: [],
       lockAcquisitions: 0,
       waiters: [],
     };
@@ -570,6 +576,7 @@ describe("unique indexes", () => {
       inFlight: 0,
       maxInFlight: 0,
       values: [],
+      limits: [],
       lockAcquisitions: 0,
       waiters: [],
     };
@@ -589,6 +596,30 @@ describe("unique indexes", () => {
     ]);
 
     expect(precheck.maxInFlight).toBe(2);
+  });
+
+  test("batchSet uses existence-only limits for unique pre-check queries", async () => {
+    const precheck: UniquePrecheckTracker = {
+      inFlight: 0,
+      maxInFlight: 0,
+      values: [],
+      limits: [],
+      lockAcquisitions: 0,
+      waiters: [],
+    };
+    const trackingEngine = createUniquePrecheckTrackingEngine(precheck);
+    const store = createStore(trackingEngine, [buildUserV1WithUniqueEmail()], {
+      allowStoreManagedUniqueConstraints: true,
+    });
+
+    await store.user.batchSet([
+      { key: "u1", data: { id: "u1", name: "Sam", email: "sam@example.com" } },
+      { key: "u2", data: { id: "u2", name: "Jamie", email: "jamie@example.com" } },
+      { key: "u3", data: { id: "u3", name: "Casey", email: "casey@example.com" } },
+    ]);
+
+    expect(precheck.limits).toHaveLength(3);
+    expect(precheck.limits).toEqual([1, 1, 1]);
   });
 
   test("create allows multiple documents with missing optional unique index values", async () => {
