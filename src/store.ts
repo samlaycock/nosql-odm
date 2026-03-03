@@ -278,10 +278,12 @@ export interface CreateStoreOptions<TOptions = Record<string, unknown>> {
   migrationHooks?: MigrationHooks;
   projectionHooks?: ProjectionHooks;
   /**
-   * Allows models with `unique: true` indexes when the engine explicitly
-   * reports `capabilities.uniqueConstraints = "none"`. The store will use its
-   * lock + pre-check guard path instead of relying on engine-enforced atomic
-   * uniqueness.
+   * Enables the store-managed unique-constraint guard path.
+   *
+   * - Required for models with `unique: true` indexes when the engine reports
+   *   `capabilities.uniqueConstraints = "none"`.
+   * - Optional compatibility/debug override for engines that report
+   *   `capabilities.uniqueConstraints = "atomic"`.
    */
   allowStoreManagedUniqueConstraints?: boolean;
   uniqueConstraintPrecheck?: UniqueConstraintPrecheckOptions;
@@ -562,6 +564,7 @@ class BoundModelImpl<
   private projectionHooks: ProjectionHooks | undefined;
   private uniqueConstraintPrecheckConcurrency: number;
   private uniqueConstraintLockOptions: ResolvedUniqueConstraintLockOptions;
+  private useStoreManagedUniqueConstraintGuard: boolean;
 
   constructor(
     model: ModelDefinition<T, any, string, TStaticIndexNames, THasDynamicIndexes>,
@@ -570,6 +573,7 @@ class BoundModelImpl<
     projectionHooks?: ProjectionHooks,
     uniqueConstraintLockOptions?: ResolvedUniqueConstraintLockOptions,
     uniqueConstraintPrecheckConcurrency = DEFAULT_UNIQUE_CONSTRAINT_PRECHECK_CONCURRENCY,
+    useStoreManagedUniqueConstraintGuard = false,
   ) {
     this.model = model;
     this.engine = engine;
@@ -578,6 +582,7 @@ class BoundModelImpl<
     this.uniqueConstraintLockOptions =
       uniqueConstraintLockOptions ?? resolveUniqueConstraintLockOptions();
     this.uniqueConstraintPrecheckConcurrency = uniqueConstraintPrecheckConcurrency;
+    this.useStoreManagedUniqueConstraintGuard = useStoreManagedUniqueConstraintGuard;
   }
 
   async findByKey(key: string, options?: TOptions): Promise<T | null> {
@@ -1215,6 +1220,10 @@ class BoundModelImpl<
     options: TOptions | undefined,
     operation: () => Promise<R>,
   ): Promise<R> {
+    if (!this.useStoreManagedUniqueConstraintGuard) {
+      return operation();
+    }
+
     if (!candidates.some((candidate) => Object.keys(candidate.uniqueIndexes).length > 0)) {
       return operation();
     }
@@ -1627,6 +1636,9 @@ export function createStore<
     const supportsAtomicUniqueConstraints = uniqueConstraintCapability === "atomic";
     const supportsStoreManagedUniqueConstraints =
       uniqueConstraintCapability === "none" && allowStoreManagedUniqueConstraints;
+    const useStoreManagedUniqueConstraintGuard =
+      uniqueConstraintCapability === "none" ||
+      (uniqueConstraintCapability === "atomic" && allowStoreManagedUniqueConstraints);
 
     if (
       hasUniqueIndexes &&
@@ -1648,6 +1660,7 @@ export function createStore<
         options?.projectionHooks,
         uniqueConstraintLockOptions,
         uniqueConstraintPrecheckConcurrency,
+        useStoreManagedUniqueConstraintGuard,
       ),
     );
   }
