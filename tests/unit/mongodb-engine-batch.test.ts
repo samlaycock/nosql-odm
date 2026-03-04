@@ -235,6 +235,17 @@ class FakeMongoDatabase {
   }
 }
 
+class FakeMongoDocumentsCollectionWithShortBulkAck extends FakeMongoDocumentsCollection {
+  override async bulkWrite(operations: AnyRecord[], options?: Record<string, unknown>) {
+    await super.bulkWrite(operations, options);
+
+    return {
+      matchedCount: Math.max(0, operations.length - 1),
+      upsertedCount: 0,
+    };
+  }
+}
+
 describe("mongodb engine batch operations", () => {
   test("batchSet uses a single bulkWrite and sequence reservation for large batches", async () => {
     const documents = new FakeMongoDocumentsCollection();
@@ -282,6 +293,29 @@ describe("mongodb engine batch operations", () => {
     expect(metadata.findOneAndUpdateCalls).toHaveLength(1);
   });
 
+  test("batchSetWithResult throws when unconditional bulkWrite acknowledges fewer writes than expected", async () => {
+    const documents = new FakeMongoDocumentsCollectionWithShortBulkAck();
+    const metadata = new FakeMongoMetadataCollection();
+    const engine = mongoDbEngine({
+      database: new FakeMongoDatabase(documents, metadata),
+    });
+    let error: unknown = null;
+
+    try {
+      await engine.batchSetWithResult!("users", [
+        { key: "u1", doc: { key: "u1" }, indexes: { id: "u1" } },
+        { key: "u2", doc: { key: "u2" }, indexes: { id: "u2" } },
+      ]);
+    } catch (candidate) {
+      error = candidate;
+    }
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toBe(
+      "MongoDB failed to persist one or more unconditional batch set writes",
+    );
+  });
+
   test("batchDelete uses bulkWrite instead of per-key deleteOne calls for large key sets", async () => {
     const documents = new FakeMongoDocumentsCollection();
     const metadata = new FakeMongoMetadataCollection();
@@ -293,6 +327,7 @@ describe("mongodb engine batch operations", () => {
     await engine.batchDelete("users", keys);
 
     expect(documents.bulkWriteCalls).toHaveLength(1);
+    expect(documents.bulkWriteCalls[0]?.operations).toHaveLength(150);
     expect(documents.deleteOneCalls).toHaveLength(0);
   });
 });

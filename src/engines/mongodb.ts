@@ -526,7 +526,15 @@ export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine
           },
         }));
 
-        await documentsCollection.bulkWrite(operations);
+        const result = await documentsCollection.bulkWrite(operations);
+        const acknowledgedWrites = parseBulkWriteMatchedOrUpsertedCount(
+          result,
+          "MongoDB returned an invalid unconditional batch set result",
+        );
+
+        if (acknowledgedWrites < unconditionalItems.length) {
+          throw new Error("MongoDB failed to persist one or more unconditional batch set writes");
+        }
 
         for (const item of unconditionalItems) {
           persisted[item.index] = true;
@@ -851,6 +859,8 @@ async function reserveCreatedAtRange(
   collection: string,
   count: number,
 ): Promise<number[]> {
+  // Reserve one sequence value per attempted upsert to preserve legacy ordering behavior.
+  // Updates can leave gaps because createdAt is written only on insert via $setOnInsert.
   if (!Number.isInteger(count) || count <= 0) {
     return [];
   }
@@ -1763,6 +1773,35 @@ function parseMatchedCount(result: unknown, message: string): number {
   }
 
   const value = result.matchedCount;
+
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new Error(message);
+  }
+
+  return value;
+}
+
+function parseBulkWriteMatchedOrUpsertedCount(result: unknown, message: string): number {
+  if (!isRecord(result)) {
+    throw new Error(message);
+  }
+
+  return (
+    parseOptionalBulkWriteCount(result, "matchedCount", message) +
+    parseOptionalBulkWriteCount(result, "upsertedCount", message)
+  );
+}
+
+function parseOptionalBulkWriteCount(
+  record: Record<string, unknown>,
+  field: string,
+  message: string,
+): number {
+  const value = record[field];
+
+  if (value === undefined) {
+    return 0;
+  }
 
   if (typeof value !== "number" || !Number.isFinite(value)) {
     throw new Error(message);
