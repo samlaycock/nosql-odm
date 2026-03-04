@@ -448,6 +448,103 @@ describe("non-SQL query pushdown", () => {
     expect(result.cursor).toBe("u2");
   });
 
+  test("mongodb query pushes combined between/range filters to backend", async () => {
+    const engine = mongoDbEngine({
+      database: new FakeMongoDatabase(mongoDocs, mongoMeta),
+    });
+
+    const result = await engine.query("users", {
+      index: "byEmail",
+      filter: { value: { $between: ["a@example.com", "c@example.com"], $gt: "a@example.com" } },
+      sort: "asc",
+    });
+
+    expect(mongoDocs.lastFindFilter).toMatchObject({
+      collection: "users",
+      "indexes.byEmail": {
+        $gt: "a@example.com",
+        $lte: "c@example.com",
+      },
+    });
+    expect(mongoDocs.lastSort).toEqual({
+      "indexes.byEmail": 1,
+      createdAt: 1,
+      key: 1,
+    });
+    expect(result.documents.map((doc) => doc.key)).toEqual(["u2", "u3"]);
+  });
+
+  test("mongodb query can reject unsupported filters instead of scanning", async () => {
+    const engine = mongoDbEngine({
+      database: new FakeMongoDatabase(mongoDocs, mongoMeta),
+      rejectUnsupportedQueries: true,
+    } as Parameters<typeof mongoDbEngine>[0]);
+    let error: unknown = null;
+
+    try {
+      await engine.query("users", {
+        index: "byEmail",
+        filter: { value: { $foo: "bar" } as unknown as Record<string, unknown> },
+      });
+    } catch (candidate) {
+      error = candidate;
+    }
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toMatch(/unsupported/i);
+
+    expect(mongoDocs.lastFindFilter).toBeNull();
+  });
+
+  test("mongodb query reports fallback scans with a hook", async () => {
+    const events: Array<Record<string, unknown>> = [];
+    const engine = mongoDbEngine({
+      database: new FakeMongoDatabase(mongoDocs, mongoMeta),
+      onQueryFallbackScan(event) {
+        events.push(event as unknown as Record<string, unknown>);
+      },
+    } as Parameters<typeof mongoDbEngine>[0]);
+
+    const result = await engine.query("users", {
+      index: "byEmail",
+      filter: { value: { $foo: "bar" } as unknown as Record<string, unknown> },
+    });
+
+    expect(result.documents.map((doc) => doc.key)).toEqual(["u1", "u2", "u3"]);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      collection: "users",
+      operation: "query",
+      reason: "unsupported_filter",
+    });
+  });
+
+  test("mongodb queryWithMetadata reports fallback scans with operation context", async () => {
+    const events: Array<Record<string, unknown>> = [];
+    const engine = mongoDbEngine({
+      database: new FakeMongoDatabase(mongoDocs, mongoMeta),
+      onQueryFallbackScan(event) {
+        events.push(event as unknown as Record<string, unknown>);
+      },
+    } as Parameters<typeof mongoDbEngine>[0]);
+
+    const result = await engine.queryWithMetadata!("users", {
+      index: "byEmail",
+      filter: { value: { $foo: "bar" } as unknown as Record<string, unknown> },
+    });
+
+    expect(result.documents[0]).toMatchObject({
+      key: "u1",
+      writeToken: "1",
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      collection: "users",
+      operation: "queryWithMetadata",
+      reason: "unsupported_filter",
+    });
+  });
+
   test("firestore query pushes supported index filters into where clauses", async () => {
     const db = new FakeFirestoreDatabase([
       makeEngineDoc("u1", 2, { byEmail: "sam@example.com" }, { id: "u1" }),
