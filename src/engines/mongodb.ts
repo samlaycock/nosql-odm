@@ -62,9 +62,28 @@ export interface MongoDbEngineOptions {
   database: MongoDatabaseLike;
   documentsCollection?: string;
   metadataCollection?: string;
+  /**
+   * When true, indexed queries with unsupported filter operators throw instead
+   * of silently falling back to an in-memory collection scan.
+   */
+  rejectUnsupportedQueries?: boolean;
+  /**
+   * Called whenever query/queryWithMetadata uses the in-memory collection scan
+   * fallback path.
+   */
+  onQueryFallbackScan?: (event: MongoDbQueryFallbackScanEvent) => void;
 }
 
 export interface MongoDbQueryEngine extends QueryEngine<never> {}
+
+export type MongoDbQueryFallbackReason = "full_scan" | "unsupported_filter";
+
+export interface MongoDbQueryFallbackScanEvent {
+  collection: string;
+  params: QueryParams;
+  operation: "query" | "queryWithMetadata";
+  reason: MongoDbQueryFallbackReason;
+}
 
 interface StoredDocumentRecord {
   key: string;
@@ -110,6 +129,8 @@ interface OutdatedCursorState {
 
 export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine {
   const database = options.database;
+  const rejectUnsupportedQueries = options.rejectUnsupportedQueries === true;
+  const onQueryFallbackScan = options.onQueryFallbackScan;
   const documentsCollection = database.collection(
     options.documentsCollection ?? DEFAULT_DOCUMENTS_COLLECTION,
   );
@@ -268,11 +289,21 @@ export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine
     async query(collection, params) {
       await ready;
 
-      const native = await queryDocumentsNative(documentsCollection, collection, params);
+      const nativePlan = resolveMongoNativeQueryPlan(collection, params);
 
-      if (native) {
+      if (nativePlan.kind === "native") {
+        const native = await queryDocumentsNative(documentsCollection, nativePlan.plan, params);
         return nativeToQueryResult(native.records, native.cursor, false);
       }
+
+      handleMongoQueryFallback({
+        collection,
+        params,
+        operation: "query",
+        reason: nativePlan.reason,
+        rejectUnsupportedQueries,
+        onQueryFallbackScan,
+      });
 
       const records = await listCollectionDocuments(documentsCollection, collection);
       const matched = matchDocuments(records, params);
@@ -283,11 +314,21 @@ export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine
     async queryWithMetadata(collection, params) {
       await ready;
 
-      const native = await queryDocumentsNative(documentsCollection, collection, params);
+      const nativePlan = resolveMongoNativeQueryPlan(collection, params);
 
-      if (native) {
+      if (nativePlan.kind === "native") {
+        const native = await queryDocumentsNative(documentsCollection, nativePlan.plan, params);
         return nativeToQueryResult(native.records, native.cursor, true);
       }
+
+      handleMongoQueryFallback({
+        collection,
+        params,
+        operation: "queryWithMetadata",
+        reason: nativePlan.reason,
+        rejectUnsupportedQueries,
+        onQueryFallbackScan,
+      });
 
       const records = await listCollectionDocuments(documentsCollection, collection);
       const matched = matchDocuments(records, params);
@@ -802,6 +843,7 @@ async function listCollectionDocuments(
 }
 
 interface MongoNativeQueryPlan {
+  collection: string;
   indexName: string;
   filter: Record<string, unknown>;
   sort: Record<string, 1 | -1>;
@@ -813,17 +855,121 @@ interface MongoNativeQueryResult {
   cursor: string | null;
 }
 
-async function queryDocumentsNative(
-  documentsCollection: MongoCollectionLike,
+type MongoNativeQueryPlanResolution =
+  | {
+      kind: "native";
+      plan: MongoNativeQueryPlan;
+    }
+  | {
+      kind: "fallback";
+      reason: MongoDbQueryFallbackReason;
+    };
+
+type MongoIndexFilterResolution =
+  | {
+      kind: "supported";
+      filter: Record<string, unknown> | string;
+    }
+  | {
+      kind: "unsupported";
+    }
+  | {
+      kind: "empty";
+    };
+
+interface MongoRangeBound {
+  value: string;
+  inclusive: boolean;
+}
+
+interface MongoRangeBounds {
+  lower: MongoRangeBound | null;
+  upper: MongoRangeBound | null;
+}
+
+interface HandleMongoQueryFallbackParams {
+  collection: string;
+  params: QueryParams;
+  operation: "query" | "queryWithMetadata";
+  reason: MongoDbQueryFallbackReason;
+  rejectUnsupportedQueries: boolean;
+  onQueryFallbackScan: ((event: MongoDbQueryFallbackScanEvent) => void) | undefined;
+}
+
+function handleMongoQueryFallback(params: HandleMongoQueryFallbackParams): void {
+  params.onQueryFallbackScan?.({
+    collection: params.collection,
+    params: structuredClone(params.params),
+    operation: params.operation,
+    reason: params.reason,
+  });
+
+  if (params.reason === "unsupported_filter" && params.rejectUnsupportedQueries) {
+    throw new Error(
+      `MongoDB cannot push down unsupported query filters for index "${
+        params.params.index ?? "(unknown)"
+      }"`,
+    );
+  }
+}
+
+function resolveMongoNativeQueryPlan(
   collection: string,
   params: QueryParams,
-): Promise<MongoNativeQueryResult | null> {
-  const plan = buildMongoNativeQueryPlan(collection, params);
-
-  if (!plan) {
-    return null;
+): MongoNativeQueryPlanResolution {
+  if (!params.index || !params.filter) {
+    return {
+      kind: "fallback",
+      reason: "full_scan",
+    };
   }
 
+  const mongoIndexFilter = buildMongoIndexFilter(params.filter.value);
+
+  if (mongoIndexFilter.kind === "unsupported") {
+    return {
+      kind: "fallback",
+      reason: "unsupported_filter",
+    };
+  }
+
+  const indexField = `indexes.${params.index}`;
+  const limit = normalizeLimit(params.limit);
+
+  return {
+    kind: "native",
+    plan: {
+      collection,
+      indexName: params.index,
+      filter: {
+        collection,
+        ...(mongoIndexFilter.kind === "empty"
+          ? {}
+          : {
+              [indexField]: mongoIndexFilter.filter,
+            }),
+      },
+      sort:
+        params.sort && params.index
+          ? {
+              [indexField]: params.sort === "desc" ? -1 : 1,
+              createdAt: 1,
+              key: 1,
+            }
+          : {
+              createdAt: 1,
+              key: 1,
+            },
+      limit: mongoIndexFilter.kind === "empty" ? 0 : limit,
+    },
+  };
+}
+
+async function queryDocumentsNative(
+  documentsCollection: MongoCollectionLike,
+  plan: MongoNativeQueryPlan,
+  params: QueryParams,
+): Promise<MongoNativeQueryResult> {
   if (plan.limit === 0) {
     return {
       records: [],
@@ -835,7 +981,7 @@ async function queryDocumentsNative(
 
   if (params.cursor) {
     const cursorRaw = await documentsCollection.findOne({
-      collection,
+      collection: plan.collection,
       key: params.cursor,
     });
 
@@ -878,115 +1024,210 @@ async function queryDocumentsNative(
   };
 }
 
-function buildMongoNativeQueryPlan(
-  collection: string,
-  params: QueryParams,
-): MongoNativeQueryPlan | null {
-  if (!params.index || !params.filter) {
-    return null;
-  }
-
-  const mongoIndexFilter = buildMongoIndexFilter(params.filter.value);
-
-  if (!mongoIndexFilter) {
-    return null;
-  }
-
-  const indexField = `indexes.${params.index}`;
-
-  return {
-    indexName: params.index,
-    filter: {
-      collection,
-      [indexField]: mongoIndexFilter,
-    },
-    sort:
-      params.sort && params.index
-        ? {
-            [indexField]: params.sort === "desc" ? -1 : 1,
-            createdAt: 1,
-            key: 1,
-          }
-        : {
-            createdAt: 1,
-            key: 1,
-          },
-    limit: normalizeLimit(params.limit),
-  };
-}
-
 function buildMongoIndexFilter(
   filter: string | number | FieldCondition,
-): Record<string, unknown> | string | null {
+): MongoIndexFilterResolution {
   if (typeof filter === "string" || typeof filter === "number") {
-    return String(filter);
+    return {
+      kind: "supported",
+      filter: String(filter),
+    };
   }
 
   const keys = Object.keys(filter);
 
   if (keys.some((key) => !MONGO_SUPPORTED_FILTER_KEYS.has(key))) {
-    return null;
-  }
-
-  const hasEq = filter.$eq !== undefined;
-  const hasBegins = filter.$begins !== undefined;
-  const hasBetween = filter.$between !== undefined;
-  const hasRange =
-    filter.$gt !== undefined ||
-    filter.$gte !== undefined ||
-    filter.$lt !== undefined ||
-    filter.$lte !== undefined;
-
-  if (hasEq && (hasBegins || hasBetween || hasRange)) {
-    return null;
-  }
-
-  if (hasBegins && (hasEq || hasBetween || hasRange)) {
-    return null;
-  }
-
-  if (hasBetween && (hasEq || hasBegins || hasRange)) {
-    return null;
-  }
-
-  if (hasEq) {
-    return String(filter.$eq as string | number);
-  }
-
-  if (hasBegins) {
     return {
-      $regex: `^${escapeMongoRegex(filter.$begins as string)}`,
+      kind: "unsupported",
     };
   }
 
-  if (hasBetween) {
+  const bounds: MongoRangeBounds = {
+    lower: null,
+    upper: null,
+  };
+
+  if (filter.$between !== undefined) {
     const [low, high] = filter.$between as [string | number, string | number];
-
-    return {
-      $gte: String(low),
-      $lte: String(high),
-    };
+    addLowerRangeBound(bounds, normalizeMongoFilterValue(low), true);
+    addUpperRangeBound(bounds, normalizeMongoFilterValue(high), true);
   }
-
-  const mongoFilter: Record<string, unknown> = {};
 
   if (filter.$gt !== undefined) {
-    mongoFilter.$gt = String(filter.$gt as string | number);
+    addLowerRangeBound(bounds, normalizeMongoFilterValue(filter.$gt), false);
   }
 
   if (filter.$gte !== undefined) {
-    mongoFilter.$gte = String(filter.$gte as string | number);
+    addLowerRangeBound(bounds, normalizeMongoFilterValue(filter.$gte), true);
   }
 
   if (filter.$lt !== undefined) {
-    mongoFilter.$lt = String(filter.$lt as string | number);
+    addUpperRangeBound(bounds, normalizeMongoFilterValue(filter.$lt), false);
   }
 
   if (filter.$lte !== undefined) {
-    mongoFilter.$lte = String(filter.$lte as string | number);
+    addUpperRangeBound(bounds, normalizeMongoFilterValue(filter.$lte), true);
   }
 
-  return Object.keys(mongoFilter).length > 0 ? mongoFilter : null;
+  if (filter.$begins !== undefined) {
+    addLowerRangeBound(bounds, filter.$begins, true);
+    addUpperRangeBound(bounds, `${filter.$begins}\uffff`, true);
+  }
+
+  if (filter.$eq !== undefined) {
+    const equality = normalizeMongoFilterValue(filter.$eq);
+
+    if (!isWithinMongoRangeBounds(bounds, equality)) {
+      return {
+        kind: "empty",
+      };
+    }
+
+    return {
+      kind: "supported",
+      filter: equality,
+    };
+  }
+
+  if (isMongoRangeBoundsEmpty(bounds)) {
+    return {
+      kind: "empty",
+    };
+  }
+
+  const rangeFilter = toMongoRangeFilter(bounds);
+
+  if (Object.keys(rangeFilter).length === 0) {
+    return {
+      kind: "supported",
+      filter: {
+        $exists: true,
+      },
+    };
+  }
+
+  return {
+    kind: "supported",
+    filter: rangeFilter,
+  };
+}
+
+function normalizeMongoFilterValue(value: unknown): string {
+  return String(value as string | number);
+}
+
+function addLowerRangeBound(bounds: MongoRangeBounds, value: string, inclusive: boolean): void {
+  const current = bounds.lower;
+
+  if (!current) {
+    bounds.lower = {
+      value,
+      inclusive,
+    };
+    return;
+  }
+
+  const cmp = value.localeCompare(current.value);
+
+  if (cmp > 0) {
+    bounds.lower = {
+      value,
+      inclusive,
+    };
+    return;
+  }
+
+  if (cmp === 0) {
+    bounds.lower = {
+      value,
+      inclusive: current.inclusive && inclusive,
+    };
+  }
+}
+
+function addUpperRangeBound(bounds: MongoRangeBounds, value: string, inclusive: boolean): void {
+  const current = bounds.upper;
+
+  if (!current) {
+    bounds.upper = {
+      value,
+      inclusive,
+    };
+    return;
+  }
+
+  const cmp = value.localeCompare(current.value);
+
+  if (cmp < 0) {
+    bounds.upper = {
+      value,
+      inclusive,
+    };
+    return;
+  }
+
+  if (cmp === 0) {
+    bounds.upper = {
+      value,
+      inclusive: current.inclusive && inclusive,
+    };
+  }
+}
+
+function isMongoRangeBoundsEmpty(bounds: MongoRangeBounds): boolean {
+  if (!bounds.lower || !bounds.upper) {
+    return false;
+  }
+
+  const cmp = bounds.lower.value.localeCompare(bounds.upper.value);
+
+  if (cmp > 0) {
+    return true;
+  }
+
+  return cmp === 0 && (!bounds.lower.inclusive || !bounds.upper.inclusive);
+}
+
+function isWithinMongoRangeBounds(bounds: MongoRangeBounds, value: string): boolean {
+  if (bounds.lower) {
+    const cmpLower = value.localeCompare(bounds.lower.value);
+
+    if (cmpLower < 0) {
+      return false;
+    }
+
+    if (cmpLower === 0 && !bounds.lower.inclusive) {
+      return false;
+    }
+  }
+
+  if (bounds.upper) {
+    const cmpUpper = value.localeCompare(bounds.upper.value);
+
+    if (cmpUpper > 0) {
+      return false;
+    }
+
+    if (cmpUpper === 0 && !bounds.upper.inclusive) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function toMongoRangeFilter(bounds: MongoRangeBounds): Record<string, unknown> {
+  const mongoFilter: Record<string, unknown> = {};
+
+  if (bounds.lower) {
+    mongoFilter[bounds.lower.inclusive ? "$gte" : "$gt"] = bounds.lower.value;
+  }
+
+  if (bounds.upper) {
+    mongoFilter[bounds.upper.inclusive ? "$lte" : "$lt"] = bounds.upper.value;
+  }
+
+  return mongoFilter;
 }
 
 function buildMongoCursorPredicate(
@@ -1069,10 +1310,6 @@ const MONGO_SUPPORTED_FILTER_KEYS = new Set([
   "$begins",
   "$between",
 ]);
-
-function escapeMongoRegex(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
 
 async function syncMigrationMetadataForCriteria(
   documentsCollection: MongoCollectionLike,
