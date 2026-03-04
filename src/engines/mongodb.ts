@@ -30,6 +30,22 @@ interface MongoUpdateResultLike {
   matchedCount?: unknown;
 }
 
+interface MongoBulkWriteUpdateOneLike {
+  filter: Record<string, unknown>;
+  update: Record<string, unknown>;
+  upsert?: boolean;
+}
+
+type MongoBulkWriteOperationLike =
+  | {
+      updateOne: MongoBulkWriteUpdateOneLike;
+    }
+  | {
+      deleteOne: {
+        filter: Record<string, unknown>;
+      };
+    };
+
 interface MongoCursorLike {
   sort(sort: Record<string, 1 | -1>): MongoCursorLike;
   limit(value: number): MongoCursorLike;
@@ -46,6 +62,10 @@ interface MongoCollectionLike {
     options?: Record<string, unknown>,
   ): Promise<MongoUpdateResultLike>;
   deleteOne(filter: Record<string, unknown>): Promise<unknown>;
+  bulkWrite(
+    operations: MongoBulkWriteOperationLike[],
+    options?: Record<string, unknown>,
+  ): Promise<unknown>;
   find(filter: Record<string, unknown>): MongoCursorLike;
   findOneAndUpdate(
     filter: Record<string, unknown>,
@@ -385,121 +405,169 @@ export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine
     async batchSet(collection, items) {
       await ready;
 
-      for (const item of items) {
-        const createdAt = await nextCreatedAt(metadataCollection, collection);
+      if (items.length === 0) {
+        return;
+      }
+
+      const preparedItems = items.map((item) => {
         const normalizedDoc = normalizeDocument(item.doc);
         const normalizedIndexes = normalizeIndexes(item.indexes);
         const metadata =
           normalizeMigrationMetadata(item.migrationMetadata) ??
           deriveLegacyMetadataFromDocument(item.doc);
 
-        await documentsCollection.updateOne(
-          {
+        return {
+          key: item.key,
+          doc: normalizedDoc,
+          indexes: normalizedIndexes,
+          metadata,
+        };
+      });
+      const createdAts = await reserveCreatedAtRange(
+        metadataCollection,
+        collection,
+        preparedItems.length,
+      );
+      const operations: MongoBulkWriteOperationLike[] = preparedItems.map((item, index) => ({
+        updateOne: {
+          filter: {
             collection,
             key: item.key,
           },
-          {
+          update: {
             $set: {
-              doc: normalizedDoc,
-              indexes: normalizedIndexes,
-              migrationTargetVersion: metadata.targetVersion,
-              migrationVersionState: metadata.versionState,
-              migrationIndexSignature: metadata.indexSignature,
+              doc: item.doc,
+              indexes: item.indexes,
+              migrationTargetVersion: item.metadata.targetVersion,
+              migrationVersionState: item.metadata.versionState,
+              migrationIndexSignature: item.metadata.indexSignature,
             },
             $setOnInsert: {
               collection,
               key: item.key,
-              createdAt,
+              createdAt: createdAts[index],
             },
             $inc: {
               writeVersion: 1,
             },
           },
-          {
-            upsert: true,
-          },
-        );
-      }
+          upsert: true,
+        },
+      }));
+
+      await documentsCollection.bulkWrite(operations);
     },
 
     async batchSetWithResult(collection, items) {
       await ready;
 
-      const persistedKeys: string[] = [];
-      const conflictedKeys: string[] = [];
+      if (items.length === 0) {
+        return {
+          persistedKeys: [],
+          conflictedKeys: [],
+        } satisfies BatchSetResult;
+      }
 
-      for (const item of items) {
+      const preparedItems = items.map((item, index) => {
         const normalizedDoc = normalizeDocument(item.doc);
         const normalizedIndexes = normalizeIndexes(item.indexes);
         const metadata =
           normalizeMigrationMetadata(item.migrationMetadata) ??
           deriveLegacyMetadataFromDocument(item.doc);
-        const expectedWriteVersion = parseExpectedWriteVersion(item.expectedWriteToken);
 
-        if (expectedWriteVersion !== undefined) {
-          const result = await documentsCollection.updateOne(
-            {
+        return {
+          index,
+          key: item.key,
+          doc: normalizedDoc,
+          indexes: normalizedIndexes,
+          metadata,
+          expectedWriteVersion: parseExpectedWriteVersion(item.expectedWriteToken),
+        };
+      });
+
+      const conditionalItems = preparedItems.filter(
+        (item) => item.expectedWriteVersion !== undefined,
+      );
+      const unconditionalItems = preparedItems.filter(
+        (item) => item.expectedWriteVersion === undefined,
+      );
+      const persisted = Array.from({ length: preparedItems.length }, () => false);
+
+      if (unconditionalItems.length > 0) {
+        const createdAts = await reserveCreatedAtRange(
+          metadataCollection,
+          collection,
+          unconditionalItems.length,
+        );
+        const operations: MongoBulkWriteOperationLike[] = unconditionalItems.map((item, index) => ({
+          updateOne: {
+            filter: {
               collection,
               key: item.key,
-              writeVersion: expectedWriteVersion,
             },
-            {
+            update: {
               $set: {
-                doc: normalizedDoc,
-                indexes: normalizedIndexes,
-                migrationTargetVersion: metadata.targetVersion,
-                migrationVersionState: metadata.versionState,
-                migrationIndexSignature: metadata.indexSignature,
+                doc: item.doc,
+                indexes: item.indexes,
+                migrationTargetVersion: item.metadata.targetVersion,
+                migrationVersionState: item.metadata.versionState,
+                migrationIndexSignature: item.metadata.indexSignature,
+              },
+              $setOnInsert: {
+                collection,
+                key: item.key,
+                createdAt: createdAts[index],
               },
               $inc: {
                 writeVersion: 1,
               },
             },
-          );
+            upsert: true,
+          },
+        }));
 
-          if (
-            parseMatchedCount(
-              result,
-              "MongoDB returned an invalid conditional batch set result",
-            ) === 0
-          ) {
-            conflictedKeys.push(item.key);
-            continue;
-          }
+        await documentsCollection.bulkWrite(operations);
 
-          persistedKeys.push(item.key);
-          continue;
+        for (const item of unconditionalItems) {
+          persisted[item.index] = true;
         }
+      }
 
-        const createdAt = await nextCreatedAt(metadataCollection, collection);
-        await documentsCollection.updateOne(
+      for (const item of conditionalItems) {
+        const result = await documentsCollection.updateOne(
           {
             collection,
             key: item.key,
+            writeVersion: item.expectedWriteVersion,
           },
           {
             $set: {
-              doc: normalizedDoc,
-              indexes: normalizedIndexes,
-              migrationTargetVersion: metadata.targetVersion,
-              migrationVersionState: metadata.versionState,
-              migrationIndexSignature: metadata.indexSignature,
-            },
-            $setOnInsert: {
-              collection,
-              key: item.key,
-              createdAt,
+              doc: item.doc,
+              indexes: item.indexes,
+              migrationTargetVersion: item.metadata.targetVersion,
+              migrationVersionState: item.metadata.versionState,
+              migrationIndexSignature: item.metadata.indexSignature,
             },
             $inc: {
               writeVersion: 1,
             },
           },
-          {
-            upsert: true,
-          },
         );
 
-        persistedKeys.push(item.key);
+        persisted[item.index] =
+          parseMatchedCount(result, "MongoDB returned an invalid conditional batch set result") > 0;
+      }
+
+      const persistedKeys: string[] = [];
+      const conflictedKeys: string[] = [];
+
+      for (const item of preparedItems) {
+        if (persisted[item.index]) {
+          persistedKeys.push(item.key);
+          continue;
+        }
+
+        conflictedKeys.push(item.key);
       }
 
       return {
@@ -511,12 +579,22 @@ export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine
     async batchDelete(collection, keys) {
       await ready;
 
-      for (const key of keys) {
-        await documentsCollection.deleteOne({
-          collection,
-          key,
-        });
+      const uniqueKeys = uniqueStrings(keys);
+
+      if (uniqueKeys.length === 0) {
+        return;
       }
+
+      const operations: MongoBulkWriteOperationLike[] = uniqueKeys.map((key) => ({
+        deleteOne: {
+          filter: {
+            collection,
+            key,
+          },
+        },
+      }));
+
+      await documentsCollection.bulkWrite(operations);
     },
 
     migration: {
@@ -758,6 +836,25 @@ async function nextCreatedAt(
   metadataCollection: MongoCollectionLike,
   collection: string,
 ): Promise<number> {
+  const createdAts = await reserveCreatedAtRange(metadataCollection, collection, 1);
+  const createdAt = createdAts[0];
+
+  if (createdAt === undefined) {
+    throw new Error("MongoDB returned an invalid sequence record");
+  }
+
+  return createdAt;
+}
+
+async function reserveCreatedAtRange(
+  metadataCollection: MongoCollectionLike,
+  collection: string,
+  count: number,
+): Promise<number[]> {
+  if (!Number.isInteger(count) || count <= 0) {
+    return [];
+  }
+
   const raw = await metadataCollection.findOneAndUpdate(
     {
       collection,
@@ -769,7 +866,7 @@ async function nextCreatedAt(
         kind: "sequence",
       },
       $inc: {
-        value: 1,
+        value: count,
       },
     },
     {
@@ -780,8 +877,14 @@ async function nextCreatedAt(
 
   const valueDoc = parseFindOneAndUpdateResult(raw, "sequence record");
   const value = readFiniteNumber(valueDoc, "value", "sequence record");
+  const start = value - count + 1;
+  const createdAts: number[] = [];
 
-  return value;
+  for (let index = 0; index < count; index += 1) {
+    createdAts.push(start + index);
+  }
+
+  return createdAts;
 }
 
 async function listCollectionDocuments(

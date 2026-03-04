@@ -211,6 +211,12 @@ class FakeMongoCollection {
     throw new Error("not implemented");
   }
 
+  async bulkWrite(_operations: Record<string, unknown>[], _options?: Record<string, unknown>) {
+    return {
+      matchedCount: 0,
+    };
+  }
+
   async findOneAndUpdate(
     _filter: Record<string, unknown>,
     _update: Record<string, unknown>,
