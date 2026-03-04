@@ -1183,8 +1183,9 @@ function buildMongoIndexFilter(
   }
 
   if (filter.$begins !== undefined) {
-    addLowerRangeBound(bounds, filter.$begins, true);
-    addUpperRangeBound(bounds, `${filter.$begins}\uffff`, true);
+    const beginsValue = normalizeMongoFilterValue(filter.$begins);
+    addLowerRangeBound(bounds, beginsValue, true);
+    addUpperRangeBound(bounds, `${beginsValue}\uffff`, true);
   }
 
   if (filter.$eq !== undefined) {
@@ -1229,6 +1230,18 @@ function normalizeMongoFilterValue(value: unknown): string {
   return String(value as string | number);
 }
 
+function mongoStringCompare(a: string, b: string): number {
+  if (a < b) {
+    return -1;
+  }
+
+  if (a > b) {
+    return 1;
+  }
+
+  return 0;
+}
+
 function addLowerRangeBound(bounds: MongoRangeBounds, value: string, inclusive: boolean): void {
   const current = bounds.lower;
 
@@ -1240,7 +1253,7 @@ function addLowerRangeBound(bounds: MongoRangeBounds, value: string, inclusive: 
     return;
   }
 
-  const cmp = value.localeCompare(current.value);
+  const cmp = mongoStringCompare(value, current.value);
 
   if (cmp > 0) {
     bounds.lower = {
@@ -1269,7 +1282,7 @@ function addUpperRangeBound(bounds: MongoRangeBounds, value: string, inclusive: 
     return;
   }
 
-  const cmp = value.localeCompare(current.value);
+  const cmp = mongoStringCompare(value, current.value);
 
   if (cmp < 0) {
     bounds.upper = {
@@ -1292,7 +1305,7 @@ function isMongoRangeBoundsEmpty(bounds: MongoRangeBounds): boolean {
     return false;
   }
 
-  const cmp = bounds.lower.value.localeCompare(bounds.upper.value);
+  const cmp = mongoStringCompare(bounds.lower.value, bounds.upper.value);
 
   if (cmp > 0) {
     return true;
@@ -1303,7 +1316,7 @@ function isMongoRangeBoundsEmpty(bounds: MongoRangeBounds): boolean {
 
 function isWithinMongoRangeBounds(bounds: MongoRangeBounds, value: string): boolean {
   if (bounds.lower) {
-    const cmpLower = value.localeCompare(bounds.lower.value);
+    const cmpLower = mongoStringCompare(value, bounds.lower.value);
 
     if (cmpLower < 0) {
       return false;
@@ -1315,7 +1328,7 @@ function isWithinMongoRangeBounds(bounds: MongoRangeBounds, value: string): bool
   }
 
   if (bounds.upper) {
-    const cmpUpper = value.localeCompare(bounds.upper.value);
+    const cmpUpper = mongoStringCompare(value, bounds.upper.value);
 
     if (cmpUpper > 0) {
       return false;

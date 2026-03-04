@@ -474,6 +474,27 @@ describe("non-SQL query pushdown", () => {
     expect(result.documents.map((doc) => doc.key)).toEqual(["u2", "u3"]);
   });
 
+  test("mongodb query pushes $begins as range bounds", async () => {
+    const engine = mongoDbEngine({
+      database: new FakeMongoDatabase(mongoDocs, mongoMeta),
+    });
+
+    const result = await engine.query("users", {
+      index: "byEmail",
+      filter: { value: { $begins: "b" } },
+      sort: "asc",
+    });
+
+    expect(mongoDocs.lastFindFilter).toMatchObject({
+      collection: "users",
+      "indexes.byEmail": {
+        $gte: "b",
+        $lte: "b\uffff",
+      },
+    });
+    expect(result.documents.map((doc) => doc.key)).toEqual(["u2"]);
+  });
+
   test("mongodb query can reject unsupported filters instead of scanning", async () => {
     const engine = mongoDbEngine({
       database: new FakeMongoDatabase(mongoDocs, mongoMeta),
