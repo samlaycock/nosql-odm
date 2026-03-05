@@ -30,6 +30,22 @@ function compareUnknown(a: unknown, b: unknown): number {
 
 function matchesMongoLikeFilter(record: AnyRecord, filter: AnyRecord): boolean {
   for (const [key, value] of Object.entries(filter)) {
+    if (key === "$and") {
+      if (!Array.isArray(value)) {
+        return false;
+      }
+
+      if (
+        !value.every(
+          (candidate) => isRecord(candidate) && matchesMongoLikeFilter(record, candidate),
+        )
+      ) {
+        return false;
+      }
+
+      continue;
+    }
+
     if (key === "$or") {
       if (!Array.isArray(value)) {
         return false;
@@ -461,10 +477,19 @@ describe("non-SQL query pushdown", () => {
 
     expect(mongoDocs.lastFindFilter).toMatchObject({
       collection: "users",
-      "indexes.byEmail": {
-        $gt: "a@example.com",
-        $lte: "c@example.com",
-      },
+      $and: [
+        {
+          "indexes.byEmail": {
+            $gte: "a@example.com",
+            $lte: "c@example.com",
+          },
+        },
+        {
+          "indexes.byEmail": {
+            $gt: "a@example.com",
+          },
+        },
+      ],
     });
     expect(mongoDocs.lastSort).toEqual({
       "indexes.byEmail": 1,
@@ -474,7 +499,7 @@ describe("non-SQL query pushdown", () => {
     expect(result.documents.map((doc) => doc.key)).toEqual(["u2", "u3"]);
   });
 
-  test("mongodb query pushes $begins as range bounds", async () => {
+  test("mongodb query pushes $begins as anchored regex", async () => {
     const engine = mongoDbEngine({
       database: new FakeMongoDatabase(mongoDocs, mongoMeta),
     });
@@ -488,11 +513,35 @@ describe("non-SQL query pushdown", () => {
     expect(mongoDocs.lastFindFilter).toMatchObject({
       collection: "users",
       "indexes.byEmail": {
-        $gte: "b",
-        $lte: "b\uffff",
+        $regex: "^b",
       },
     });
     expect(result.documents.map((doc) => doc.key)).toEqual(["u2"]);
+  });
+
+  test("mongodb query keeps supplementary-plane suffixes when using $begins", async () => {
+    const docs = new FakeMongoCollection([
+      makeEngineDoc("u1", 1, { byEmail: "b@example.com" }, { id: "u1" }),
+      makeEngineDoc("u2", 2, { byEmail: "b🔒@example.com" }, { id: "u2" }),
+      makeEngineDoc("u3", 3, { byEmail: "c@example.com" }, { id: "u3" }),
+    ]);
+    const engine = mongoDbEngine({
+      database: new FakeMongoDatabase(docs, mongoMeta),
+    });
+
+    const result = await engine.query("users", {
+      index: "byEmail",
+      filter: { value: { $begins: "b" } },
+      sort: "asc",
+    });
+
+    expect(docs.lastFindFilter).toMatchObject({
+      collection: "users",
+      "indexes.byEmail": {
+        $regex: "^b",
+      },
+    });
+    expect(result.documents.map((doc) => doc.key)).toEqual(["u1", "u2"]);
   });
 
   test("mongodb query can reject unsupported filters instead of scanning", async () => {
@@ -564,6 +613,29 @@ describe("non-SQL query pushdown", () => {
       operation: "queryWithMetadata",
       reason: "unsupported_filter",
     });
+  });
+
+  test("mongodb fallback hook errors do not suppress rejectUnsupportedQueries errors", async () => {
+    const engine = mongoDbEngine({
+      database: new FakeMongoDatabase(mongoDocs, mongoMeta),
+      rejectUnsupportedQueries: true,
+      onQueryFallbackScan() {
+        throw new Error("hook failure");
+      },
+    } as Parameters<typeof mongoDbEngine>[0]);
+    let error: unknown = null;
+
+    try {
+      await engine.query("users", {
+        index: "byEmail",
+        filter: { value: { $foo: "bar" } as unknown as Record<string, unknown> },
+      });
+    } catch (candidate) {
+      error = candidate;
+    }
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toMatch(/unsupported/i);
   });
 
   test("firestore query pushes supported index filters into where clauses", async () => {
