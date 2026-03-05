@@ -868,24 +868,11 @@ type MongoNativeQueryPlanResolution =
 type MongoIndexFilterResolution =
   | {
       kind: "supported";
-      filter: Record<string, unknown> | string;
+      predicate: Record<string, unknown>;
     }
   | {
       kind: "unsupported";
-    }
-  | {
-      kind: "empty";
     };
-
-interface MongoRangeBound {
-  value: string;
-  inclusive: boolean;
-}
-
-interface MongoRangeBounds {
-  lower: MongoRangeBound | null;
-  upper: MongoRangeBound | null;
-}
 
 interface HandleMongoQueryFallbackParams {
   collection: string;
@@ -897,12 +884,14 @@ interface HandleMongoQueryFallbackParams {
 }
 
 function handleMongoQueryFallback(params: HandleMongoQueryFallbackParams): void {
-  params.onQueryFallbackScan?.({
-    collection: params.collection,
-    params: structuredClone(params.params),
-    operation: params.operation,
-    reason: params.reason,
-  });
+  try {
+    params.onQueryFallbackScan?.({
+      collection: params.collection,
+      params: structuredClone(params.params),
+      operation: params.operation,
+      reason: params.reason,
+    });
+  } catch {}
 
   if (params.reason === "unsupported_filter" && params.rejectUnsupportedQueries) {
     throw new Error(
@@ -924,7 +913,8 @@ function resolveMongoNativeQueryPlan(
     };
   }
 
-  const mongoIndexFilter = buildMongoIndexFilter(params.filter.value);
+  const indexField = `indexes.${params.index}`;
+  const mongoIndexFilter = buildMongoIndexFilter(indexField, params.filter.value);
 
   if (mongoIndexFilter.kind === "unsupported") {
     return {
@@ -933,9 +923,6 @@ function resolveMongoNativeQueryPlan(
     };
   }
 
-  const indexField = `indexes.${params.index}`;
-  const limit = normalizeLimit(params.limit);
-
   return {
     kind: "native",
     plan: {
@@ -943,11 +930,7 @@ function resolveMongoNativeQueryPlan(
       indexName: params.index,
       filter: {
         collection,
-        ...(mongoIndexFilter.kind === "empty"
-          ? {}
-          : {
-              [indexField]: mongoIndexFilter.filter,
-            }),
+        ...mongoIndexFilter.predicate,
       },
       sort:
         params.sort && params.index
@@ -960,7 +943,7 @@ function resolveMongoNativeQueryPlan(
               createdAt: 1,
               key: 1,
             },
-      limit: mongoIndexFilter.kind === "empty" ? 0 : limit,
+      limit: normalizeLimit(params.limit),
     },
   };
 }
@@ -1025,12 +1008,15 @@ async function queryDocumentsNative(
 }
 
 function buildMongoIndexFilter(
+  indexField: string,
   filter: string | number | FieldCondition,
 ): MongoIndexFilterResolution {
   if (typeof filter === "string" || typeof filter === "number") {
     return {
       kind: "supported",
-      filter: String(filter),
+      predicate: {
+        [indexField]: String(filter),
+      },
     };
   }
 
@@ -1042,74 +1028,85 @@ function buildMongoIndexFilter(
     };
   }
 
-  const bounds: MongoRangeBounds = {
-    lower: null,
-    upper: null,
-  };
+  const clauses: Record<string, unknown>[] = [];
 
   if (filter.$between !== undefined) {
     const [low, high] = filter.$between as [string | number, string | number];
-    addLowerRangeBound(bounds, normalizeMongoFilterValue(low), true);
-    addUpperRangeBound(bounds, normalizeMongoFilterValue(high), true);
+    clauses.push({
+      [indexField]: {
+        $gte: normalizeMongoFilterValue(low),
+        $lte: normalizeMongoFilterValue(high),
+      },
+    });
   }
 
   if (filter.$gt !== undefined) {
-    addLowerRangeBound(bounds, normalizeMongoFilterValue(filter.$gt), false);
+    clauses.push({
+      [indexField]: {
+        $gt: normalizeMongoFilterValue(filter.$gt),
+      },
+    });
   }
 
   if (filter.$gte !== undefined) {
-    addLowerRangeBound(bounds, normalizeMongoFilterValue(filter.$gte), true);
+    clauses.push({
+      [indexField]: {
+        $gte: normalizeMongoFilterValue(filter.$gte),
+      },
+    });
   }
 
   if (filter.$lt !== undefined) {
-    addUpperRangeBound(bounds, normalizeMongoFilterValue(filter.$lt), false);
+    clauses.push({
+      [indexField]: {
+        $lt: normalizeMongoFilterValue(filter.$lt),
+      },
+    });
   }
 
   if (filter.$lte !== undefined) {
-    addUpperRangeBound(bounds, normalizeMongoFilterValue(filter.$lte), true);
+    clauses.push({
+      [indexField]: {
+        $lte: normalizeMongoFilterValue(filter.$lte),
+      },
+    });
   }
 
   if (filter.$begins !== undefined) {
     const beginsValue = normalizeMongoFilterValue(filter.$begins);
-    addLowerRangeBound(bounds, beginsValue, true);
-    addUpperRangeBound(bounds, `${beginsValue}\uffff`, true);
+    clauses.push({
+      [indexField]: {
+        $regex: `^${escapeMongoRegex(beginsValue)}`,
+      },
+    });
   }
 
   if (filter.$eq !== undefined) {
-    const equality = normalizeMongoFilterValue(filter.$eq);
-
-    if (!isWithinMongoRangeBounds(bounds, equality)) {
-      return {
-        kind: "empty",
-      };
-    }
-
-    return {
-      kind: "supported",
-      filter: equality,
-    };
+    clauses.push({
+      [indexField]: normalizeMongoFilterValue(filter.$eq),
+    });
   }
 
-  if (isMongoRangeBoundsEmpty(bounds)) {
-    return {
-      kind: "empty",
-    };
-  }
-
-  const rangeFilter = toMongoRangeFilter(bounds);
-
-  if (Object.keys(rangeFilter).length === 0) {
-    return {
-      kind: "supported",
-      filter: {
+  if (clauses.length === 0) {
+    clauses.push({
+      [indexField]: {
         $exists: true,
       },
+    });
+  }
+
+  if (clauses.length === 1) {
+    return {
+      kind: "supported",
+      predicate: clauses[0]!,
     };
   }
 
   return {
     kind: "supported",
-    filter: rangeFilter,
+    predicate: {
+      $and: clauses,
+    },
   };
 }
 
@@ -1117,130 +1114,8 @@ function normalizeMongoFilterValue(value: unknown): string {
   return String(value as string | number);
 }
 
-function mongoStringCompare(a: string, b: string): number {
-  if (a < b) {
-    return -1;
-  }
-
-  if (a > b) {
-    return 1;
-  }
-
-  return 0;
-}
-
-function addLowerRangeBound(bounds: MongoRangeBounds, value: string, inclusive: boolean): void {
-  const current = bounds.lower;
-
-  if (!current) {
-    bounds.lower = {
-      value,
-      inclusive,
-    };
-    return;
-  }
-
-  const cmp = mongoStringCompare(value, current.value);
-
-  if (cmp > 0) {
-    bounds.lower = {
-      value,
-      inclusive,
-    };
-    return;
-  }
-
-  if (cmp === 0) {
-    bounds.lower = {
-      value,
-      inclusive: current.inclusive && inclusive,
-    };
-  }
-}
-
-function addUpperRangeBound(bounds: MongoRangeBounds, value: string, inclusive: boolean): void {
-  const current = bounds.upper;
-
-  if (!current) {
-    bounds.upper = {
-      value,
-      inclusive,
-    };
-    return;
-  }
-
-  const cmp = mongoStringCompare(value, current.value);
-
-  if (cmp < 0) {
-    bounds.upper = {
-      value,
-      inclusive,
-    };
-    return;
-  }
-
-  if (cmp === 0) {
-    bounds.upper = {
-      value,
-      inclusive: current.inclusive && inclusive,
-    };
-  }
-}
-
-function isMongoRangeBoundsEmpty(bounds: MongoRangeBounds): boolean {
-  if (!bounds.lower || !bounds.upper) {
-    return false;
-  }
-
-  const cmp = mongoStringCompare(bounds.lower.value, bounds.upper.value);
-
-  if (cmp > 0) {
-    return true;
-  }
-
-  return cmp === 0 && (!bounds.lower.inclusive || !bounds.upper.inclusive);
-}
-
-function isWithinMongoRangeBounds(bounds: MongoRangeBounds, value: string): boolean {
-  if (bounds.lower) {
-    const cmpLower = mongoStringCompare(value, bounds.lower.value);
-
-    if (cmpLower < 0) {
-      return false;
-    }
-
-    if (cmpLower === 0 && !bounds.lower.inclusive) {
-      return false;
-    }
-  }
-
-  if (bounds.upper) {
-    const cmpUpper = mongoStringCompare(value, bounds.upper.value);
-
-    if (cmpUpper > 0) {
-      return false;
-    }
-
-    if (cmpUpper === 0 && !bounds.upper.inclusive) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
-function toMongoRangeFilter(bounds: MongoRangeBounds): Record<string, unknown> {
-  const mongoFilter: Record<string, unknown> = {};
-
-  if (bounds.lower) {
-    mongoFilter[bounds.lower.inclusive ? "$gte" : "$gt"] = bounds.lower.value;
-  }
-
-  if (bounds.upper) {
-    mongoFilter[bounds.upper.inclusive ? "$lte" : "$lt"] = bounds.upper.value;
-  }
-
-  return mongoFilter;
+function escapeMongoRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function buildMongoCursorPredicate(
