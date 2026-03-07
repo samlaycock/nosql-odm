@@ -2,7 +2,7 @@
 // Shared engine types — the contract between store ↔ engine
 // ---------------------------------------------------------------------------
 
-import type { DocumentPreparationMode, PreparedDocument } from "./document-preparation";
+import type { PreparedDocument } from "./document-preparation";
 
 /**
  * Index values resolved to concrete strings, keyed by index key.
@@ -237,13 +237,7 @@ export interface QueryEngine<TOptions = Record<string, unknown>> {
    * Optional hook that lets the store reuse engine-specific document
    * preparation and avoid duplicate deep traversal on writes.
    */
-  prepareDocumentForWrite?(
-    doc: object,
-    collection: string,
-    key: string,
-  ): PreparedDocument & {
-    readonly mode: DocumentPreparationMode;
-  };
+  prepareDocumentForWrite?(doc: object, collection: string, key: string): PreparedDocument;
 
   get(collection: string, key: string, options?: TOptions): Promise<unknown>;
   getWithMetadata?(
