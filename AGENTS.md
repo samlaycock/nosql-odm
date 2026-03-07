@@ -1,4 +1,4 @@
-This is JavaScript library that implements a JavaScript code interpreter.
+This is JavaScript library that exposes a simple, database agnostic Object Document Mapper (ODM) for NoSQL databases. The library is designed to be flexible and extensible, allowing developers to easily integrate it with various NoSQL (and SQL) databases.
 This project uses Bun as the package manager. NEVER use `npm` or `yarn` to install dependencies or run scripts.
 
 For rules to follow when making Git operations, see [GIT.md](conventions/GIT.md)
