@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 
 import { DefaultMigrator } from "../migrator";
+import { getPreparedSerializedDocument, prepareDocumentForStorage } from "./document-preparation";
 import {
   encodeQueryPageCursor,
   resolveQueryPageCursorPosition,
@@ -552,6 +553,10 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
       uniqueConstraints: "atomic",
     },
 
+    prepareDocumentForWrite(doc, collection, key) {
+      return prepareDocumentForStorage(doc, collection, key, "serialize");
+    },
+
     db,
 
     close() {
@@ -991,6 +996,12 @@ function setUserVersion(db: Database.Database, version: number): void {
 }
 
 function serializeDocument(doc: unknown, collection: string, key: string): string {
+  const prepared = getPreparedSerializedDocument(doc);
+
+  if (prepared !== null) {
+    return prepared;
+  }
+
   const encoded = JSON.stringify(doc);
 
   if (encoded === undefined) {

@@ -1,4 +1,5 @@
 import { DefaultMigrator } from "../migrator";
+import { getPreparedSerializedDocument, prepareDocumentForStorage } from "./document-preparation";
 import { encodeQueryPageCursor, resolveQueryPageStartIndex } from "./query-cursor";
 import {
   type BatchSetResult,
@@ -387,6 +388,10 @@ export function redisEngine(options: RedisEngineOptions): RedisQueryEngine {
   const engine: RedisQueryEngine = {
     capabilities: {
       uniqueConstraints: "atomic",
+    },
+
+    prepareDocumentForWrite(doc, collection, key) {
+      return prepareDocumentForStorage(doc, collection, key, "serialize");
     },
 
     async get(collection, key) {
@@ -1382,6 +1387,12 @@ function parseIndexes(raw: unknown): ResolvedIndexKeys {
 }
 
 function serializeDocument(doc: unknown): string {
+  const prepared = getPreparedSerializedDocument(doc);
+
+  if (prepared !== null) {
+    return prepared;
+  }
+
   const cloned = structuredClone(doc);
 
   if (!isRecord(cloned)) {

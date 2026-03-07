@@ -1,4 +1,5 @@
 import { DefaultMigrator } from "../migrator";
+import { getPreparedClone, prepareDocumentForStorage } from "./document-preparation";
 import { encodeQueryPageCursor, resolveQueryPageStartIndex } from "./query-cursor";
 import {
   EngineDocumentAlreadyExistsError,
@@ -134,6 +135,10 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
   const engine: IndexedDbQueryEngine = {
     capabilities: {
       uniqueConstraints: "atomic",
+    },
+
+    prepareDocumentForWrite(doc, collection, key) {
+      return prepareDocumentForStorage(doc, collection, key, "clone");
     },
 
     close() {
@@ -998,7 +1003,7 @@ function createStoredDocumentRecord(input: {
     collection: input.collection,
     key: input.key,
     createdAt: input.createdAt,
-    doc: structuredClone(input.doc) as Record<string, unknown>,
+    doc: getPreparedClone(input.doc) ?? (structuredClone(input.doc) as Record<string, unknown>),
     indexes: { ...input.indexes },
   };
 }
