@@ -13,6 +13,7 @@ import {
 } from "@aws-sdk/lib-dynamodb";
 
 import { DefaultMigrator } from "../migrator";
+import { getPreparedClone, prepareDocumentForStorage } from "./document-preparation";
 import { encodeQueryPageCursor, resolveQueryPageStartIndex } from "./query-cursor";
 import {
   EngineDocumentAlreadyExistsError,
@@ -218,6 +219,10 @@ export function dynamoDbEngine(options: DynamoDbEngineOptions): DynamoDbQueryEng
   const engine: DynamoDbQueryEngine = {
     capabilities: {
       uniqueConstraints: "atomic",
+    },
+
+    prepareDocumentForWrite(doc, collection, key) {
+      return prepareDocumentForStorage(doc, collection, key, "clone");
     },
 
     async get(collection, key) {
@@ -904,7 +909,7 @@ function createDocumentItem(
   doc: unknown,
   indexes: ResolvedIndexKeys,
 ): StoredDocumentItem {
-  const cloned = structuredClone(doc);
+  const cloned = getPreparedClone(doc) ?? (structuredClone(doc) as Record<string, unknown>);
 
   if (!isRecord(cloned)) {
     throw new Error("DynamoDB received a non-object document");

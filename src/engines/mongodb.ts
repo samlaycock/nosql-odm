@@ -1,4 +1,5 @@
 import { DefaultMigrator } from "../migrator";
+import { getPreparedClone, prepareDocumentForStorage } from "./document-preparation";
 import {
   type BatchSetResult,
   EngineDocumentAlreadyExistsError,
@@ -163,6 +164,10 @@ export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine
   const engine: MongoDbQueryEngine = {
     capabilities: {
       uniqueConstraints: "atomic",
+    },
+
+    prepareDocumentForWrite(doc, collection, key) {
+      return prepareDocumentForStorage(doc, collection, key, "clone");
     },
 
     async get(collection, key) {
@@ -1818,7 +1823,7 @@ function parseMigrationMetadataFields(record: Record<string, unknown>): Migratio
 }
 
 function normalizeDocument(doc: unknown): Record<string, unknown> {
-  const cloned = structuredClone(doc);
+  const cloned = getPreparedClone(doc) ?? (structuredClone(doc) as Record<string, unknown>);
 
   if (!isRecord(cloned)) {
     throw new Error("MongoDB received a non-object document");

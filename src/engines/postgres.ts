@@ -1,4 +1,5 @@
 import { DefaultMigrator } from "../migrator";
+import { getPreparedSerializedDocument, prepareDocumentForStorage } from "./document-preparation";
 import {
   encodeQueryPageCursor,
   resolveQueryPageCursorPosition,
@@ -115,6 +116,10 @@ export function postgresEngine(options: PostgresEngineOptions): PostgresQueryEng
   const engine: PostgresQueryEngine = {
     capabilities: {
       uniqueConstraints: "atomic",
+    },
+
+    prepareDocumentForWrite(doc, collection, key) {
+      return prepareDocumentForStorage(doc, collection, key, "serialize");
     },
 
     async get(collection, key) {
@@ -1297,6 +1302,12 @@ function parseStoredDocument(
 }
 
 function serializeDocument(doc: unknown): string {
+  const prepared = getPreparedSerializedDocument(doc);
+
+  if (prepared !== null) {
+    return prepared;
+  }
+
   const cloned = structuredClone(doc);
 
   if (!isRecord(cloned)) {

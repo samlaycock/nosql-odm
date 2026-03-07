@@ -1,4 +1,5 @@
 import { DefaultMigrator } from "../migrator";
+import { getPreparedClone, prepareDocumentForStorage } from "./document-preparation";
 import {
   encodeQueryPageCursor,
   resolveQueryPageStartIndex,
@@ -123,6 +124,10 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
   const engine: FirestoreQueryEngine = {
     capabilities: {
       uniqueConstraints: "atomic",
+    },
+
+    prepareDocumentForWrite(doc, collection, key) {
+      return prepareDocumentForStorage(doc, collection, key, "clone");
     },
 
     async get(collection, key) {
@@ -1179,7 +1184,7 @@ function parseMigrationPartition(
 }
 
 function normalizeDocument(doc: unknown): Record<string, unknown> {
-  const cloned = structuredClone(doc);
+  const cloned = getPreparedClone(doc) ?? (structuredClone(doc) as Record<string, unknown>);
 
   if (!isRecord(cloned)) {
     throw new Error("Firestore received a non-object document");

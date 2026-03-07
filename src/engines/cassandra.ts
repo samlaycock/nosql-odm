@@ -1,4 +1,5 @@
 import { DefaultMigrator } from "../migrator";
+import { getPreparedSerializedDocument, prepareDocumentForStorage } from "./document-preparation";
 import { encodeQueryPageCursor, resolveQueryPageStartIndex } from "./query-cursor";
 import {
   type BatchSetItem,
@@ -135,6 +136,10 @@ export function cassandraEngine(options: CassandraEngineOptions): CassandraQuery
   const engine: CassandraQueryEngine = {
     capabilities: {
       uniqueConstraints: "atomic",
+    },
+
+    prepareDocumentForWrite(doc, collection, key) {
+      return prepareDocumentForStorage(doc, collection, key, "serialize");
     },
 
     async get(collection, key) {
@@ -887,6 +892,12 @@ function parseDocument(serialized: string): Record<string, unknown> {
 }
 
 function serializeDocument(doc: unknown): string {
+  const prepared = getPreparedSerializedDocument(doc);
+
+  if (prepared !== null) {
+    return prepared;
+  }
+
   const cloned = structuredClone(doc);
 
   if (!isRecord(cloned)) {
