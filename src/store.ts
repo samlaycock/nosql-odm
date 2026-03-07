@@ -1,6 +1,9 @@
 import type { ProjectionSkipReason } from "./model";
 
-import { prepareDocumentForStorage, type PreparedDocument } from "./engines/document-preparation";
+import {
+  type PreparedDocument,
+  validateJsonCompatibleDocument,
+} from "./engines/document-preparation";
 import {
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
@@ -892,10 +895,7 @@ class BoundModelImpl<
       return this.engine.prepareDocumentForWrite(stamped, this.model.name, key);
     }
 
-    return prepareDocumentForStorage(stamped, this.model.name, key, "clone").value as Record<
-      string,
-      unknown
-    >;
+    return validateJsonCompatibleDocument(stamped, this.model.name, key);
   }
 
   private currentMigrationMetadata(): MigrationDocumentMetadata {

@@ -16,6 +16,15 @@ interface PreparedNode {
   readonly serialized: string;
 }
 
+export function validateJsonCompatibleDocument(
+  value: object,
+  collection: string,
+  key: string,
+): Record<string, unknown> {
+  validateValue(value, "$", new WeakSet<object>(), collection, key);
+  return value as Record<string, unknown>;
+}
+
 export function prepareDocumentForStorage(
   value: object,
   collection: string,
@@ -59,6 +68,8 @@ function visitValue(
   collection: string,
   key: string,
 ): PreparedNode {
+  validatePrimitiveValue(candidate, path, collection, key);
+
   if (candidate === null) {
     return { cloned: null, serialized: "null" };
   }
@@ -98,85 +109,171 @@ function visitValue(
     };
   }
 
-  if (candidateType === "undefined") {
-    throw new Error(
-      `Document "${key}" in model "${collection}" is not JSON-compatible at ${path}: undefined is not allowed`,
-    );
-  }
-
-  if (candidateType === "bigint") {
-    throw new Error(
-      `Document "${key}" in model "${collection}" is not JSON-compatible at ${path}: bigint is not allowed`,
-    );
-  }
-
-  if (candidateType === "symbol") {
-    throw new Error(
-      `Document "${key}" in model "${collection}" is not JSON-compatible at ${path}: symbol is not allowed`,
-    );
-  }
-
-  if (candidateType === "function") {
-    throw new Error(
-      `Document "${key}" in model "${collection}" is not JSON-compatible at ${path}: function is not allowed`,
-    );
-  }
-
   if (candidateType !== "object") {
-    throw new Error(
-      `Document "${key}" in model "${collection}" is not JSON-compatible at ${path}: unsupported value type`,
-    );
+    throwNotJsonCompatible(collection, key, path, "unsupported value type");
   }
 
   const objectValue = candidate as object;
 
   if (visited.has(objectValue)) {
-    throw new Error(
-      `Document "${key}" in model "${collection}" is not JSON-compatible at ${path}: circular references are not allowed`,
-    );
+    throwNotJsonCompatible(collection, key, path, "circular references are not allowed");
   }
 
   visited.add(objectValue);
 
-  if (Array.isArray(candidate)) {
-    const cloned: JsonValue[] = [];
+  try {
+    if (Array.isArray(candidate)) {
+      const cloned: JsonValue[] = [];
+      const serializedParts: string[] = [];
+
+      for (let i = 0; i < candidate.length; i++) {
+        const prepared = visitValue(
+          candidate[i],
+          `${path}[${String(i)}]`,
+          visited,
+          collection,
+          key,
+        );
+        cloned.push(prepared.cloned);
+        serializedParts.push(prepared.serialized);
+      }
+
+      return {
+        cloned,
+        serialized: `[${serializedParts.join(",")}]`,
+      };
+    }
+
+    const proto = Object.getPrototypeOf(candidate);
+
+    if (proto !== Object.prototype && proto !== null) {
+      const constructorName =
+        (candidate as { constructor?: { name?: string } }).constructor?.name ?? "Object";
+      throwNotJsonCompatible(collection, key, path, `unsupported object type "${constructorName}"`);
+    }
+
+    const entries = Object.entries(candidate as Record<string, unknown>);
+    const cloned: Record<string, JsonValue> =
+      proto === null ? (Object.create(null) as Record<string, JsonValue>) : {};
     const serializedParts: string[] = [];
 
-    for (let i = 0; i < candidate.length; i++) {
-      const prepared = visitValue(candidate[i], `${path}[${String(i)}]`, visited, collection, key);
-      cloned.push(prepared.cloned);
-      serializedParts.push(prepared.serialized);
+    for (const [entryKey, entryValue] of entries) {
+      const prepared = visitValue(entryValue, `${path}.${entryKey}`, visited, collection, key);
+      cloned[entryKey] = prepared.cloned;
+      serializedParts.push(`${JSON.stringify(entryKey)}:${prepared.serialized}`);
     }
 
     return {
       cloned,
-      serialized: `[${serializedParts.join(",")}]`,
+      serialized: `{${serializedParts.join(",")}}`,
     };
+  } finally {
+    visited.delete(objectValue);
+  }
+}
+
+function validateValue(
+  candidate: unknown,
+  path: string,
+  visited: WeakSet<object>,
+  collection: string,
+  key: string,
+): void {
+  validatePrimitiveValue(candidate, path, collection, key);
+
+  if (candidate === null) {
+    return;
   }
 
-  const proto = Object.getPrototypeOf(candidate);
+  const candidateType = typeof candidate;
 
-  if (proto !== Object.prototype && proto !== null) {
-    const constructorName =
-      (candidate as { constructor?: { name?: string } }).constructor?.name ?? "Object";
-    throw new Error(
-      `Document "${key}" in model "${collection}" is not JSON-compatible at ${path}: unsupported object type "${constructorName}"`,
-    );
+  if (candidateType === "string" || candidateType === "boolean" || candidateType === "number") {
+    return;
   }
 
-  const entries = Object.entries(candidate as Record<string, unknown>);
-  const cloned: Record<string, JsonValue> =
-    proto === null ? (Object.create(null) as Record<string, JsonValue>) : {};
-  const serializedParts: string[] = [];
-
-  for (const [entryKey, entryValue] of entries) {
-    const prepared = visitValue(entryValue, `${path}.${entryKey}`, visited, collection, key);
-    cloned[entryKey] = prepared.cloned;
-    serializedParts.push(`${JSON.stringify(entryKey)}:${prepared.serialized}`);
+  if (candidateType !== "object") {
+    throwNotJsonCompatible(collection, key, path, "unsupported value type");
   }
 
-  return {
-    cloned,
-    serialized: `{${serializedParts.join(",")}}`,
-  };
+  const objectValue = candidate as object;
+
+  if (visited.has(objectValue)) {
+    throwNotJsonCompatible(collection, key, path, "circular references are not allowed");
+  }
+
+  visited.add(objectValue);
+
+  try {
+    if (Array.isArray(candidate)) {
+      for (let i = 0; i < candidate.length; i++) {
+        validateValue(candidate[i], `${path}[${String(i)}]`, visited, collection, key);
+      }
+      return;
+    }
+
+    const proto = Object.getPrototypeOf(candidate);
+
+    if (proto !== Object.prototype && proto !== null) {
+      const constructorName =
+        (candidate as { constructor?: { name?: string } }).constructor?.name ?? "Object";
+      throwNotJsonCompatible(collection, key, path, `unsupported object type "${constructorName}"`);
+    }
+
+    for (const [entryKey, entryValue] of Object.entries(candidate as Record<string, unknown>)) {
+      validateValue(entryValue, `${path}.${entryKey}`, visited, collection, key);
+    }
+  } finally {
+    visited.delete(objectValue);
+  }
+}
+
+function validatePrimitiveValue(
+  candidate: unknown,
+  path: string,
+  collection: string,
+  key: string,
+): void {
+  if (candidate === null) {
+    return;
+  }
+
+  const candidateType = typeof candidate;
+
+  if (candidateType === "string" || candidateType === "boolean") {
+    return;
+  }
+
+  if (candidateType === "number") {
+    if (!Number.isFinite(candidate as number)) {
+      throwNotJsonCompatible(collection, key, path, "non-finite numbers are not allowed");
+    }
+    return;
+  }
+
+  if (candidateType === "undefined") {
+    throwNotJsonCompatible(collection, key, path, "undefined is not allowed");
+  }
+
+  if (candidateType === "bigint") {
+    throwNotJsonCompatible(collection, key, path, "bigint is not allowed");
+  }
+
+  if (candidateType === "symbol") {
+    throwNotJsonCompatible(collection, key, path, "symbol is not allowed");
+  }
+
+  if (candidateType === "function") {
+    throwNotJsonCompatible(collection, key, path, "function is not allowed");
+  }
+}
+
+function throwNotJsonCompatible(
+  collection: string,
+  key: string,
+  path: string,
+  reason: string,
+): never {
+  throw new Error(
+    `Document "${key}" in model "${collection}" is not JSON-compatible at ${path}: ${reason}`,
+  );
 }

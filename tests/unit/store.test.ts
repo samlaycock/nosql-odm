@@ -2232,6 +2232,73 @@ describe("engine-assisted write preparation", () => {
     expect(prepareCalls).toEqual([{ collection: "blob", key: "invalid" }]);
     expect(createDocs).toHaveLength(0);
   });
+
+  test("shared nested objects are allowed when they do not form a cycle", async () => {
+    const { engine } = createPreparationEngine();
+    const store = createStore(engine, [buildBlobV1()]);
+    const shared = { leaf: "value" };
+
+    expect(
+      store.blob.create("diamond", {
+        id: "diamond",
+        payload: {
+          left: shared,
+          right: shared,
+        },
+      }),
+    ).resolves.toEqual({
+      id: "diamond",
+      payload: {
+        left: { leaf: "value" },
+        right: { leaf: "value" },
+      },
+    });
+  });
+
+  test("engines without write preparation still validate without deep-cloning nested values", async () => {
+    const originalNested = { marker: "shared" };
+    const docs: unknown[] = [];
+
+    const engine: QueryEngine<never> = {
+      async get() {
+        return null;
+      },
+      async create(_collection, _key, doc) {
+        docs.push(doc);
+      },
+      async put() {},
+      async update() {},
+      async delete() {},
+      async query() {
+        return { documents: [], cursor: null };
+      },
+      async batchGet() {
+        return [];
+      },
+      async batchSet() {},
+      async batchDelete() {},
+      migration: {
+        async acquireLock() {
+          return null;
+        },
+        async releaseLock() {},
+        async getOutdated() {
+          return { documents: [], cursor: null };
+        },
+      },
+    };
+    const store = createStore(engine, [buildBlobV1()]);
+
+    await store.blob.create("no-prep", {
+      id: "no-prep",
+      payload: {
+        nested: originalNested,
+      },
+    });
+
+    expect(docs).toHaveLength(1);
+    expect((docs[0] as { payload: { nested: unknown } }).payload.nested).toBe(originalNested);
+  });
 });
 
 // ---------------------------------------------------------------------------
