@@ -11,11 +11,6 @@ export interface PreparedDocument {
   readonly value: Record<string, unknown> | string;
 }
 
-interface PreparedNode {
-  readonly cloned: JsonValue;
-  readonly serialized: string;
-}
-
 export function validateJsonCompatibleDocument(
   value: object,
   collection: string,
@@ -31,13 +26,16 @@ export function prepareDocumentForStorage(
   key: string,
   mode: DocumentPreparationMode,
 ): PreparedDocument {
-  const visited = new WeakSet<object>();
-  const prepared = visitValue(value, "$", visited, collection, key);
-
   return {
     [preparedDocumentTag]: true,
     mode,
-    value: mode === "clone" ? (prepared.cloned as Record<string, unknown>) : prepared.serialized,
+    value:
+      mode === "clone"
+        ? (visitClonedValue(value, "$", new WeakSet<object>(), collection, key) as Record<
+            string,
+            unknown
+          >)
+        : visitSerializedValue(value, "$", new WeakSet<object>(), collection, key),
   };
 }
 
@@ -61,52 +59,23 @@ function isPreparedDocument(doc: unknown): doc is PreparedDocument {
   return typeof doc === "object" && doc !== null && preparedDocumentTag in doc;
 }
 
-function visitValue(
+function visitClonedValue(
   candidate: unknown,
   path: string,
   visited: WeakSet<object>,
   collection: string,
   key: string,
-): PreparedNode {
+): JsonValue {
   validatePrimitiveValue(candidate, path, collection, key);
 
   if (candidate === null) {
-    return { cloned: null, serialized: "null" };
+    return null;
   }
 
   const candidateType = typeof candidate;
 
-  if (candidateType === "string") {
-    const stringValue = candidate as string;
-
-    return {
-      cloned: stringValue,
-      serialized: JSON.stringify(stringValue),
-    };
-  }
-
-  if (candidateType === "boolean") {
-    const booleanValue = candidate as boolean;
-
-    return {
-      cloned: booleanValue,
-      serialized: booleanValue ? "true" : "false",
-    };
-  }
-
-  if (candidateType === "number") {
-    const numberValue = candidate as number;
-
-    if (!Number.isFinite(numberValue)) {
-      throw new Error(
-        `Document "${key}" in model "${collection}" is not JSON-compatible at ${path}: non-finite numbers are not allowed`,
-      );
-    }
-
-    return {
-      cloned: numberValue,
-      serialized: JSON.stringify(numberValue),
-    };
+  if (candidateType === "string" || candidateType === "boolean" || candidateType === "number") {
+    return candidate as JsonPrimitive;
   }
 
   if (candidateType !== "object") {
@@ -124,24 +93,14 @@ function visitValue(
   try {
     if (Array.isArray(candidate)) {
       const cloned: JsonValue[] = [];
-      const serializedParts: string[] = [];
 
       for (let i = 0; i < candidate.length; i++) {
-        const prepared = visitValue(
-          candidate[i],
-          `${path}[${String(i)}]`,
-          visited,
-          collection,
-          key,
+        cloned.push(
+          visitClonedValue(candidate[i], `${path}[${String(i)}]`, visited, collection, key),
         );
-        cloned.push(prepared.cloned);
-        serializedParts.push(prepared.serialized);
       }
 
-      return {
-        cloned,
-        serialized: `[${serializedParts.join(",")}]`,
-      };
+      return cloned;
     }
 
     const proto = Object.getPrototypeOf(candidate);
@@ -152,21 +111,100 @@ function visitValue(
       throwNotJsonCompatible(collection, key, path, `unsupported object type "${constructorName}"`);
     }
 
-    const entries = Object.entries(candidate as Record<string, unknown>);
     const cloned: Record<string, JsonValue> =
       proto === null ? (Object.create(null) as Record<string, JsonValue>) : {};
-    const serializedParts: string[] = [];
 
-    for (const [entryKey, entryValue] of entries) {
-      const prepared = visitValue(entryValue, `${path}.${entryKey}`, visited, collection, key);
-      cloned[entryKey] = prepared.cloned;
-      serializedParts.push(`${JSON.stringify(entryKey)}:${prepared.serialized}`);
+    for (const [entryKey, entryValue] of Object.entries(candidate as Record<string, unknown>)) {
+      cloned[entryKey] = visitClonedValue(
+        entryValue,
+        `${path}.${entryKey}`,
+        visited,
+        collection,
+        key,
+      );
     }
 
-    return {
-      cloned,
-      serialized: `{${serializedParts.join(",")}}`,
-    };
+    return cloned;
+  } finally {
+    visited.delete(objectValue);
+  }
+}
+
+function visitSerializedValue(
+  candidate: unknown,
+  path: string,
+  visited: WeakSet<object>,
+  collection: string,
+  key: string,
+): string {
+  validatePrimitiveValue(candidate, path, collection, key);
+
+  if (candidate === null) {
+    return "null";
+  }
+
+  const candidateType = typeof candidate;
+
+  if (candidateType === "string") {
+    return JSON.stringify(candidate as string);
+  }
+
+  if (candidateType === "boolean") {
+    return (candidate as boolean) ? "true" : "false";
+  }
+
+  if (candidateType === "number") {
+    return JSON.stringify(candidate as number);
+  }
+
+  if (candidateType !== "object") {
+    throwNotJsonCompatible(collection, key, path, "unsupported value type");
+  }
+
+  const objectValue = candidate as object;
+
+  if (visited.has(objectValue)) {
+    throwNotJsonCompatible(collection, key, path, "circular references are not allowed");
+  }
+
+  visited.add(objectValue);
+
+  try {
+    if (Array.isArray(candidate)) {
+      const serializedParts: string[] = [];
+
+      for (let i = 0; i < candidate.length; i++) {
+        serializedParts.push(
+          visitSerializedValue(candidate[i], `${path}[${String(i)}]`, visited, collection, key),
+        );
+      }
+
+      return `[${serializedParts.join(",")}]`;
+    }
+
+    const proto = Object.getPrototypeOf(candidate);
+
+    if (proto !== Object.prototype && proto !== null) {
+      const constructorName =
+        (candidate as { constructor?: { name?: string } }).constructor?.name ?? "Object";
+      throwNotJsonCompatible(collection, key, path, `unsupported object type "${constructorName}"`);
+    }
+
+    const serializedParts: string[] = [];
+
+    for (const [entryKey, entryValue] of Object.entries(candidate as Record<string, unknown>)) {
+      serializedParts.push(
+        `${JSON.stringify(entryKey)}:${visitSerializedValue(
+          entryValue,
+          `${path}.${entryKey}`,
+          visited,
+          collection,
+          key,
+        )}`,
+      );
+    }
+
+    return `{${serializedParts.join(",")}}`;
   } finally {
     visited.delete(objectValue);
   }
