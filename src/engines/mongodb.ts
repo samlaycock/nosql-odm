@@ -1185,7 +1185,7 @@ function buildMongoIndexFilter(
     });
   }
 
-  if (filter.$begins !== undefined) {
+  if (filter.$begins !== undefined && filter.$eq === undefined) {
     const beginsValue = normalizeMongoFilterValue(filter.$begins);
     clauses.push({
       [indexField]: {

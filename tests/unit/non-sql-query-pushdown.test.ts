@@ -544,6 +544,23 @@ describe("non-SQL query pushdown", () => {
     expect(result.documents.map((doc) => doc.key)).toEqual(["u1", "u2"]);
   });
 
+  test("mongodb query omits redundant begins regex when eq is present", async () => {
+    const engine = mongoDbEngine({
+      database: new FakeMongoDatabase(mongoDocs, mongoMeta),
+    });
+
+    const result = await engine.query("users", {
+      index: "byEmail",
+      filter: { value: { $eq: "b@example.com", $begins: "b" } },
+    });
+
+    expect(mongoDocs.lastFindFilter).toEqual({
+      collection: "users",
+      "indexes.byEmail": "b@example.com",
+    });
+    expect(result.documents.map((doc) => doc.key)).toEqual(["u2"]);
+  });
+
   test("mongodb query can reject unsupported filters instead of scanning", async () => {
     const engine = mongoDbEngine({
       database: new FakeMongoDatabase(mongoDocs, mongoMeta),
@@ -586,6 +603,26 @@ describe("non-SQL query pushdown", () => {
       collection: "users",
       operation: "query",
       reason: "unsupported_filter",
+    });
+  });
+
+  test("mongodb query reports full_scan fallback with a hook when no index is provided", async () => {
+    const events: Array<Record<string, unknown>> = [];
+    const engine = mongoDbEngine({
+      database: new FakeMongoDatabase(mongoDocs, mongoMeta),
+      onQueryFallbackScan(event) {
+        events.push(event as unknown as Record<string, unknown>);
+      },
+    } as Parameters<typeof mongoDbEngine>[0]);
+
+    const result = await engine.query("users", {});
+
+    expect(result.documents.map((doc) => doc.key)).toEqual(["u1", "u2", "u3"]);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      collection: "users",
+      operation: "query",
+      reason: "full_scan",
     });
   });
 
