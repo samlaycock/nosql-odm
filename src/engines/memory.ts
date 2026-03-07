@@ -1,4 +1,5 @@
 import { DefaultMigrator } from "../migrator";
+import { getPreparedClone, prepareDocumentForStorage } from "./document-preparation";
 import { encodeQueryPageCursor, resolveQueryPageStartIndex } from "./query-cursor";
 import {
   EngineDocumentAlreadyExistsError,
@@ -132,6 +133,10 @@ export function memoryEngine(options?: MemoryEngineOptions): MemoryQueryEngine {
       uniqueConstraints: "atomic",
     },
 
+    prepareDocumentForWrite(doc, collection, key) {
+      return prepareDocumentForStorage(doc, collection, key, "clone");
+    },
+
     setOptions(newOptions: MemoryEngineOptions) {
       engineOptions = newOptions;
     },
@@ -157,7 +162,7 @@ export function memoryEngine(options?: MemoryEngineOptions): MemoryQueryEngine {
 
       col.set(key, {
         createdAt: ++createdAtSequence,
-        doc: structuredClone(doc) as Record<string, unknown>,
+        doc: cloneStoredDocument(doc),
         indexes: { ...indexes },
         uniqueIndexes: { ...uniqueIndexes },
       });
@@ -174,7 +179,7 @@ export function memoryEngine(options?: MemoryEngineOptions): MemoryQueryEngine {
 
       col.set(key, {
         createdAt: existing?.createdAt ?? ++createdAtSequence,
-        doc: structuredClone(doc) as Record<string, unknown>,
+        doc: cloneStoredDocument(doc),
         indexes: { ...indexes },
         uniqueIndexes: { ...uniqueIndexes },
       });
@@ -196,7 +201,7 @@ export function memoryEngine(options?: MemoryEngineOptions): MemoryQueryEngine {
 
       col.set(key, {
         createdAt: existing.createdAt,
-        doc: structuredClone(doc) as Record<string, unknown>,
+        doc: cloneStoredDocument(doc),
         indexes: { ...indexes },
         uniqueIndexes: { ...uniqueIndexes },
       });
@@ -254,7 +259,7 @@ export function memoryEngine(options?: MemoryEngineOptions): MemoryQueryEngine {
 
         col.set(item.key, {
           createdAt: existing?.createdAt ?? ++createdAtSequence,
-          doc: structuredClone(item.doc) as Record<string, unknown>,
+          doc: cloneStoredDocument(item.doc),
           indexes: { ...item.indexes },
           uniqueIndexes: { ...item.uniqueIndexes },
         });
@@ -394,6 +399,10 @@ export function memoryEngine(options?: MemoryEngineOptions): MemoryQueryEngine {
   engine.migrator = new DefaultMigrator(engine);
 
   return engine;
+}
+
+function cloneStoredDocument(doc: unknown): Record<string, unknown> {
+  return getPreparedClone(doc) ?? (structuredClone(doc) as Record<string, unknown>);
 }
 
 // ---------------------------------------------------------------------------

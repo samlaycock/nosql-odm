@@ -1,6 +1,10 @@
 import { describe, expect, test, beforeEach } from "bun:test";
 import * as z from "zod";
 
+import {
+  getPreparedSerializedDocument,
+  prepareDocumentForStorage,
+} from "../../src/engines/document-preparation";
 import { memoryEngine, type MemoryQueryEngine } from "../../src/engines/memory";
 import {
   EngineDocumentAlreadyExistsError,
@@ -2096,6 +2100,137 @@ describe("JSON compatibility on engine writes", () => {
       }),
       /\$\.payload\.deep\[1\]\.bad/,
     );
+  });
+});
+
+describe("engine-assisted write preparation", () => {
+  function createPreparationEngine() {
+    const prepareCalls: Array<{ collection: string; key: string }> = [];
+    const createDocs: unknown[] = [];
+    const updateDocs: unknown[] = [];
+    const batchDocs: unknown[][] = [];
+    const stored = new Map<string, Record<string, unknown>>();
+
+    const decodePreparedDocument = (doc: unknown): Record<string, unknown> => {
+      const serialized = getPreparedSerializedDocument(doc);
+
+      if (serialized === null) {
+        throw new Error("expected a prepared serialized document");
+      }
+
+      return JSON.parse(serialized) as Record<string, unknown>;
+    };
+
+    const engine: QueryEngine<never> = {
+      prepareDocumentForWrite(doc, collection, key) {
+        prepareCalls.push({ collection, key });
+        return prepareDocumentForStorage(doc, collection, key, "serialize");
+      },
+      async get(collection, key) {
+        return stored.get(`${collection}:${key}`) ?? null;
+      },
+      async create(collection, key, doc) {
+        createDocs.push(doc);
+        stored.set(`${collection}:${key}`, decodePreparedDocument(doc));
+      },
+      async put(collection, key, doc) {
+        stored.set(`${collection}:${key}`, decodePreparedDocument(doc));
+      },
+      async update(collection, key, doc) {
+        updateDocs.push(doc);
+        stored.set(`${collection}:${key}`, decodePreparedDocument(doc));
+      },
+      async delete(collection, key) {
+        stored.delete(`${collection}:${key}`);
+      },
+      async query() {
+        return { documents: [], cursor: null };
+      },
+      async batchGet() {
+        return [];
+      },
+      async batchSet(collection, items) {
+        batchDocs.push(items.map((item) => item.doc));
+
+        for (const item of items) {
+          stored.set(`${collection}:${item.key}`, decodePreparedDocument(item.doc));
+        }
+      },
+      async batchDelete(collection, keys) {
+        for (const key of keys) {
+          stored.delete(`${collection}:${key}`);
+        }
+      },
+      migration: {
+        async acquireLock() {
+          return null;
+        },
+        async releaseLock() {},
+        async getOutdated() {
+          return { documents: [], cursor: null };
+        },
+      },
+    };
+
+    return {
+      batchDocs,
+      createDocs,
+      engine,
+      prepareCalls,
+      updateDocs,
+    };
+  }
+
+  test("create, update, and batchSet reuse engine-provided write preparation", async () => {
+    const { batchDocs, createDocs, engine, prepareCalls, updateDocs } = createPreparationEngine();
+    const store = createStore(engine, [buildBlobV1()]);
+
+    await store.blob.create("b1", {
+      id: "b1",
+      payload: { nested: "create" },
+    });
+    await store.blob.update("b1", {
+      payload: { nested: "update" },
+    });
+    await store.blob.batchSet([
+      {
+        key: "b2",
+        data: { id: "b2", payload: { nested: "batch-1" } },
+      },
+      {
+        key: "b3",
+        data: { id: "b3", payload: { nested: "batch-2" } },
+      },
+    ]);
+
+    expect(prepareCalls).toEqual([
+      { collection: "blob", key: "b1" },
+      { collection: "blob", key: "b1" },
+      { collection: "blob", key: "b2" },
+      { collection: "blob", key: "b3" },
+    ]);
+
+    expect(getPreparedSerializedDocument(createDocs[0])).toContain('"nested":"create"');
+    expect(getPreparedSerializedDocument(updateDocs[0])).toContain('"nested":"update"');
+    expect(batchDocs).toHaveLength(1);
+    expect(getPreparedSerializedDocument(batchDocs[0]?.[0])).toContain('"nested":"batch-1"');
+    expect(getPreparedSerializedDocument(batchDocs[0]?.[1])).toContain('"nested":"batch-2"');
+  });
+
+  test("engine-provided write preparation preserves JSON compatibility errors", async () => {
+    const { createDocs, engine, prepareCalls } = createPreparationEngine();
+    const store = createStore(engine, [buildBlobV1()]);
+
+    await expectReject(
+      store.blob.create("invalid", {
+        id: "invalid",
+        payload: BigInt(1),
+      }),
+      /not JSON-compatible/,
+    );
+
+    expect(prepareCalls).toEqual([{ collection: "blob", key: "invalid" }]);
+    expect(createDocs).toHaveLength(0);
   });
 });
 

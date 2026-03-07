@@ -1,5 +1,6 @@
 import type { ProjectionSkipReason } from "./model";
 
+import { prepareDocumentForStorage, type PreparedDocument } from "./engines/document-preparation";
 import {
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
@@ -374,9 +375,6 @@ function resolveUniqueConstraintLockOptions(
   };
 }
 
-type JsonPrimitive = string | number | boolean | null;
-type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
-
 const DEFAULT_UNIQUE_CONSTRAINT_PRECHECK_CONCURRENCY = 8;
 
 function resolveUniqueConstraintPrecheckConcurrency(
@@ -395,103 +393,6 @@ function resolveUniqueConstraintPrecheckConcurrency(
   }
 
   return concurrency;
-}
-
-function ensureJsonCompatibleDocument(
-  value: object,
-  collection: string,
-  key: string,
-): Record<string, unknown> {
-  const visited = new WeakSet<object>();
-
-  const visit = (candidate: unknown, path: string): void => {
-    if (candidate === null) {
-      return;
-    }
-
-    const candidateType = typeof candidate;
-
-    if (candidateType === "string" || candidateType === "boolean") {
-      return;
-    }
-
-    if (candidateType === "number") {
-      if (!Number.isFinite(candidate as number)) {
-        throw new Error(
-          `Document "${key}" in model "${collection}" is not JSON-compatible at ${path}: non-finite numbers are not allowed`,
-        );
-      }
-
-      return;
-    }
-
-    if (candidateType === "undefined") {
-      throw new Error(
-        `Document "${key}" in model "${collection}" is not JSON-compatible at ${path}: undefined is not allowed`,
-      );
-    }
-
-    if (candidateType === "bigint") {
-      throw new Error(
-        `Document "${key}" in model "${collection}" is not JSON-compatible at ${path}: bigint is not allowed`,
-      );
-    }
-
-    if (candidateType === "symbol") {
-      throw new Error(
-        `Document "${key}" in model "${collection}" is not JSON-compatible at ${path}: symbol is not allowed`,
-      );
-    }
-
-    if (candidateType === "function") {
-      throw new Error(
-        `Document "${key}" in model "${collection}" is not JSON-compatible at ${path}: function is not allowed`,
-      );
-    }
-
-    if (candidateType !== "object") {
-      throw new Error(
-        `Document "${key}" in model "${collection}" is not JSON-compatible at ${path}: unsupported value type`,
-      );
-    }
-
-    const objectValue = candidate as object;
-
-    if (visited.has(objectValue)) {
-      throw new Error(
-        `Document "${key}" in model "${collection}" is not JSON-compatible at ${path}: circular references are not allowed`,
-      );
-    }
-
-    visited.add(objectValue);
-
-    if (Array.isArray(candidate)) {
-      for (let i = 0; i < candidate.length; i++) {
-        visit(candidate[i], `${path}[${String(i)}]`);
-      }
-      return;
-    }
-
-    const proto = Object.getPrototypeOf(candidate);
-
-    if (proto !== Object.prototype && proto !== null) {
-      const constructorName =
-        (candidate as { constructor?: { name?: string } }).constructor?.name ?? "Object";
-      throw new Error(
-        `Document "${key}" in model "${collection}" is not JSON-compatible at ${path}: unsupported object type "${constructorName}"`,
-      );
-    }
-
-    const entries = Object.entries(candidate as Record<string, unknown>);
-
-    for (const [entryKey, entryValue] of entries) {
-      visit(entryValue, `${path}.${entryKey}`);
-    }
-  };
-
-  visit(value as JsonValue, "$");
-
-  return value as Record<string, unknown>;
 }
 
 async function forEachWithConcurrencyLimit<T>(
@@ -806,7 +707,7 @@ class BoundModelImpl<
     const prepared: {
       key: string;
       validated: T;
-      doc: object;
+      doc: Record<string, unknown> | PreparedDocument;
       indexes: Record<string, string>;
       uniqueIndexes: Record<string, string>;
       migrationMetadata: MigrationDocumentMetadata;
@@ -980,14 +881,21 @@ class BoundModelImpl<
   }
 
   // Stamps the version and index names onto a document for storage.
-  private stamp(data: object, key: string): Record<string, unknown> {
+  private stamp(data: object, key: string): Record<string, unknown> | PreparedDocument {
     const stamped = {
       ...data,
       [this.model.options.versionField]: this.model.latestVersion,
       [this.model.options.indexesField]: this.model.indexNames,
     };
 
-    return ensureJsonCompatibleDocument(stamped, this.model.name, key);
+    if (this.engine.prepareDocumentForWrite) {
+      return this.engine.prepareDocumentForWrite(stamped, this.model.name, key);
+    }
+
+    return prepareDocumentForStorage(stamped, this.model.name, key, "clone").value as Record<
+      string,
+      unknown
+    >;
   }
 
   private currentMigrationMetadata(): MigrationDocumentMetadata {
