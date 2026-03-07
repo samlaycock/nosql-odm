@@ -561,6 +561,32 @@ describe("non-SQL query pushdown", () => {
     expect(result.documents.map((doc) => doc.key)).toEqual(["u2"]);
   });
 
+  test("mongodb query preserves contradictory eq and begins filters", async () => {
+    const engine = mongoDbEngine({
+      database: new FakeMongoDatabase(mongoDocs, mongoMeta),
+    });
+
+    const result = await engine.query("users", {
+      index: "byEmail",
+      filter: { value: { $eq: "c@example.com", $begins: "b" } },
+    });
+
+    expect(mongoDocs.lastFindFilter).toEqual({
+      collection: "users",
+      $and: [
+        {
+          "indexes.byEmail": {
+            $regex: "^b",
+          },
+        },
+        {
+          "indexes.byEmail": "c@example.com",
+        },
+      ],
+    });
+    expect(result.documents).toEqual([]);
+  });
+
   test("mongodb query can reject unsupported filters instead of scanning", async () => {
     const engine = mongoDbEngine({
       database: new FakeMongoDatabase(mongoDocs, mongoMeta),
@@ -626,6 +652,31 @@ describe("non-SQL query pushdown", () => {
     });
   });
 
+  test("mongodb query paginates correctly for multi-clause native filters", async () => {
+    const engine = mongoDbEngine({
+      database: new FakeMongoDatabase(mongoDocs, mongoMeta),
+    });
+
+    const first = await engine.query("users", {
+      index: "byEmail",
+      filter: { value: { $between: ["a@example.com", "c@example.com"], $gt: "a@example.com" } },
+      sort: "asc",
+      limit: 1,
+    });
+    const second = await engine.query("users", {
+      index: "byEmail",
+      filter: { value: { $between: ["a@example.com", "c@example.com"], $gt: "a@example.com" } },
+      sort: "asc",
+      cursor: first.cursor ?? undefined,
+      limit: 1,
+    });
+
+    expect(first.documents.map((doc) => doc.key)).toEqual(["u2"]);
+    expect(first.cursor).toBe("u2");
+    expect(second.documents.map((doc) => doc.key)).toEqual(["u3"]);
+    expect(second.cursor).toBeNull();
+  });
+
   test("mongodb queryWithMetadata reports fallback scans with operation context", async () => {
     const events: Array<Record<string, unknown>> = [];
     const engine = mongoDbEngine({
@@ -653,6 +704,11 @@ describe("non-SQL query pushdown", () => {
   });
 
   test("mongodb fallback hook errors do not suppress rejectUnsupportedQueries errors", async () => {
+    const originalConsoleError = console.error;
+    const logged: unknown[][] = [];
+    console.error = (...args: unknown[]) => {
+      logged.push(args);
+    };
     const engine = mongoDbEngine({
       database: new FakeMongoDatabase(mongoDocs, mongoMeta),
       rejectUnsupportedQueries: true,
@@ -669,10 +725,14 @@ describe("non-SQL query pushdown", () => {
       });
     } catch (candidate) {
       error = candidate;
+    } finally {
+      console.error = originalConsoleError;
     }
 
     expect(error).toBeInstanceOf(Error);
     expect((error as Error).message).toMatch(/unsupported/i);
+    expect(logged).toHaveLength(1);
+    expect(String(logged[0]?.[0])).toContain("onQueryFallbackScan");
   });
 
   test("firestore query pushes supported index filters into where clauses", async () => {
