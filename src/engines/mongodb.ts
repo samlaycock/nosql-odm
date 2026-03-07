@@ -891,7 +891,9 @@ function handleMongoQueryFallback(params: HandleMongoQueryFallbackParams): void 
       operation: params.operation,
       reason: params.reason,
     });
-  } catch {}
+  } catch (error) {
+    console.error("[nosql-odm] onQueryFallbackScan threw", error);
+  }
 
   if (params.reason === "unsupported_filter" && params.rejectUnsupportedQueries) {
     throw new Error(
@@ -1028,6 +1030,28 @@ function buildMongoIndexFilter(
     };
   }
 
+  const beginsValue =
+    filter.$begins !== undefined ? normalizeMongoFilterValue(filter.$begins) : undefined;
+  const eqValue = filter.$eq !== undefined ? normalizeMongoFilterValue(filter.$eq) : undefined;
+
+  if (beginsValue !== undefined && eqValue !== undefined && !eqValue.startsWith(beginsValue)) {
+    return {
+      kind: "supported",
+      predicate: {
+        $and: [
+          {
+            [indexField]: {
+              $regex: `^${escapeMongoRegex(beginsValue)}`,
+            },
+          },
+          {
+            [indexField]: eqValue,
+          },
+        ],
+      },
+    };
+  }
+
   const clauses: Record<string, unknown>[] = [];
 
   if (filter.$between !== undefined) {
@@ -1072,8 +1096,7 @@ function buildMongoIndexFilter(
     });
   }
 
-  if (filter.$begins !== undefined && filter.$eq === undefined) {
-    const beginsValue = normalizeMongoFilterValue(filter.$begins);
+  if (beginsValue !== undefined && eqValue === undefined) {
     clauses.push({
       [indexField]: {
         $regex: `^${escapeMongoRegex(beginsValue)}`,
@@ -1081,9 +1104,9 @@ function buildMongoIndexFilter(
     });
   }
 
-  if (filter.$eq !== undefined) {
+  if (eqValue !== undefined) {
     clauses.push({
-      [indexField]: normalizeMongoFilterValue(filter.$eq),
+      [indexField]: eqValue,
     });
   }
 
