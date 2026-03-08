@@ -1,5 +1,57 @@
 # nosql-odm
 
+## 0.9.0
+
+### Minor Changes
+
+- 071191f: Add an explicit `allowStoreManagedUniqueConstraints` `createStore()` option to allow models with unique indexes when an engine declares `capabilities.uniqueConstraints = "none"`.
+
+  When enabled, the store accepts those models and relies on the existing store-managed lock + uniqueness pre-check guard path instead of requiring engine-level atomic unique constraints.
+
+### Patch Changes
+
+- 2927e09: Reduce MongoDB full-collection fallback scans by pushing down additional index-filter combinations, including mixed `$between` and range predicates.
+
+  Add `rejectUnsupportedQueries` to `mongoDbEngine(...)` so unsupported indexed filters can fail fast instead of silently scanning collections.
+
+  Add an `onQueryFallbackScan` hook for observing when MongoDB query methods use in-memory scan fallback.
+
+- b7b8182: Use MongoDB `bulkWrite` for `batchSet` and `batchDelete`, and for unconditional writes in `batchSetWithResult`, reducing per-item round trips on large batches.
+
+  Reserve `createdAt` sequence values in a single metadata increment per batch to preserve monotonic ordering without per-item sequence fetches.
+
+  Add MongoDB batch regression tests covering large-batch `bulkWrite` paths and conditional write conflict behavior.
+
+- 2891701: Prevent `store.update()` from silently overwriting concurrent writes when the engine exposes optimistic write tokens.
+
+  `update()` now reads via `getWithMetadata()` when available and performs a conditional single-document write using `batchSetWithResult()`. When the conditional write conflicts, the store throws a new `ConcurrentWriteError` instead of silently clobbering the newer document state.
+
+- 480be86: Optimize store-managed unique precheck conflict detection by querying with `limit: 1` instead of `limit: 10`, since these probes only need to detect existence.
+
+  Add a regression unit test that verifies unique precheck queries use existence-only limits during `batchSet()`.
+
+- 1e94ccc: Reduce repeated deep traversal on write paths by letting engines opt into store-level document preparation.
+
+  Reuse a shared JSON-compatible document preparation helper across store writes and the memory, IndexedDB, DynamoDB, Firestore, MongoDB, SQLite, MySQL, Postgres, Redis, and Cassandra adapters so clone/serialization work only happens once per write.
+
+  Add regression coverage that verifies engine-provided write preparation is used for `create()`, `update()`, and `batchSet()` while preserving the existing JSON-compatibility errors.
+
+- e7ffe31: Optimize SQLite `batchGet()` and `batchGetWithMetadata()` by fetching requested keys through batched `IN (...)` queries instead of issuing one lookup per key.
+
+  The SQLite adapter now preserves request order and duplicates while reducing database round-trips for multi-key reads.
+
+- edb5d89: Skip store-managed unique-constraint lock/precheck guards by default when an engine reports atomic unique enforcement.
+
+  `createStore(..., { allowStoreManagedUniqueConstraints: true })` now also acts as an explicit compatibility/debug override to re-enable the store-managed guard path on atomic-capable engines.
+
+- 7a0fb3d: Fix SQL engine query pagination cursors (MySQL, Postgres, SQLite) to use opaque, query-bound cursors that remain stable when the previous page's last row is deleted between requests.
+
+  This aligns SQL pagination behavior with the shared cursor helpers used by other adapters and adds regression coverage for deleted-cursor-row continuation.
+
+- 22fb55e: Prevent `store.query()` from silently falling back to a full collection scan when `index` is provided without `filter`.
+
+  The store now validates `index` and `filter` as a required pair before resolving query params, and throws a clear error for malformed queries instead of passing them through to engine scan paths.
+
 ## 0.8.0
 
 ### Minor Changes
