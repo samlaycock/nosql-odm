@@ -66,6 +66,7 @@ export type {
   QueryParams,
   KeyedDocument,
   EngineQueryResult,
+  UniqueProbeMatch,
   MigrationLock,
   AcquireLockOptions,
   MigrationCriteria,

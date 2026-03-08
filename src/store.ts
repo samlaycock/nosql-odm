@@ -14,6 +14,7 @@ import {
   type QueryEngine,
   type QueryParams,
   type QueryFilter,
+  type UniqueProbeMatch,
   type WhereFilter,
   type MigrationCriteria,
   type MigrationStatus,
@@ -1347,6 +1348,77 @@ class BoundModelImpl<
       }
     }
 
+    const assertNoConflicts = (
+      ownerKey: string,
+      indexName: string,
+      indexValue: string,
+      existingKeys: readonly string[],
+    ): void => {
+      for (const existingKey of existingKeys) {
+        if (existingKey === ownerKey) {
+          continue;
+        }
+
+        const plannedForExisting = candidateByKey.get(existingKey);
+
+        if (plannedForExisting && plannedForExisting[indexName] !== indexValue) {
+          continue;
+        }
+
+        throw new UniqueConstraintError(
+          this.model.name,
+          ownerKey,
+          indexName,
+          indexValue,
+          existingKey,
+        );
+      }
+    };
+
+    if (this.engine.probeUnique) {
+      const valuesByIndexName = new Map<string, string[]>();
+
+      for (const token of ownerByIndexValue.keys()) {
+        const separator = token.indexOf("\u0000");
+        const indexName = token.slice(0, separator);
+        const indexValue = token.slice(separator + 1);
+        const values = valuesByIndexName.get(indexName);
+
+        if (values) {
+          values.push(indexValue);
+          continue;
+        }
+
+        valuesByIndexName.set(indexName, [indexValue]);
+      }
+
+      await forEachWithConcurrencyLimit(
+        Array.from(valuesByIndexName.entries()),
+        this.uniqueConstraintPrecheckConcurrency,
+        async ([indexName, values]) => {
+          const matches = await this.engine.probeUnique!(
+            this.model.name,
+            indexName,
+            values,
+            options,
+          );
+
+          for (const match of matches) {
+            this.assertValidUniqueProbeMatch(match);
+            const ownerKey = ownerByIndexValue.get(`${indexName}\u0000${match.value}`);
+
+            if (!ownerKey) {
+              continue;
+            }
+
+            assertNoConflicts(ownerKey, indexName, match.value, match.keys);
+          }
+        },
+      );
+
+      return;
+    }
+
     await forEachWithConcurrencyLimit(
       Array.from(ownerByIndexValue.entries()),
       this.uniqueConstraintPrecheckConcurrency,
@@ -1364,27 +1436,30 @@ class BoundModelImpl<
           options,
         );
 
-        for (const { key: existingKey } of result.documents) {
-          if (existingKey === ownerKey) {
-            continue;
-          }
-
-          const plannedForExisting = candidateByKey.get(existingKey);
-
-          if (plannedForExisting && plannedForExisting[indexName] !== indexValue) {
-            continue;
-          }
-
-          throw new UniqueConstraintError(
-            this.model.name,
-            ownerKey,
-            indexName,
-            indexValue,
-            existingKey,
-          );
-        }
+        assertNoConflicts(
+          ownerKey,
+          indexName,
+          indexValue,
+          result.documents.map(({ key: existingKey }) => existingKey),
+        );
       },
     );
+  }
+
+  private assertValidUniqueProbeMatch(match: UniqueProbeMatch): void {
+    if (!Array.isArray(match.keys) || typeof match.value !== "string") {
+      throw new Error(
+        `Engine "probeUnique" must return items shaped like { value: string, keys: string[] } for model "${this.model.name}"`,
+      );
+    }
+
+    for (const key of match.keys) {
+      if (typeof key !== "string") {
+        throw new Error(
+          `Engine "probeUnique" must return string keys for model "${this.model.name}"`,
+        );
+      }
+    }
   }
 
   // Resolves query params: `where` shorthand → `index`/`filter`, or pass through

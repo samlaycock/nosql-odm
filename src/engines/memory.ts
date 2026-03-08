@@ -12,6 +12,7 @@ import {
   type ResolvedIndexKeys,
   type FieldCondition,
   type MigrationLock,
+  type UniqueProbeMatch,
 } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -224,6 +225,31 @@ export function memoryEngine(options?: MemoryEngineOptions): MemoryQueryEngine {
       const results = matchDocuments(col, params);
 
       return paginateQuery(collection, results, params);
+    },
+
+    async probeUnique(collection, indexName, values) {
+      const ownerByValue = getCollectionUniqueOwnership(collection).get(indexName);
+
+      if (!ownerByValue) {
+        return [];
+      }
+
+      const matches: UniqueProbeMatch[] = [];
+
+      for (const value of uniqueStrings(values)) {
+        const ownerKey = ownerByValue.get(value);
+
+        if (!ownerKey) {
+          continue;
+        }
+
+        matches.push({
+          value,
+          keys: [ownerKey],
+        });
+      }
+
+      return matches;
     },
 
     async batchGet(collection, keys) {
@@ -734,4 +760,8 @@ function normalizeLimit(limit: number | undefined): number | null {
   }
 
   return Math.floor(limit);
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return Array.from(new Set(values));
 }

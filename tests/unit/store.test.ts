@@ -60,6 +60,23 @@ function buildUserV1WithUniqueEmail() {
     .build();
 }
 
+function buildUserV1WithUniqueEmailAndUsername() {
+  return model("user")
+    .schema(
+      1,
+      z.object({
+        id: z.string(),
+        name: z.string(),
+        email: z.email(),
+        username: z.string(),
+      }),
+    )
+    .index({ name: "primary", value: "id" })
+    .index({ name: "byEmail", value: "email", unique: true })
+    .index({ name: "byUsername", value: "username", unique: true })
+    .build();
+}
+
 function buildUserV1WithOptionalEmail() {
   return model("user")
     .schema(
@@ -282,12 +299,42 @@ interface UniquePrecheckTracker {
   maxInFlight: number;
   values: string[];
   limits: number[];
+  queryCount: number;
+  probeCalls: Array<{
+    indexName: string;
+    values: string[];
+  }>;
   lockAcquisitions: number;
   waiters: Array<() => void>;
 }
 
-function createUniquePrecheckTrackingEngine(precheck: UniquePrecheckTracker): QueryEngine<never> {
-  return {
+function createUniquePrecheckTrackingEngine(
+  precheck: UniquePrecheckTracker,
+  options?: {
+    supportsProbeUnique?: boolean;
+  },
+): QueryEngine<never> {
+  const waitForGate = async (): Promise<void> => {
+    precheck.inFlight += 1;
+    precheck.maxInFlight = Math.max(precheck.maxInFlight, precheck.inFlight);
+
+    const gate = new Promise<void>((resolve) => {
+      precheck.waiters.push(resolve);
+    });
+
+    queueMicrotask(() => {
+      const waiters = precheck.waiters.splice(0);
+
+      for (const resolve of waiters) {
+        resolve();
+      }
+    });
+
+    await gate;
+    precheck.inFlight -= 1;
+  };
+
+  const engine: QueryEngine<never> = {
     capabilities: {
       uniqueConstraints: "atomic",
     },
@@ -299,6 +346,8 @@ function createUniquePrecheckTrackingEngine(precheck: UniquePrecheckTracker): Qu
     async update() {},
     async delete() {},
     async query(_collection, params) {
+      precheck.queryCount += 1;
+
       const indexValue = (params.filter as { value?: string } | undefined)?.value;
       if (typeof indexValue === "string") {
         precheck.values.push(indexValue);
@@ -307,23 +356,7 @@ function createUniquePrecheckTrackingEngine(precheck: UniquePrecheckTracker): Qu
         precheck.limits.push(params.limit);
       }
 
-      precheck.inFlight += 1;
-      precheck.maxInFlight = Math.max(precheck.maxInFlight, precheck.inFlight);
-
-      const gate = new Promise<void>((resolve) => {
-        precheck.waiters.push(resolve);
-      });
-
-      queueMicrotask(() => {
-        const waiters = precheck.waiters.splice(0);
-
-        for (const resolve of waiters) {
-          resolve();
-        }
-      });
-
-      await gate;
-      precheck.inFlight -= 1;
+      await waitForGate();
 
       return { documents: [], cursor: null };
     },
@@ -347,6 +380,21 @@ function createUniquePrecheckTrackingEngine(precheck: UniquePrecheckTracker): Qu
       },
     },
   };
+
+  if (options?.supportsProbeUnique) {
+    engine.probeUnique = async (_collection, indexName, values) => {
+      precheck.probeCalls.push({
+        indexName,
+        values: [...values],
+      });
+      precheck.values.push(...values);
+      await waitForGate();
+
+      return [];
+    };
+  }
+
+  return engine;
 }
 
 function createNonAtomicUniqueEngine(): QueryEngine<never> {
@@ -357,6 +405,7 @@ function createNonAtomicUniqueEngine(): QueryEngine<never> {
     capabilities: {
       uniqueConstraints: "none",
     },
+    probeUnique: undefined,
     async create(collection, key, doc, indexes, options, migrationMetadata, _uniqueIndexes) {
       await base.create(collection, key, doc, indexes, options, migrationMetadata);
     },
@@ -461,6 +510,8 @@ describe("unique indexes", () => {
       maxInFlight: 0,
       values: [],
       limits: [],
+      queryCount: 0,
+      probeCalls: [],
       lockAcquisitions: 0,
       waiters: [],
     };
@@ -474,6 +525,8 @@ describe("unique indexes", () => {
     });
 
     expect(precheck.values).toEqual([]);
+    expect(precheck.queryCount).toBe(0);
+    expect(precheck.probeCalls).toEqual([]);
     expect(precheck.lockAcquisitions).toBe(0);
   });
 
@@ -551,6 +604,8 @@ describe("unique indexes", () => {
       maxInFlight: 0,
       values: [],
       limits: [],
+      queryCount: 0,
+      probeCalls: [],
       lockAcquisitions: 0,
       waiters: [],
     };
@@ -572,6 +627,8 @@ describe("unique indexes", () => {
       "robin@example.com",
       "sam@example.com",
     ]);
+    expect(precheck.queryCount).toBe(4);
+    expect(precheck.probeCalls).toEqual([]);
     expect(precheck.maxInFlight).toBeGreaterThan(1);
   });
 
@@ -581,6 +638,8 @@ describe("unique indexes", () => {
       maxInFlight: 0,
       values: [],
       limits: [],
+      queryCount: 0,
+      probeCalls: [],
       lockAcquisitions: 0,
       waiters: [],
     };
@@ -608,6 +667,8 @@ describe("unique indexes", () => {
       maxInFlight: 0,
       values: [],
       limits: [],
+      queryCount: 0,
+      probeCalls: [],
       lockAcquisitions: 0,
       waiters: [],
     };
@@ -624,6 +685,68 @@ describe("unique indexes", () => {
 
     expect(precheck.limits).toHaveLength(3);
     expect(precheck.limits).toEqual([1, 1, 1]);
+  });
+
+  test("batchSet batches unique probes by index when the engine supports it", async () => {
+    const precheck: UniquePrecheckTracker = {
+      inFlight: 0,
+      maxInFlight: 0,
+      values: [],
+      limits: [],
+      queryCount: 0,
+      probeCalls: [],
+      lockAcquisitions: 0,
+      waiters: [],
+    };
+    const trackingEngine = createUniquePrecheckTrackingEngine(precheck, {
+      supportsProbeUnique: true,
+    });
+    const store = createStore(trackingEngine, [buildUserV1WithUniqueEmailAndUsername()], {
+      allowStoreManagedUniqueConstraints: true,
+    });
+
+    await store.user.batchSet([
+      {
+        key: "u1",
+        data: {
+          id: "u1",
+          name: "Sam",
+          email: "sam@example.com",
+          username: "sam",
+        },
+      },
+      {
+        key: "u2",
+        data: {
+          id: "u2",
+          name: "Jamie",
+          email: "jamie@example.com",
+          username: "jamie",
+        },
+      },
+      {
+        key: "u3",
+        data: {
+          id: "u3",
+          name: "Casey",
+          email: "casey@example.com",
+          username: "casey",
+        },
+      },
+    ]);
+
+    expect(precheck.queryCount).toBe(0);
+    expect(precheck.probeCalls).toEqual([
+      {
+        indexName: "byEmail",
+        values: ["sam@example.com", "jamie@example.com", "casey@example.com"],
+      },
+      {
+        indexName: "byUsername",
+        values: ["sam", "jamie", "casey"],
+      },
+    ]);
+    expect(precheck.maxInFlight).toBeGreaterThan(1);
   });
 
   test("create allows multiple documents with missing optional unique index values", async () => {
