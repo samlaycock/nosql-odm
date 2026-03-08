@@ -2238,15 +2238,15 @@ describe("engine-assisted write preparation", () => {
     const store = createStore(engine, [buildBlobV1()]);
     const shared = { leaf: "value" };
 
-    expect(
-      store.blob.create("diamond", {
-        id: "diamond",
-        payload: {
-          left: shared,
-          right: shared,
-        },
-      }),
-    ).resolves.toEqual({
+    const created = await store.blob.create("diamond", {
+      id: "diamond",
+      payload: {
+        left: shared,
+        right: shared,
+      },
+    });
+
+    expect(created).toEqual({
       id: "diamond",
       payload: {
         left: { leaf: "value" },
