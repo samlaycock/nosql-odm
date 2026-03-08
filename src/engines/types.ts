@@ -179,6 +179,15 @@ export interface EngineQueryResult {
   cursor: string | null;
 }
 
+/**
+ * Result for a batched unique-value existence probe.
+ * Implementations may omit values that have no owning documents.
+ */
+export interface UniqueProbeMatch {
+  value: string;
+  keys: string[];
+}
+
 // ---------------------------------------------------------------------------
 // Migration
 // ---------------------------------------------------------------------------
@@ -292,6 +301,16 @@ export interface QueryEngine<TOptions = Record<string, unknown>> {
     params: QueryParams,
     options?: TOptions,
   ): Promise<EngineQueryResult>;
+  /**
+   * Optional batched existence probe used by store-managed unique guards to
+   * check many values for the same index in a single engine round trip.
+   */
+  probeUnique?(
+    collection: string,
+    indexName: string,
+    values: string[],
+    options?: TOptions,
+  ): Promise<UniqueProbeMatch[]>;
 
   batchGet(collection: string, keys: string[], options?: TOptions): Promise<KeyedDocument[]>;
   batchGetWithMetadata?(
