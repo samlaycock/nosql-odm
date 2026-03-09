@@ -312,6 +312,7 @@ function createUniquePrecheckTrackingEngine(
   precheck: UniquePrecheckTracker,
   options?: {
     supportsProbeUnique?: boolean;
+    probeMatchesByIndexName?: Record<string, Array<{ value: string; keys: string[] }>>;
   },
 ): QueryEngine<never> {
   const waitForGate = async (): Promise<void> => {
@@ -390,7 +391,7 @@ function createUniquePrecheckTrackingEngine(
       precheck.values.push(...values);
       await waitForGate();
 
-      return [];
+      return options.probeMatchesByIndexName?.[indexName] ?? [];
     };
   }
 
@@ -747,6 +748,55 @@ describe("unique indexes", () => {
       },
     ]);
     expect(precheck.maxInFlight).toBeGreaterThan(1);
+  });
+
+  test("batchSet throws UniqueConstraintError when probeUnique detects a conflict", async () => {
+    const precheck: UniquePrecheckTracker = {
+      inFlight: 0,
+      maxInFlight: 0,
+      values: [],
+      limits: [],
+      queryCount: 0,
+      probeCalls: [],
+      lockAcquisitions: 0,
+      waiters: [],
+    };
+    const trackingEngine = createUniquePrecheckTrackingEngine(precheck, {
+      supportsProbeUnique: true,
+      probeMatchesByIndexName: {
+        byEmail: [
+          {
+            value: "sam@example.com",
+            keys: ["existing-user"],
+          },
+        ],
+      },
+    });
+    const store = createStore(trackingEngine, [buildUserV1WithUniqueEmail()], {
+      allowStoreManagedUniqueConstraints: true,
+    });
+
+    await expectReject(
+      store.user.batchSet([
+        {
+          key: "u1",
+          data: {
+            id: "u1",
+            name: "Sam",
+            email: "sam@example.com",
+          },
+        },
+      ]),
+      UniqueConstraintError,
+    );
+
+    expect(precheck.queryCount).toBe(0);
+    expect(precheck.probeCalls).toEqual([
+      {
+        indexName: "byEmail",
+        values: ["sam@example.com"],
+      },
+    ]);
   });
 
   test("create allows multiple documents with missing optional unique index values", async () => {
