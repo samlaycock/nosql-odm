@@ -1001,8 +1001,12 @@ class BoundModelImpl<
   private currentQuerySignatureSalt(): string {
     return JSON.stringify({
       latestVersion: this.model.latestVersion,
-      indexSignature: this.computeIndexSignature(this.model.indexNames),
+      indexSignature: this.computeCursorIndexSignature(this.model.indexNames),
     });
+  }
+
+  private computeCursorIndexSignature(indexes: readonly string[]): string {
+    return this.computeIndexSignature([...indexes].sort());
   }
 
   createMigrationContext(): MigrationModelContext {
