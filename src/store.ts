@@ -1447,7 +1447,12 @@ class BoundModelImpl<
   }
 
   private assertValidUniqueProbeMatch(match: UniqueProbeMatch): void {
-    if (!Array.isArray(match.keys) || typeof match.value !== "string") {
+    if (
+      match === null ||
+      typeof match !== "object" ||
+      !Array.isArray(match.keys) ||
+      typeof match.value !== "string"
+    ) {
       throw new Error(
         `Engine "probeUnique" must return items shaped like { value: string, keys: string[] } for model "${this.model.name}"`,
       );

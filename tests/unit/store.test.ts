@@ -737,16 +737,19 @@ describe("unique indexes", () => {
     ]);
 
     expect(precheck.queryCount).toBe(0);
-    expect(precheck.probeCalls).toEqual([
-      {
-        indexName: "byEmail",
-        values: ["sam@example.com", "jamie@example.com", "casey@example.com"],
-      },
-      {
-        indexName: "byUsername",
-        values: ["sam", "jamie", "casey"],
-      },
-    ]);
+    expect(precheck.probeCalls).toHaveLength(2);
+    expect(precheck.probeCalls).toEqual(
+      expect.arrayContaining([
+        {
+          indexName: "byEmail",
+          values: ["sam@example.com", "jamie@example.com", "casey@example.com"],
+        },
+        {
+          indexName: "byUsername",
+          values: ["sam", "jamie", "casey"],
+        },
+      ]),
+    );
     expect(precheck.maxInFlight).toBeGreaterThan(1);
   });
 
@@ -797,6 +800,42 @@ describe("unique indexes", () => {
         values: ["sam@example.com"],
       },
     ]);
+  });
+
+  test("batchSet throws a descriptive error when probeUnique returns malformed matches", async () => {
+    const precheck: UniquePrecheckTracker = {
+      inFlight: 0,
+      maxInFlight: 0,
+      values: [],
+      limits: [],
+      queryCount: 0,
+      probeCalls: [],
+      lockAcquisitions: 0,
+      waiters: [],
+    };
+    const trackingEngine = createUniquePrecheckTrackingEngine(precheck, {
+      supportsProbeUnique: true,
+      probeMatchesByIndexName: {
+        byEmail: [null as never],
+      },
+    });
+    const store = createStore(trackingEngine, [buildUserV1WithUniqueEmail()], {
+      allowStoreManagedUniqueConstraints: true,
+    });
+
+    await expectReject(
+      store.user.batchSet([
+        {
+          key: "u1",
+          data: {
+            id: "u1",
+            name: "Sam",
+            email: "sam@example.com",
+          },
+        },
+      ]),
+      /probeUnique.*value: string, keys: string\[\]/,
+    );
   });
 
   test("create allows multiple documents with missing optional unique index values", async () => {
