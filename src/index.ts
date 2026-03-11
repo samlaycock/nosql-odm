@@ -1,3 +1,5 @@
+export { ERROR_CODES, type CodedError, type ErrorCode, NosqlOdmError } from "./errors";
+
 export {
   model,
   type ModelDefinition,

@@ -6,6 +6,7 @@ import {
   type MigrationLock,
   type QueryEngine,
 } from "./engines/types";
+import { ERROR_CODES, NosqlOdmError } from "./errors";
 
 export interface MigrationRunOptions {
   /** Lock TTL in milliseconds. If provided, stale locks can be replaced by the engine. */
@@ -193,10 +194,11 @@ const PROJECTION_CONCURRENCY = 8;
 const FAST_PAGE_MS = 500;
 const SLOW_PAGE_MS = 2000;
 
-export class MigrationScopeConflictError extends Error {
+export class MigrationScopeConflictError extends NosqlOdmError<
+  typeof ERROR_CODES.MIGRATION_SCOPE_CONFLICT
+> {
   constructor(message: string) {
-    super(message);
-    this.name = "MigrationScopeConflictError";
+    super("MigrationScopeConflictError", ERROR_CODES.MIGRATION_SCOPE_CONFLICT, message);
   }
 }
 

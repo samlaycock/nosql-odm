@@ -1282,12 +1282,36 @@ const User = model("user", {
 Common errors surfaced by store/model APIs:
 
 - `DocumentAlreadyExistsError`: `create()` key already exists.
+- `DocumentNotFoundError`: `findByKey()`/`update()` target document does not exist.
+- `ConcurrentWriteError`: optimistic/conditional update token no longer matches.
 - `UniqueConstraintError`: unique index conflict on `create`, `update`, or `batchSet`.
 - `MigrationProjectionError`: projection failed and model is in strict mode (`migrationErrors: "throw"`).
 - `MigrationAlreadyRunningError`: `migrateAll()`/paging hit a busy migration lock.
 - `MigrationScopeConflictError`: overlapping store/model migration scopes.
 - `MissingMigratorError`: no migrator configured or exposed by the selected engine.
 - `ValidationError`: input or migrated output failed schema validation.
+- `VersionError`: a document claims a version newer than the model supports.
+- `MigrationError`: a schema version is missing its required `migrate` function.
+
+All exported public error classes also expose a stable `code` property. The `ERROR_CODES`
+export contains the canonical string constants.
+
+| Error class                        | `code`                               |
+| ---------------------------------- | ------------------------------------ |
+| `DocumentAlreadyExistsError`       | `DOCUMENT_ALREADY_EXISTS`            |
+| `DocumentNotFoundError`            | `DOCUMENT_NOT_FOUND`                 |
+| `ConcurrentWriteError`             | `CONCURRENT_WRITE`                   |
+| `UniqueConstraintError`            | `UNIQUE_CONSTRAINT_VIOLATION`        |
+| `MigrationProjectionError`         | `MIGRATION_PROJECTION_FAILED`        |
+| `MigrationAlreadyRunningError`     | `MIGRATION_ALREADY_RUNNING`          |
+| `MigrationScopeConflictError`      | `MIGRATION_SCOPE_CONFLICT`           |
+| `MissingMigratorError`             | `MISSING_MIGRATOR`                   |
+| `ValidationError`                  | `VALIDATION_FAILED`                  |
+| `VersionError`                     | `DOCUMENT_VERSION_AHEAD_OF_SCHEMA`   |
+| `MigrationError`                   | `MIGRATION_FUNCTION_MISSING`         |
+| `EngineDocumentAlreadyExistsError` | `ENGINE_DOCUMENT_ALREADY_EXISTS`     |
+| `EngineDocumentNotFoundError`      | `ENGINE_DOCUMENT_NOT_FOUND`          |
+| `EngineUniqueConstraintError`      | `ENGINE_UNIQUE_CONSTRAINT_VIOLATION` |
 
 ## Uniqueness Guarantees and Engine Capability Matrix
 

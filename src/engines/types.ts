@@ -4,6 +4,8 @@
 
 import type { PreparedDocument } from "./document-preparation";
 
+import { ERROR_CODES, NosqlOdmError } from "../errors";
+
 /**
  * Index values resolved to concrete strings, keyed by index key.
  * Passed to the engine on writes.
@@ -50,13 +52,18 @@ export interface BatchSetResult {
  * Engine-level duplicate-key error used by create() to signal that the
  * storage key already exists in the collection.
  */
-export class EngineDocumentAlreadyExistsError extends Error {
+export class EngineDocumentAlreadyExistsError extends NosqlOdmError<
+  typeof ERROR_CODES.ENGINE_DOCUMENT_ALREADY_EXISTS
+> {
   readonly collection: string;
   readonly key: string;
 
   constructor(collection: string, key: string) {
-    super(`Document "${key}" already exists in model "${collection}"`);
-    this.name = "EngineDocumentAlreadyExistsError";
+    super(
+      "EngineDocumentAlreadyExistsError",
+      ERROR_CODES.ENGINE_DOCUMENT_ALREADY_EXISTS,
+      `Document "${key}" already exists in model "${collection}"`,
+    );
     this.collection = collection;
     this.key = key;
   }
@@ -66,13 +73,18 @@ export class EngineDocumentAlreadyExistsError extends Error {
  * Engine-level missing-key error used by update() to signal that the
  * storage key does not exist in the collection.
  */
-export class EngineDocumentNotFoundError extends Error {
+export class EngineDocumentNotFoundError extends NosqlOdmError<
+  typeof ERROR_CODES.ENGINE_DOCUMENT_NOT_FOUND
+> {
   readonly collection: string;
   readonly key: string;
 
   constructor(collection: string, key: string) {
-    super(`Document "${key}" not found in model "${collection}"`);
-    this.name = "EngineDocumentNotFoundError";
+    super(
+      "EngineDocumentNotFoundError",
+      ERROR_CODES.ENGINE_DOCUMENT_NOT_FOUND,
+      `Document "${key}" not found in model "${collection}"`,
+    );
     this.collection = collection;
     this.key = key;
   }
@@ -82,7 +94,9 @@ export class EngineDocumentNotFoundError extends Error {
  * Engine-level unique index violation used by write methods when a unique
  * index value is already owned by another document key.
  */
-export class EngineUniqueConstraintError extends Error {
+export class EngineUniqueConstraintError extends NosqlOdmError<
+  typeof ERROR_CODES.ENGINE_UNIQUE_CONSTRAINT_VIOLATION
+> {
   readonly collection: string;
   readonly indexName: string;
   readonly indexValue: string;
@@ -97,9 +111,10 @@ export class EngineUniqueConstraintError extends Error {
     existingKey?: string | null,
   ) {
     super(
+      "EngineUniqueConstraintError",
+      ERROR_CODES.ENGINE_UNIQUE_CONSTRAINT_VIOLATION,
       `Unique index "${indexName}" violation in model "${collection}" for value "${indexValue}"`,
     );
-    this.name = "EngineUniqueConstraintError";
     this.collection = collection;
     this.indexName = indexName;
     this.indexValue = indexValue;
