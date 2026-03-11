@@ -45,6 +45,38 @@ function buildUserV1() {
     .build();
 }
 
+function buildUserV1WithByNameIndex() {
+  return model("user")
+    .schema(
+      1,
+      z.object({
+        id: z.string(),
+        name: z.string(),
+        email: z.email(),
+      }),
+    )
+    .index({ name: "primary", value: "id" })
+    .index({ name: "byEmail", value: "email" })
+    .index({ name: "byName", value: "name" })
+    .build();
+}
+
+function buildUserV1WithReorderedSecondaryIndexes() {
+  return model("user")
+    .schema(
+      1,
+      z.object({
+        id: z.string(),
+        name: z.string(),
+        email: z.email(),
+      }),
+    )
+    .index({ name: "primary", value: "id" })
+    .index({ name: "byName", value: "name" })
+    .index({ name: "byEmail", value: "email" })
+    .build();
+}
+
 function buildUserV1WithUniqueEmail() {
   return model("user")
     .schema(
@@ -1774,6 +1806,37 @@ describe("store.query() with where", () => {
         cursor: page1.cursor!,
       }),
     ).rejects.toThrow("Query cursor does not match the requested query");
+  });
+
+  test("accepts a cursor when index declarations are reordered without changing names", async () => {
+    const originalStore = createStore(engine, [buildUserV1WithByNameIndex()]);
+
+    await originalStore.user.create("u1", {
+      id: "u1",
+      name: "A",
+      email: "a@example.com",
+    });
+    await originalStore.user.create("u2", {
+      id: "u2",
+      name: "B",
+      email: "b@example.com",
+    });
+    await originalStore.user.create("u3", {
+      id: "u3",
+      name: "C",
+      email: "c@example.com",
+    });
+
+    const page1 = await originalStore.user.query({ limit: 2, sort: "asc" });
+    const reorderedStore = createStore(engine, [buildUserV1WithReorderedSecondaryIndexes()]);
+    const page2 = await reorderedStore.user.query({
+      limit: 2,
+      sort: "asc",
+      cursor: page1.cursor!,
+    });
+
+    expect(page2.documents).toHaveLength(1);
+    expect(page2.documents[0]?.id).toBe("u3");
   });
 
   test("throws when field has no index", async () => {
