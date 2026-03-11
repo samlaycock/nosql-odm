@@ -1,13 +1,17 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  ERROR_CODES,
+  type CodedError,
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
   EngineUniqueConstraintError,
-} from "../../src/engines/types";
-import { MigrationScopeConflictError } from "../../src/migrator";
-import { MigrationError, ValidationError, VersionError } from "../../src/model";
-import {
+  type ErrorCode,
+  MigrationError,
+  MigrationScopeConflictError,
+  NosqlOdmError,
+  ValidationError,
+  VersionError,
   ConcurrentWriteError,
   DocumentAlreadyExistsError,
   DocumentNotFoundError,
@@ -15,7 +19,7 @@ import {
   MigrationProjectionError,
   MissingMigratorError,
   UniqueConstraintError,
-} from "../../src/store";
+} from "../../src/index";
 
 describe("public error codes", () => {
   test("store errors expose stable code values", () => {
@@ -68,5 +72,17 @@ describe("public error codes", () => {
       "ENGINE_DOCUMENT_NOT_FOUND",
       "ENGINE_UNIQUE_CONSTRAINT_VIOLATION",
     ]);
+  });
+
+  test("public entry point exports the shared error contract", () => {
+    const error = new DocumentAlreadyExistsError("user", "u1");
+    const code: ErrorCode = ERROR_CODES.DOCUMENT_ALREADY_EXISTS;
+    const codedError: CodedError = error;
+
+    expect(ERROR_CODES.DOCUMENT_ALREADY_EXISTS).toBe("DOCUMENT_ALREADY_EXISTS");
+    expect(code).toBe("DOCUMENT_ALREADY_EXISTS");
+    expect(codedError.code).toBe("DOCUMENT_ALREADY_EXISTS");
+    expect(error).toBeInstanceOf(DocumentAlreadyExistsError);
+    expect(error).toBeInstanceOf(NosqlOdmError);
   });
 });
