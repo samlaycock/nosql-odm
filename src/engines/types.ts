@@ -137,6 +137,8 @@ export interface QueryParams {
   limit?: number;
   cursor?: string;
   sort?: "asc" | "desc";
+  /** Optional metadata used to invalidate stale cursors after query-shape changes. */
+  querySignatureSalt?: string;
 }
 
 /**

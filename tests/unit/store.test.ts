@@ -1695,6 +1695,87 @@ describe("store.query() with where", () => {
     expect(page2.documents).toHaveLength(1);
   });
 
+  test("rejects a cursor generated before a model version change", async () => {
+    const v1Store = createStore(engine, [buildUserV1()]);
+
+    await v1Store.user.create("u1", {
+      id: "u1",
+      name: "A",
+      email: "a@example.com",
+    });
+    await v1Store.user.create("u2", {
+      id: "u2",
+      name: "B",
+      email: "b@example.com",
+    });
+    await v1Store.user.create("u3", {
+      id: "u3",
+      name: "C",
+      email: "c@example.com",
+    });
+
+    const page1 = await v1Store.user.query({
+      where: { id: { $gte: "u1" } },
+      limit: 2,
+      sort: "asc",
+    });
+    const v2Store = createStore(engine, [buildUserV2()]);
+
+    return expect(
+      v2Store.user.query({
+        where: { id: { $gte: "u1" } },
+        limit: 2,
+        sort: "asc",
+        cursor: page1.cursor!,
+      }),
+    ).rejects.toThrow("Query cursor does not match the requested query");
+  });
+
+  test("rejects a cursor generated before index metadata changes", async () => {
+    const v1Store = createStore(engine, [buildUserV1()]);
+
+    await v1Store.user.create("u1", {
+      id: "u1",
+      name: "A",
+      email: "a@example.com",
+    });
+    await v1Store.user.create("u2", {
+      id: "u2",
+      name: "B",
+      email: "b@example.com",
+    });
+    await v1Store.user.create("u3", {
+      id: "u3",
+      name: "C",
+      email: "c@example.com",
+    });
+
+    const page1 = await v1Store.user.query({ limit: 2, sort: "asc" });
+    const storeWithExtraIndex = createStore(engine, [
+      model("user")
+        .schema(
+          1,
+          z.object({
+            id: z.string(),
+            name: z.string(),
+            email: z.email(),
+          }),
+        )
+        .index({ name: "primary", value: "id" })
+        .index({ name: "byEmail", value: "email" })
+        .index({ name: "byName", value: "name" })
+        .build(),
+    ]);
+
+    return expect(
+      storeWithExtraIndex.user.query({
+        limit: 2,
+        sort: "asc",
+        cursor: page1.cursor!,
+      }),
+    ).rejects.toThrow("Query cursor does not match the requested query");
+  });
+
   test("throws when field has no index", async () => {
     const store = createStore(engine, [buildUserV1()]);
 
