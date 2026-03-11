@@ -838,6 +838,47 @@ describe("unique indexes", () => {
     );
   });
 
+  test("batchSet throws a descriptive error when probeUnique returns non-string keys", async () => {
+    const precheck: UniquePrecheckTracker = {
+      inFlight: 0,
+      maxInFlight: 0,
+      values: [],
+      limits: [],
+      queryCount: 0,
+      probeCalls: [],
+      lockAcquisitions: 0,
+      waiters: [],
+    };
+    const trackingEngine = createUniquePrecheckTrackingEngine(precheck, {
+      supportsProbeUnique: true,
+      probeMatchesByIndexName: {
+        byEmail: [
+          {
+            value: "sam@example.com",
+            keys: [42 as never],
+          },
+        ],
+      },
+    });
+    const store = createStore(trackingEngine, [buildUserV1WithUniqueEmail()], {
+      allowStoreManagedUniqueConstraints: true,
+    });
+
+    await expectReject(
+      store.user.batchSet([
+        {
+          key: "u1",
+          data: {
+            id: "u1",
+            name: "Sam",
+            email: "sam@example.com",
+          },
+        },
+      ]),
+      /probeUnique.*string keys/,
+    );
+  });
+
   test("create allows multiple documents with missing optional unique index values", async () => {
     const store = createStore(engine, [buildUserV1WithOptionalUniqueEmail()]);
 
