@@ -19,6 +19,7 @@ import {
   type MigrationCriteria,
   type MigrationStatus,
 } from "./engines/types";
+import { ERROR_CODES, NosqlOdmError } from "./errors";
 import {
   DefaultMigrator,
   type MigrationHooks,
@@ -162,33 +163,46 @@ export type Store<
 // Errors
 // ---------------------------------------------------------------------------
 
-export class DocumentAlreadyExistsError extends Error {
+export class DocumentAlreadyExistsError extends NosqlOdmError<
+  typeof ERROR_CODES.DOCUMENT_ALREADY_EXISTS
+> {
   constructor(collection: string, key: string) {
-    super(`Document "${key}" already exists in model "${collection}"`);
-    this.name = "DocumentAlreadyExistsError";
+    super(
+      "DocumentAlreadyExistsError",
+      ERROR_CODES.DOCUMENT_ALREADY_EXISTS,
+      `Document "${key}" already exists in model "${collection}"`,
+    );
   }
 }
 
-export class DocumentNotFoundError extends Error {
+export class DocumentNotFoundError extends NosqlOdmError<typeof ERROR_CODES.DOCUMENT_NOT_FOUND> {
   constructor(collection: string, key: string) {
-    super(`Document "${key}" not found in model "${collection}"`);
-    this.name = "DocumentNotFoundError";
+    super(
+      "DocumentNotFoundError",
+      ERROR_CODES.DOCUMENT_NOT_FOUND,
+      `Document "${key}" not found in model "${collection}"`,
+    );
   }
 }
 
-export class ConcurrentWriteError extends Error {
+export class ConcurrentWriteError extends NosqlOdmError<typeof ERROR_CODES.CONCURRENT_WRITE> {
   readonly collection: string;
   readonly key: string;
 
   constructor(collection: string, key: string) {
-    super(`Concurrent write detected for document "${key}" in model "${collection}"`);
-    this.name = "ConcurrentWriteError";
+    super(
+      "ConcurrentWriteError",
+      ERROR_CODES.CONCURRENT_WRITE,
+      `Concurrent write detected for document "${key}" in model "${collection}"`,
+    );
     this.collection = collection;
     this.key = key;
   }
 }
 
-export class UniqueConstraintError extends Error {
+export class UniqueConstraintError extends NosqlOdmError<
+  typeof ERROR_CODES.UNIQUE_CONSTRAINT_VIOLATION
+> {
   readonly collection: string;
   readonly key: string;
   readonly indexName: string;
@@ -203,9 +217,10 @@ export class UniqueConstraintError extends Error {
     existingKey?: string | null,
   ) {
     super(
+      "UniqueConstraintError",
+      ERROR_CODES.UNIQUE_CONSTRAINT_VIOLATION,
       `Unique index "${indexName}" violation in model "${collection}" for value "${indexValue}"`,
     );
-    this.name = "UniqueConstraintError";
     this.collection = collection;
     this.key = key;
     this.indexName = indexName;
@@ -214,7 +229,9 @@ export class UniqueConstraintError extends Error {
   }
 }
 
-export class MigrationProjectionError extends Error {
+export class MigrationProjectionError extends NosqlOdmError<
+  typeof ERROR_CODES.MIGRATION_PROJECTION_FAILED
+> {
   readonly collection: string;
   readonly key: string | null;
   readonly reason: ProjectionSkipReason;
@@ -228,12 +245,11 @@ export class MigrationProjectionError extends Error {
       cause?: unknown;
     },
   ) {
-    super(
-      `Migration projection failed for model "${collection}"${
-        key ? ` and key "${key}"` : ""
-      }: ${reason}`,
-    );
-    this.name = "MigrationProjectionError";
+    const message = `Migration projection failed for model "${collection}"${
+      key ? ` and key "${key}"` : ""
+    }: ${reason}`;
+
+    super("MigrationProjectionError", ERROR_CODES.MIGRATION_PROJECTION_FAILED, message);
     this.collection = collection;
     this.key = key ?? null;
     this.reason = reason;
@@ -241,19 +257,25 @@ export class MigrationProjectionError extends Error {
   }
 }
 
-export class MigrationAlreadyRunningError extends Error {
+export class MigrationAlreadyRunningError extends NosqlOdmError<
+  typeof ERROR_CODES.MIGRATION_ALREADY_RUNNING
+> {
   constructor(collection: string) {
-    super(`Migration is already running for collection "${collection}"`);
-    this.name = "MigrationAlreadyRunningError";
+    super(
+      "MigrationAlreadyRunningError",
+      ERROR_CODES.MIGRATION_ALREADY_RUNNING,
+      `Migration is already running for collection "${collection}"`,
+    );
   }
 }
 
-export class MissingMigratorError extends Error {
+export class MissingMigratorError extends NosqlOdmError<typeof ERROR_CODES.MISSING_MIGRATOR> {
   constructor() {
     super(
+      "MissingMigratorError",
+      ERROR_CODES.MISSING_MIGRATOR,
       "No migrator is configured for this store. Pass one via createStore(..., { migrator }) or use an engine that provides engine.migrator.",
     );
-    this.name = "MissingMigratorError";
   }
 }
 

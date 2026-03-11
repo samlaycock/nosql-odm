@@ -2,6 +2,8 @@ import type { StandardSchemaV1 } from "@standard-schema/spec";
 
 import type { ResolvedIndexKeys } from "./engines/types";
 
+import { ERROR_CODES, NosqlOdmError } from "./errors";
+
 // ---------------------------------------------------------------------------
 // Public model types
 // ---------------------------------------------------------------------------
@@ -758,28 +760,37 @@ function normalizeNumericVersion(value: string): number | null {
 // Errors
 // ---------------------------------------------------------------------------
 
-export class ValidationError extends Error {
+export class ValidationError extends NosqlOdmError<typeof ERROR_CODES.VALIDATION_FAILED> {
   readonly issues: readonly StandardSchemaV1.Issue[];
 
   constructor(modelName: string, issues: readonly StandardSchemaV1.Issue[]) {
-    super(`Validation failed for model "${modelName}": ${issues.map((i) => i.message).join(", ")}`);
-    this.name = "ValidationError";
+    super(
+      "ValidationError",
+      ERROR_CODES.VALIDATION_FAILED,
+      `Validation failed for model "${modelName}": ${issues.map((i) => i.message).join(", ")}`,
+    );
     this.issues = issues;
   }
 }
 
-export class VersionError extends Error {
+export class VersionError extends NosqlOdmError<
+  typeof ERROR_CODES.DOCUMENT_VERSION_AHEAD_OF_SCHEMA
+> {
   constructor(modelName: string, docVersion: VersionValue, latestVersion: VersionValue) {
     super(
+      "VersionError",
+      ERROR_CODES.DOCUMENT_VERSION_AHEAD_OF_SCHEMA,
       `Document version ${docVersion} for model "${modelName}" exceeds latest schema version ${latestVersion}`,
     );
-    this.name = "VersionError";
   }
 }
 
-export class MigrationError extends Error {
+export class MigrationError extends NosqlOdmError<typeof ERROR_CODES.MIGRATION_FUNCTION_MISSING> {
   constructor(modelName: string, version: number) {
-    super(`Schema version ${version} for model "${modelName}" is missing a migrate function`);
-    this.name = "MigrationError";
+    super(
+      "MigrationError",
+      ERROR_CODES.MIGRATION_FUNCTION_MISSING,
+      `Schema version ${version} for model "${modelName}" is missing a migrate function`,
+    );
   }
 }
