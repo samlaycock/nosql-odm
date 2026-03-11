@@ -1,5 +1,7 @@
 import type { QueryParams } from "./types";
 
+const CURRENT_QUERY_CURSOR_VERSION = 2;
+
 export type QueryCursorPosition =
   | {
       kind: "key";
@@ -19,7 +21,7 @@ export type QueryCursorPosition =
 
 interface QueryCursorPayload {
   kind: "nosql-odm-query-cursor";
-  version: 1;
+  version: typeof CURRENT_QUERY_CURSOR_VERSION;
   signature: string;
   position: QueryCursorPosition;
 }
@@ -37,7 +39,7 @@ export function encodeQueryPageCursor(
 ): string {
   const payload: QueryCursorPayload = {
     kind: "nosql-odm-query-cursor",
-    version: 1,
+    version: CURRENT_QUERY_CURSOR_VERSION,
     signature: buildQueryCursorSignature(collection, params),
     position: buildCursorPosition(params, position),
   };
@@ -204,7 +206,7 @@ function decodeQueryPageCursor(encoded: string): QueryCursorPayload {
     throw new Error("Invalid query cursor");
   }
 
-  if (parsed.kind !== "nosql-odm-query-cursor" || parsed.version !== 1) {
+  if (parsed.kind !== "nosql-odm-query-cursor" || parsed.version !== CURRENT_QUERY_CURSOR_VERSION) {
     throw new Error("Invalid query cursor");
   }
 
@@ -216,7 +218,7 @@ function decodeQueryPageCursor(encoded: string): QueryCursorPayload {
 
   return {
     kind: "nosql-odm-query-cursor",
-    version: 1,
+    version: CURRENT_QUERY_CURSOR_VERSION,
     signature: parsed.signature,
     position,
   };
@@ -275,6 +277,7 @@ function buildQueryCursorSignature(collection: string, params: QueryParams): str
     index: params.index ?? null,
     filter: params.filter?.value ?? null,
     sort: params.sort ?? null,
+    salt: params.querySignatureSalt ?? null,
   });
 }
 

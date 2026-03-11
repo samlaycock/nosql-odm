@@ -31,6 +31,30 @@ describe("query cursor helpers", () => {
     ).toThrow("Invalid query cursor");
   });
 
+  test("rejects unsupported cursor payload versions", () => {
+    const legacyCursor = Buffer.from(
+      JSON.stringify({
+        kind: "nosql-odm-query-cursor",
+        version: 1,
+        signature: JSON.stringify({
+          collection: "users",
+          index: null,
+          filter: null,
+          sort: null,
+        }),
+        position: {
+          kind: "key",
+          key: "u1",
+        },
+      }),
+      "utf8",
+    ).toString("base64url");
+
+    expect(() =>
+      resolveQueryPageStartIndex([], "users", { cursor: legacyCursor }, position),
+    ).toThrow("Invalid query cursor");
+  });
+
   test("rejects cursors reused with different query parameters", () => {
     const params: QueryParams = {
       index: "byRole",

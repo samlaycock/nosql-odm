@@ -998,6 +998,13 @@ class BoundModelImpl<
     };
   }
 
+  private currentQuerySignatureSalt(): string {
+    return JSON.stringify({
+      latestVersion: this.model.latestVersion,
+      indexSignature: this.computeIndexSignature(this.model.indexNames),
+    });
+  }
+
   createMigrationContext(): MigrationModelContext {
     return {
       collection: this.model.name,
@@ -1495,6 +1502,7 @@ class BoundModelImpl<
         ...this.resolveWhere(params.where!),
         limit: params.limit,
         cursor: params.cursor,
+        querySignatureSalt: this.currentQuerySignatureSalt(),
         sort: params.sort,
       };
     }
@@ -1503,10 +1511,14 @@ class BoundModelImpl<
       return {
         ...params,
         index: this.resolveIndexName(params.index!),
+        querySignatureSalt: this.currentQuerySignatureSalt(),
       };
     }
 
-    return params;
+    return {
+      ...params,
+      querySignatureSalt: this.currentQuerySignatureSalt(),
+    };
   }
 
   // Resolves a user-facing index name to the engine-level index identifier.
