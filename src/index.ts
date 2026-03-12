@@ -29,6 +29,7 @@ export {
   ConcurrentWriteError,
   DocumentAlreadyExistsError,
   DocumentNotFoundError,
+  DuplicateBatchSetKeysError,
   MigrationProjectionError,
   MigrationAlreadyRunningError,
   MissingMigratorError,

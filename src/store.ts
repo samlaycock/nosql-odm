@@ -55,6 +55,11 @@ export interface BatchSetInputItem<T> {
   data: T;
 }
 
+export interface DuplicateBatchSetKeyConflict {
+  readonly key: string;
+  readonly positions: readonly number[];
+}
+
 export interface MigrationResult {
   model: string;
   status: "completed" | "skipped" | "failed";
@@ -226,6 +231,27 @@ export class UniqueConstraintError extends NosqlOdmError<
     this.indexName = indexName;
     this.indexValue = indexValue;
     this.existingKey = existingKey ?? null;
+  }
+}
+
+export class DuplicateBatchSetKeysError extends NosqlOdmError<
+  typeof ERROR_CODES.DUPLICATE_BATCH_SET_KEYS
+> {
+  readonly collection: string;
+  readonly conflicts: readonly DuplicateBatchSetKeyConflict[];
+
+  constructor(collection: string, conflicts: readonly DuplicateBatchSetKeyConflict[]) {
+    const details = conflicts
+      .map((conflict) => `"${conflict.key}" at positions [${conflict.positions.join(", ")}]`)
+      .join("; ");
+
+    super(
+      "DuplicateBatchSetKeysError",
+      ERROR_CODES.DUPLICATE_BATCH_SET_KEYS,
+      `batchSet received duplicate keys in model "${collection}": ${details}`,
+    );
+    this.collection = collection;
+    this.conflicts = conflicts;
   }
 }
 
@@ -473,6 +499,32 @@ async function forEachWithConcurrencyLimit<T>(
   if (state.firstError !== null) {
     throw state.firstError;
   }
+}
+
+function findDuplicateBatchSetKeyConflicts<T>(
+  collection: string,
+  items: readonly BatchSetInputItem<T>[],
+): DuplicateBatchSetKeyConflict[] {
+  const keyPositions = new Map<string, number[]>();
+
+  items.forEach((item, position) => {
+    if (typeof item.key !== "string") {
+      throw new Error(`Invalid document key for model "${collection}"`);
+    }
+
+    const positions = keyPositions.get(item.key);
+
+    if (positions) {
+      positions.push(position);
+      return;
+    }
+
+    keyPositions.set(item.key, [position]);
+  });
+
+  return Array.from(keyPositions.entries())
+    .filter(([, positions]) => positions.length > 1)
+    .map(([key, positions]) => ({ key, positions }));
 }
 
 // ---------------------------------------------------------------------------
@@ -730,6 +782,12 @@ class BoundModelImpl<
   }
 
   async batchSet(items: BatchSetInputItem<T>[], options?: TOptions): Promise<T[]> {
+    const duplicateKeyConflicts = findDuplicateBatchSetKeyConflicts(this.model.name, items);
+
+    if (duplicateKeyConflicts.length > 0) {
+      throw new DuplicateBatchSetKeysError(this.model.name, duplicateKeyConflicts);
+    }
+
     const prepared: {
       key: string;
       validated: T;
@@ -740,10 +798,6 @@ class BoundModelImpl<
     }[] = [];
 
     for (const item of items) {
-      if (typeof item.key !== "string") {
-        throw new Error(`Invalid document key for model "${this.model.name}"`);
-      }
-
       const validated = await this.model.validate(item.data);
 
       prepared.push({

@@ -631,6 +631,31 @@ describe("unique indexes", () => {
     expect(await store.user.findByKey("u2")).toBeNull();
   });
 
+  test("batchSet rejects duplicate keys before writing to the engine", async () => {
+    const calls: unknown[] = [];
+    const trackingEngine = memoryEngine();
+    trackingEngine.batchSet = async (_collection, items) => {
+      calls.push({ method: "batchSet", items });
+    };
+    const store = createStore(trackingEngine, [buildUserV1()]);
+
+    await expectReject(
+      store.user.batchSet([
+        {
+          key: "u1",
+          data: { id: "u1", name: "Sam", email: "sam@example.com" },
+        },
+        {
+          key: "u1",
+          data: { id: "u1", name: "Sam Duplicate", email: "sam.duplicate@example.com" },
+        },
+      ]),
+      /duplicate keys.*"u1".*0, 1/i,
+    );
+
+    expect(calls).toHaveLength(0);
+  });
+
   test("batchSet runs unique pre-check queries in parallel", async () => {
     const precheck: UniquePrecheckTracker = {
       inFlight: 0,
