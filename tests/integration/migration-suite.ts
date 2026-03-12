@@ -304,6 +304,30 @@ export function runMigrationIntegrationSuite<TOptions>(
       expect(await users.findByKey("u2")).toBeNull();
     });
 
+    test("store batchSet rejects duplicate keys atomically", async () => {
+      const engine = options.getEngine();
+      const collection = options.nextCollection("users_duplicate_batch_keys");
+      const User = buildUserModel(collection);
+      const store = createStore(engine, [User]);
+      const users = getBoundModel(store, collection);
+
+      await expectReject(
+        users.batchSet([
+          {
+            key: "u1",
+            data: { id: "u1", name: "Sam Example", email: "sam@example.com" },
+          },
+          {
+            key: "u1",
+            data: { id: "u1", name: "Sam Duplicate", email: "sam.duplicate@example.com" },
+          },
+        ]),
+        /duplicate keys.*"u1".*0, 1/i,
+      );
+
+      expect(await users.findByKey("u1")).toBeNull();
+    });
+
     test("model migrateAll migrates stale versions and reindexes latest docs", async () => {
       const engine = options.getEngine();
       const collection = options.nextCollection("users_model_all");
