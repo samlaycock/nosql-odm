@@ -15,6 +15,7 @@ import {
   EngineDocumentNotFoundError,
   type ComparableVersion,
 } from "../../src/engines/types";
+import { runQueryEngineConformanceSuite } from "./conformance-suite";
 import { createCollectionNameFactory, createTestResourceName, expectReject } from "./helpers";
 import { runMigrationIntegrationSuite } from "./migration-suite";
 
@@ -128,6 +129,12 @@ describe("postgresEngine integration", () => {
   });
 
   runMigrationIntegrationSuite({
+    engineName: "postgresEngine integration",
+    getEngine: () => engine,
+    nextCollection,
+  });
+
+  runQueryEngineConformanceSuite({
     engineName: "postgresEngine integration",
     getEngine: () => engine,
     nextCollection,

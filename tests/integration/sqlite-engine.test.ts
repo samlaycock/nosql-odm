@@ -4,6 +4,7 @@ import { Database as BunDatabase } from "bun:sqlite";
 import { afterEach, beforeEach } from "bun:test";
 
 import { sqliteEngine, type SqliteQueryEngine } from "../../src/engines/sqlite";
+import { runQueryEngineConformanceSuite } from "./conformance-suite";
 import { createCollectionNameFactory } from "./helpers";
 import { runMigrationIntegrationSuite } from "./migration-suite";
 
@@ -70,6 +71,12 @@ afterEach(() => {
 });
 
 runMigrationIntegrationSuite({
+  engineName: "sqliteEngine integration",
+  getEngine: () => engine,
+  nextCollection,
+});
+
+runQueryEngineConformanceSuite({
   engineName: "sqliteEngine integration",
   getEngine: () => engine,
   nextCollection,

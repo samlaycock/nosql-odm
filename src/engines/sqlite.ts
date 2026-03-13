@@ -26,7 +26,7 @@ import {
   type ResolvedIndexKeys,
 } from "./types";
 
-const LATEST_SCHEMA_VERSION = 2;
+const LATEST_SCHEMA_VERSION = 3;
 const OUTDATED_PAGE_LIMIT = 100;
 const OUTDATED_SCAN_CHUNK_SIZE = 256;
 const SQLITE_MAX_VARIABLES = 999;
@@ -136,8 +136,17 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
     `DELETE FROM index_entries WHERE collection = ? AND doc_key = ?`,
   );
 
+  const deleteUniqueIndexesForDocumentStmt = db.prepare<[string, string]>(
+    `DELETE FROM unique_index_entries WHERE collection = ? AND doc_key = ?`,
+  );
+
   const insertIndexStmt = db.prepare<[string, string, string, string]>(`
     INSERT INTO index_entries (collection, doc_key, index_name, index_value)
+    VALUES (?, ?, ?, ?)
+  `);
+
+  const insertUniqueIndexStmt = db.prepare<[string, string, string, string]>(`
+    INSERT INTO unique_index_entries (collection, doc_key, index_name, index_value)
     VALUES (?, ?, ?, ?)
   `);
 
@@ -147,7 +156,7 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
   >(
     `
       SELECT doc_key
-      FROM index_entries
+      FROM unique_index_entries
       WHERE collection = ?
         AND index_name = ?
         AND index_value = ?
@@ -321,19 +330,61 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
     collection: string,
     key: string,
     uniqueIndexes: ResolvedIndexKeys,
+    stagedOwners?: Map<string, string>,
   ): void => {
     for (const [indexName, indexValue] of Object.entries(uniqueIndexes)) {
-      const conflict = selectUniqueConflictStmt.get(collection, indexName, String(indexValue), key);
+      const normalizedValue = String(indexValue);
+      const conflict = selectUniqueConflictStmt.get(collection, indexName, normalizedValue, key);
 
       if (conflict) {
         throw new EngineUniqueConstraintError(
           collection,
           key,
           indexName,
-          String(indexValue),
+          normalizedValue,
           conflict.doc_key,
         );
       }
+
+      const stagedConflict = stagedOwners?.get(getUniqueOwnershipKey(indexName, normalizedValue));
+
+      if (stagedConflict && stagedConflict !== key) {
+        throw new EngineUniqueConstraintError(
+          collection,
+          key,
+          indexName,
+          normalizedValue,
+          stagedConflict,
+        );
+      }
+    }
+  };
+
+  const replaceUniqueIndexes = (
+    collection: string,
+    key: string,
+    uniqueIndexes: ResolvedIndexKeys,
+  ): void => {
+    deleteUniqueIndexesForDocumentStmt.run(collection, key);
+
+    for (const [indexName, indexValue] of Object.entries(uniqueIndexes)) {
+      insertUniqueIndexStmt.run(collection, key, indexName, String(indexValue));
+    }
+  };
+
+  const rememberStagedUniqueIndexes = (
+    key: string,
+    uniqueIndexes: ResolvedIndexKeys,
+    stagedOwners: Map<string, string>,
+  ): void => {
+    for (const [ownershipKey, ownerKey] of stagedOwners) {
+      if (ownerKey === key) {
+        stagedOwners.delete(ownershipKey);
+      }
+    }
+
+    for (const [indexName, indexValue] of Object.entries(uniqueIndexes)) {
+      stagedOwners.set(getUniqueOwnershipKey(indexName, String(indexValue)), key);
     }
   };
 
@@ -349,6 +400,7 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
       assertUniqueIndexes(collection, key, uniqueIndexes);
       upsertDocumentStmt.run(collection, key, docJson);
       deleteIndexesForDocumentStmt.run(collection, key);
+      replaceUniqueIndexes(collection, key, uniqueIndexes);
 
       for (const [indexName, indexValue] of Object.entries(indexes)) {
         insertIndexStmt.run(collection, key, indexName, String(indexValue));
@@ -382,6 +434,7 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
       }
 
       deleteIndexesForDocumentStmt.run(collection, key);
+      replaceUniqueIndexes(collection, key, uniqueIndexes);
 
       for (const [indexName, indexValue] of Object.entries(indexes)) {
         insertIndexStmt.run(collection, key, indexName, String(indexValue));
@@ -408,6 +461,7 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
     ) => {
       assertUniqueIndexes(collection, key, uniqueIndexes);
       insertDocumentStmt.run(collection, key, docJson);
+      replaceUniqueIndexes(collection, key, uniqueIndexes);
 
       for (const [indexName, indexValue] of Object.entries(indexes)) {
         insertIndexStmt.run(collection, key, indexName, String(indexValue));
@@ -434,10 +488,14 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
         metadata: MigrationMetadata;
       }[],
     ): void => {
+      const stagedOwners = new Map<string, string>();
+
       for (const item of items) {
-        assertUniqueIndexes(collection, item.key, item.uniqueIndexes);
+        assertUniqueIndexes(collection, item.key, item.uniqueIndexes, stagedOwners);
         upsertDocumentStmt.run(collection, item.key, item.docJson);
         deleteIndexesForDocumentStmt.run(collection, item.key);
+        replaceUniqueIndexes(collection, item.key, item.uniqueIndexes);
+        rememberStagedUniqueIndexes(item.key, item.uniqueIndexes, stagedOwners);
 
         for (const [indexName, indexValue] of Object.entries(item.indexes)) {
           insertIndexStmt.run(collection, item.key, indexName, String(indexValue));
@@ -468,9 +526,10 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
     ): BatchSetResult => {
       const persistedKeys: string[] = [];
       const conflictedKeys: string[] = [];
+      const stagedOwners = new Map<string, string>();
 
       for (const item of items) {
-        assertUniqueIndexes(collection, item.key, item.uniqueIndexes);
+        assertUniqueIndexes(collection, item.key, item.uniqueIndexes, stagedOwners);
 
         if (item.expectedWriteToken !== undefined) {
           const expectedWriteVersion = parseWriteToken(item.expectedWriteToken);
@@ -491,6 +550,8 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
         }
 
         deleteIndexesForDocumentStmt.run(collection, item.key);
+        replaceUniqueIndexes(collection, item.key, item.uniqueIndexes);
+        rememberStagedUniqueIndexes(item.key, item.uniqueIndexes, stagedOwners);
 
         for (const [indexName, indexValue] of Object.entries(item.indexes)) {
           insertIndexStmt.run(collection, item.key, indexName, String(indexValue));
@@ -973,6 +1034,25 @@ function runMigrations(db: Database.Database): void {
     if (fromVersion < 2) {
       ensureColumn(db, "documents", "write_version", "INTEGER NOT NULL DEFAULT 1");
       ensureMigrationMetadataSchema(db);
+    }
+
+    if (fromVersion < 3) {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS unique_index_entries (
+          collection TEXT NOT NULL,
+          doc_key TEXT NOT NULL,
+          index_name TEXT NOT NULL,
+          index_value TEXT NOT NULL,
+          PRIMARY KEY (collection, doc_key, index_name),
+          UNIQUE (collection, index_name, index_value),
+          FOREIGN KEY (collection, doc_key)
+            REFERENCES documents (collection, doc_key)
+            ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_unique_index_entries_lookup
+          ON unique_index_entries (collection, index_name, index_value, doc_key);
+      `);
     }
 
     setUserVersion(db, LATEST_SCHEMA_VERSION);
@@ -1548,6 +1628,10 @@ function normalizeNumericVersion(value: string): number | null {
 
 function uniqueStrings(values: string[]): string[] {
   return [...new Set(values)];
+}
+
+function getUniqueOwnershipKey(indexName: string, indexValue: string): string {
+  return `${indexName}\u0000${indexValue}`;
 }
 
 function createPlaceholders(count: number): string {

@@ -23,6 +23,7 @@ import {
   EngineDocumentNotFoundError,
   type ComparableVersion,
 } from "../../src/engines/types";
+import { runQueryEngineConformanceSuite } from "./conformance-suite";
 import { createCollectionNameFactory, createTestResourceName, expectReject } from "./helpers";
 import { runMigrationIntegrationSuite } from "./migration-suite";
 
@@ -173,6 +174,12 @@ describe("dynamoDbEngine integration", () => {
   });
 
   runMigrationIntegrationSuite({
+    engineName: "dynamoDbEngine integration",
+    getEngine: () => engine,
+    nextCollection,
+  });
+
+  runQueryEngineConformanceSuite({
     engineName: "dynamoDbEngine integration",
     getEngine: () => engine,
     nextCollection,

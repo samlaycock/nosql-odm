@@ -15,6 +15,7 @@ import {
   EngineDocumentNotFoundError,
   type ComparableVersion,
 } from "../../src/engines/types";
+import { runQueryEngineConformanceSuite } from "./conformance-suite";
 import { createCollectionNameFactory, createTestResourceName, expectReject } from "./helpers";
 import { runMigrationIntegrationSuite } from "./migration-suite";
 
@@ -116,6 +117,12 @@ describe("mongoDbEngine integration", () => {
   });
 
   runMigrationIntegrationSuite({
+    engineName: "mongoDbEngine integration",
+    getEngine: () => engine,
+    nextCollection,
+  });
+
+  runQueryEngineConformanceSuite({
     engineName: "mongoDbEngine integration",
     getEngine: () => engine,
     nextCollection,

@@ -7,6 +7,7 @@ import {
   type QueryEngine,
 } from "../../src/engines/types";
 import { encodeNumericIndexValue } from "../../src/index";
+import { runQueryEngineConformanceSuite } from "./conformance-suite";
 import { createCollectionNameFactory } from "./helpers";
 import { runMigrationIntegrationSuite } from "./migration-suite";
 
@@ -22,6 +23,12 @@ beforeEach(() => {
 });
 
 runMigrationIntegrationSuite({
+  engineName: "memoryEngine integration",
+  getEngine: () => engine,
+  nextCollection,
+});
+
+runQueryEngineConformanceSuite({
   engineName: "memoryEngine integration",
   getEngine: () => engine,
   nextCollection,

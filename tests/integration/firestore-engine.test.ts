@@ -16,6 +16,7 @@ import {
   EngineDocumentNotFoundError,
   type ComparableVersion,
 } from "../../src/engines/types";
+import { runQueryEngineConformanceSuite } from "./conformance-suite";
 import { createCollectionNameFactory, expectReject } from "./helpers";
 import { runMigrationIntegrationSuite } from "./migration-suite";
 
@@ -153,6 +154,12 @@ describe("firestoreEngine integration", () => {
   });
 
   runMigrationIntegrationSuite({
+    engineName: "firestoreEngine integration",
+    getEngine: () => engine,
+    nextCollection,
+  });
+
+  runQueryEngineConformanceSuite({
     engineName: "firestoreEngine integration",
     getEngine: () => engine,
     nextCollection,

@@ -4,6 +4,7 @@ import { encodeQueryPageCursor, resolveQueryPageStartIndex } from "./query-curso
 import {
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
+  EngineUniqueConstraintError,
   type ComparableVersion,
   type EngineQueryResult,
   type FieldCondition,
@@ -105,6 +106,7 @@ interface StoredDocumentRecord {
   createdAt: number;
   doc: Record<string, unknown>;
   indexes: ResolvedIndexKeys;
+  uniqueIndexes: ResolvedIndexKeys;
 }
 
 interface MetaSequenceRecord {
@@ -168,19 +170,22 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
       });
     },
 
-    async create(collection, key, doc, indexes) {
+    async create(collection, key, doc, indexes, _options, _migrationMetadata, uniqueIndexes) {
       const db = await dbPromise;
       const docId = makeDocumentId(collection, key);
 
       await withTransaction(db, [STORE_DOCUMENTS, STORE_META], "readwrite", async (tx) => {
         const docsStore = tx.objectStore(STORE_DOCUMENTS);
         const metaStore = tx.objectStore(STORE_META);
+        const collectionRecords = await loadCollectionRecordsFromStore(docsStore, collection);
 
         const existing = await requestToPromise(docsStore.get(docId));
 
         if (existing !== undefined) {
           throw new EngineDocumentAlreadyExistsError(collection, key);
         }
+
+        assertUniqueIndexes(collection, key, uniqueIndexes ?? {}, collectionRecords);
 
         const sequence = (await loadSequence(metaStore)) + 1;
 
@@ -193,6 +198,7 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
               createdAt: sequence,
               doc,
               indexes,
+              uniqueIndexes,
             }),
           ),
         );
@@ -201,13 +207,14 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
       });
     },
 
-    async put(collection, key, doc, indexes) {
+    async put(collection, key, doc, indexes, _options, _migrationMetadata, uniqueIndexes) {
       const db = await dbPromise;
       const docId = makeDocumentId(collection, key);
 
       await withTransaction(db, [STORE_DOCUMENTS, STORE_META], "readwrite", async (tx) => {
         const docsStore = tx.objectStore(STORE_DOCUMENTS);
         const metaStore = tx.objectStore(STORE_META);
+        const collectionRecords = await loadCollectionRecordsFromStore(docsStore, collection);
 
         const existingRaw = await requestToPromise(docsStore.get(docId));
 
@@ -220,6 +227,8 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
           createdAt = parseStoredDocumentRecord(existingRaw).createdAt;
         }
 
+        assertUniqueIndexes(collection, key, uniqueIndexes ?? {}, collectionRecords);
+
         await requestToPromise(
           docsStore.put(
             createStoredDocumentRecord({
@@ -229,18 +238,20 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
               createdAt,
               doc,
               indexes,
+              uniqueIndexes,
             }),
           ),
         );
       });
     },
 
-    async update(collection, key, doc, indexes) {
+    async update(collection, key, doc, indexes, _options, _migrationMetadata, uniqueIndexes) {
       const db = await dbPromise;
       const docId = makeDocumentId(collection, key);
 
       await withTransaction(db, [STORE_DOCUMENTS], "readwrite", async (tx) => {
         const docsStore = tx.objectStore(STORE_DOCUMENTS);
+        const collectionRecords = await loadCollectionRecordsFromStore(docsStore, collection);
         const existingRaw = await requestToPromise(docsStore.get(docId));
 
         if (existingRaw === undefined) {
@@ -248,6 +259,8 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
         }
 
         const existing = parseStoredDocumentRecord(existingRaw);
+
+        assertUniqueIndexes(collection, key, uniqueIndexes ?? {}, collectionRecords);
 
         await requestToPromise(
           docsStore.put(
@@ -258,6 +271,7 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
               createdAt: existing.createdAt,
               doc,
               indexes,
+              uniqueIndexes,
             }),
           ),
         );
@@ -309,6 +323,10 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
       await withTransaction(db, [STORE_DOCUMENTS, STORE_META], "readwrite", async (tx) => {
         const docsStore = tx.objectStore(STORE_DOCUMENTS);
         const metaStore = tx.objectStore(STORE_META);
+        const collectionRecords = await loadCollectionRecordsFromStore(docsStore, collection);
+        const recordsByKey = new Map(
+          collectionRecords.map((record) => [record.key, record] as const),
+        );
 
         let sequence = await loadSequence(metaStore);
         let sequenceChanged = false;
@@ -327,18 +345,22 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
             createdAt = parseStoredDocumentRecord(existingRaw).createdAt;
           }
 
-          await requestToPromise(
-            docsStore.put(
-              createStoredDocumentRecord({
-                id: docId,
-                collection,
-                key: item.key,
-                createdAt,
-                doc: item.doc,
-                indexes: item.indexes,
-              }),
-            ),
-          );
+          const uniqueIndexes = item.uniqueIndexes ?? {};
+
+          assertUniqueIndexes(collection, item.key, uniqueIndexes, recordsByKey.values());
+
+          const storedRecord = createStoredDocumentRecord({
+            id: docId,
+            collection,
+            key: item.key,
+            createdAt,
+            doc: item.doc,
+            indexes: item.indexes,
+            uniqueIndexes,
+          });
+
+          await requestToPromise(docsStore.put(storedRecord));
+          recordsByKey.set(item.key, storedRecord);
         }
 
         if (sequenceChanged) {
@@ -543,22 +565,55 @@ async function listCollectionDocuments(
   collection: string,
 ): Promise<StoredDocumentRecord[]> {
   return withTransaction(db, [STORE_DOCUMENTS], "readonly", async (tx) => {
-    const rawRecords = await requestToPromise(tx.objectStore(STORE_DOCUMENTS).getAll());
+    return loadCollectionRecordsFromStore(tx.objectStore(STORE_DOCUMENTS), collection);
+  });
+}
 
-    const records = rawRecords
-      .map((record) => parseStoredDocumentRecord(record))
-      .filter((record) => record.collection === collection);
+async function loadCollectionRecordsFromStore(
+  docsStore: IndexedDbObjectStoreLike,
+  collection: string,
+): Promise<StoredDocumentRecord[]> {
+  const rawRecords = await requestToPromise(docsStore.getAll());
+  const records = rawRecords
+    .map((record) => parseStoredDocumentRecord(record))
+    .filter((record) => record.collection === collection);
 
-    records.sort((a, b) => {
-      if (a.createdAt !== b.createdAt) {
-        return a.createdAt - b.createdAt;
+  records.sort((a, b) => {
+    if (a.createdAt !== b.createdAt) {
+      return a.createdAt - b.createdAt;
+    }
+
+    return a.key.localeCompare(b.key);
+  });
+
+  return records;
+}
+
+function assertUniqueIndexes(
+  collection: string,
+  key: string,
+  uniqueIndexes: ResolvedIndexKeys,
+  records: Iterable<StoredDocumentRecord>,
+): void {
+  for (const [indexName, indexValue] of Object.entries(uniqueIndexes)) {
+    const normalizedValue = String(indexValue);
+
+    for (const record of records) {
+      if (record.key === key) {
+        continue;
       }
 
-      return a.key.localeCompare(b.key);
-    });
-
-    return records;
-  });
+      if (record.uniqueIndexes[indexName] === normalizedValue) {
+        throw new EngineUniqueConstraintError(
+          collection,
+          key,
+          indexName,
+          normalizedValue,
+          record.key,
+        );
+      }
+    }
+  }
 }
 
 function matchDocuments(
@@ -997,6 +1052,7 @@ function createStoredDocumentRecord(input: {
   createdAt: number;
   doc: unknown;
   indexes: ResolvedIndexKeys;
+  uniqueIndexes?: ResolvedIndexKeys;
 }): StoredDocumentRecord {
   return {
     id: input.id,
@@ -1005,6 +1061,7 @@ function createStoredDocumentRecord(input: {
     createdAt: input.createdAt,
     doc: getPreparedClone(input.doc) ?? (structuredClone(input.doc) as Record<string, unknown>),
     indexes: { ...input.indexes },
+    uniqueIndexes: { ...input.uniqueIndexes },
   };
 }
 
@@ -1019,6 +1076,7 @@ function parseStoredDocumentRecord(value: unknown): StoredDocumentRecord {
   const createdAt = value.createdAt;
   const doc = value.doc;
   const indexes = value.indexes;
+  const uniqueIndexes = value.uniqueIndexes;
 
   if (typeof id !== "string" || typeof collection !== "string" || typeof key !== "string") {
     throw new Error("IndexedDB documents store contains an invalid record (bad id/collection/key)");
@@ -1037,6 +1095,7 @@ function parseStoredDocumentRecord(value: unknown): StoredDocumentRecord {
   }
 
   const resolvedIndexes: ResolvedIndexKeys = {};
+  const resolvedUniqueIndexes: ResolvedIndexKeys = {};
 
   for (const [name, indexValue] of Object.entries(indexes)) {
     if (typeof indexValue !== "string") {
@@ -1046,6 +1105,22 @@ function parseStoredDocumentRecord(value: unknown): StoredDocumentRecord {
     resolvedIndexes[name] = indexValue;
   }
 
+  if (uniqueIndexes !== undefined) {
+    if (!isRecord(uniqueIndexes)) {
+      throw new Error("IndexedDB documents store contains an invalid record (bad uniqueIndexes)");
+    }
+
+    for (const [name, indexValue] of Object.entries(uniqueIndexes)) {
+      if (typeof indexValue !== "string") {
+        throw new Error(
+          "IndexedDB documents store contains an invalid record (non-string unique index)",
+        );
+      }
+
+      resolvedUniqueIndexes[name] = indexValue;
+    }
+  }
+
   return {
     id,
     collection,
@@ -1053,6 +1128,7 @@ function parseStoredDocumentRecord(value: unknown): StoredDocumentRecord {
     createdAt,
     doc: doc as Record<string, unknown>,
     indexes: resolvedIndexes,
+    uniqueIndexes: resolvedUniqueIndexes,
   };
 }
 
