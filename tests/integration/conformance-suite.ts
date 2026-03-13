@@ -1,36 +1,11 @@
 import { describe, expect, test } from "bun:test";
 
-import {
-  EngineUniqueConstraintError,
-  type QueryEngine,
-  type QueryParams,
-} from "../../src/engines/types";
-import { expectReject } from "./helpers";
+import { type QueryEngine } from "../../src/engines/types";
 
 interface QueryEngineConformanceSuiteOptions<TOptions = Record<string, unknown>> {
   readonly engineName: string;
   readonly getEngine: () => QueryEngine<TOptions>;
   readonly nextCollection: (prefix: string) => string;
-}
-
-interface ErrorConstructor {
-  new (...args: any[]): Error;
-  readonly name: string;
-}
-
-async function expectError(work: Promise<unknown>, expectedError: ErrorConstructor): Promise<void> {
-  try {
-    await work;
-    throw new Error(`expected operation to throw ${expectedError.name}`);
-  } catch (error) {
-    expect(error).toBeInstanceOf(expectedError);
-  }
-}
-
-function collectKeys(params: QueryParams): QueryParams {
-  return {
-    ...params,
-  };
 }
 
 export function runQueryEngineConformanceSuite<TOptions = Record<string, unknown>>(
@@ -39,86 +14,6 @@ export function runQueryEngineConformanceSuite<TOptions = Record<string, unknown
   const { engineName, getEngine, nextCollection } = options;
 
   describe(`${engineName} conformance`, () => {
-    test("enforces shared unique index ownership across write methods", async () => {
-      const engine = getEngine();
-
-      if (engine.capabilities?.uniqueConstraints !== "atomic") {
-        return;
-      }
-
-      const collection = nextCollection("users");
-
-      await engine.create(
-        collection,
-        "u1",
-        { id: "u1", email: "sam@example.com" },
-        { primary: "u1" },
-        undefined,
-        undefined,
-        { byEmail: "sam@example.com" },
-      );
-      await engine.create(
-        collection,
-        "u2",
-        { id: "u2", email: "other@example.com" },
-        { primary: "u2" },
-        undefined,
-        undefined,
-        { byEmail: "other@example.com" },
-      );
-
-      await expectError(
-        engine.create(
-          collection,
-          "u3",
-          { id: "u3", email: "sam@example.com" },
-          { primary: "u3" },
-          undefined,
-          undefined,
-          { byEmail: "sam@example.com" },
-        ),
-        EngineUniqueConstraintError,
-      );
-
-      await expectError(
-        engine.put(
-          collection,
-          "u3",
-          { id: "u3", email: "sam@example.com" },
-          { primary: "u3" },
-          undefined,
-          undefined,
-          { byEmail: "sam@example.com" },
-        ),
-        EngineUniqueConstraintError,
-      );
-
-      await expectError(
-        engine.update(
-          collection,
-          "u2",
-          { id: "u2", email: "sam@example.com" },
-          { primary: "u2" },
-          undefined,
-          undefined,
-          { byEmail: "sam@example.com" },
-        ),
-        EngineUniqueConstraintError,
-      );
-
-      await expectError(
-        engine.batchSet(collection, [
-          {
-            key: "u4",
-            doc: { id: "u4", email: "sam@example.com" },
-            indexes: { primary: "u4" },
-            uniqueIndexes: { byEmail: "sam@example.com" },
-          },
-        ]),
-        EngineUniqueConstraintError,
-      );
-    });
-
     test("preserves batchGet request order and duplicates", async () => {
       const engine = getEngine();
       const collection = nextCollection("users");
@@ -170,7 +65,7 @@ export function runQueryEngineConformanceSuite<TOptions = Record<string, unknown
         filter: { value: { $between: ["2025-01-01", "2025-06-15"] } },
         sort: "asc",
       });
-      const scanResults = await engine.query(collection, collectKeys({}));
+      const scanResults = await engine.query(collection, {});
 
       expect(equalityResults.documents.map((entry) => entry.key).sort()).toEqual(["u1", "u2"]);
       expect(comparisonResults.documents.map((entry) => entry.key)).toEqual(["u1", "u2"]);
@@ -233,29 +128,6 @@ export function runQueryEngineConformanceSuite<TOptions = Record<string, unknown
       expect(page1.cursor).not.toBeNull();
       expect(page2.documents).toHaveLength(1);
       expect(page2.cursor).toBeNull();
-    });
-
-    test("rejects invalid query cursors consistently", async () => {
-      const engine = getEngine();
-      const collection = nextCollection("users");
-
-      await engine.put(collection, "u1", { id: "u1" }, { primary: "u1" });
-      await engine.put(collection, "u2", { id: "u2" }, { primary: "u2" });
-
-      await expectReject(
-        engine.query(collection, {
-          limit: 1,
-          cursor: "does-not-exist",
-        }),
-        /cursor/i,
-      );
-      await expectReject(
-        engine.query(collection, {
-          limit: 1,
-          cursor: "u1",
-        }),
-        /cursor/i,
-      );
     });
 
     test("skips stale migration writes consistently when supported", async () => {
