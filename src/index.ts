@@ -37,6 +37,7 @@ export {
   UniqueConstraintError,
   type QueryResult,
   type BatchSetInputItem,
+  type DuplicateBatchSetKeyConflict,
   type MigrationResult,
   type MigrationSkipReasons,
   type MigrationRunOptions,
