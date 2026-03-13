@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import {
   ERROR_CODES,
   type CodedError,
+  type DuplicateBatchSetKeyConflict,
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
   EngineUniqueConstraintError,
@@ -81,11 +82,14 @@ describe("public error codes", () => {
     const error = new DocumentAlreadyExistsError("user", "u1");
     const code: ErrorCode = ERROR_CODES.DOCUMENT_ALREADY_EXISTS;
     const codedError: CodedError = error;
+    const conflicts: DuplicateBatchSetKeyConflict[] = [{ key: "u1", positions: [0, 1] }];
+    const duplicateKeyError = new DuplicateBatchSetKeysError("user", conflicts);
 
     expect(ERROR_CODES.DOCUMENT_ALREADY_EXISTS).toBe("DOCUMENT_ALREADY_EXISTS");
     expect(code).toBe("DOCUMENT_ALREADY_EXISTS");
     expect(codedError.code).toBe("DOCUMENT_ALREADY_EXISTS");
     expect(error).toBeInstanceOf(DocumentAlreadyExistsError);
     expect(error).toBeInstanceOf(NosqlOdmError);
+    expect(duplicateKeyError.conflicts).toEqual(conflicts);
   });
 });

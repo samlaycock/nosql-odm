@@ -19,6 +19,7 @@ import {
   createStore,
   DocumentAlreadyExistsError,
   DocumentNotFoundError,
+  DuplicateBatchSetKeysError,
   MigrationProjectionError,
   MigrationAlreadyRunningError,
   MigrationScopeConflictError,
@@ -650,7 +651,7 @@ describe("unique indexes", () => {
           data: { id: "u1", name: "Sam Duplicate", email: "sam.duplicate@example.com" },
         },
       ]),
-      /duplicate keys.*"u1".*0, 1/i,
+      DuplicateBatchSetKeysError,
     );
 
     expect(calls).toHaveLength(0);
