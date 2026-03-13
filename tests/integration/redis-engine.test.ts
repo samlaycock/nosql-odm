@@ -15,6 +15,7 @@ import {
   EngineDocumentNotFoundError,
   type ComparableVersion,
 } from "../../src/engines/types";
+import { runQueryEngineConformanceSuite } from "./conformance-suite";
 import { createCollectionNameFactory, createTestResourceName, expectReject } from "./helpers";
 import { runMigrationIntegrationSuite } from "./migration-suite";
 
@@ -120,6 +121,12 @@ describe("redisEngine integration", () => {
   });
 
   runMigrationIntegrationSuite({
+    engineName: "redisEngine integration",
+    getEngine: () => engine,
+    nextCollection,
+  });
+
+  runQueryEngineConformanceSuite({
     engineName: "redisEngine integration",
     getEngine: () => engine,
     nextCollection,

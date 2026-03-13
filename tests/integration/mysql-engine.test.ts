@@ -15,6 +15,7 @@ import {
   EngineDocumentNotFoundError,
   type ComparableVersion,
 } from "../../src/engines/types";
+import { runQueryEngineConformanceSuite } from "./conformance-suite";
 import { createCollectionNameFactory, createTestResourceName, expectReject } from "./helpers";
 import { runMigrationIntegrationSuite } from "./migration-suite";
 
@@ -145,6 +146,12 @@ describe("mySqlEngine integration", () => {
   });
 
   runMigrationIntegrationSuite({
+    engineName: "mySqlEngine integration",
+    getEngine: () => engine,
+    nextCollection,
+  });
+
+  runQueryEngineConformanceSuite({
     engineName: "mySqlEngine integration",
     getEngine: () => engine,
     nextCollection,

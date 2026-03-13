@@ -140,7 +140,7 @@ describe("sqlite setup", () => {
       const versionRow = setupEngine.db.prepare(`PRAGMA user_version`).get() as {
         user_version?: unknown;
       };
-      expect(Number(versionRow.user_version)).toBe(2);
+      expect(Number(versionRow.user_version)).toBe(3);
 
       const tables = new Set(
         (
@@ -158,6 +158,7 @@ describe("sqlite setup", () => {
 
       expect(tables.has("documents")).toBe(true);
       expect(tables.has("index_entries")).toBe(true);
+      expect(tables.has("unique_index_entries")).toBe(true);
       expect(tables.has("migration_metadata")).toBe(true);
       expect(tables.has("migration_locks")).toBe(true);
       expect(tables.has("migration_checkpoints")).toBe(true);

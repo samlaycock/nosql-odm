@@ -80,6 +80,29 @@ jobs:
       - name: Run integration tests (${{ matrix.engine }})
         run: bun run test:integration:${{ matrix.engine }}
 
+      - name: Publish conformance status (${{ matrix.engine }})
+        if: ${{ always() }}
+        env:
+          ENGINE: ${{ matrix.engine }}
+          STATUS: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          mkdir -p conformance-status
+          cat <<EOF > "conformance-status/${ENGINE}.md"
+          # ${ENGINE} conformance
+
+          - Status: ${STATUS}
+          - Workflow: ${RUN_URL}
+          EOF
+          cat "conformance-status/${ENGINE}.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload conformance status (${{ matrix.engine }})
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-status-${{ matrix.engine }}
+          path: conformance-status/${{ matrix.engine }}.md
+
       - name: Stop service (${{ matrix.engine }})
         if: ${{ always() && matrix.service_down != '' }}
         run: ${{ matrix.service_down }}
