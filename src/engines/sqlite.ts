@@ -1054,6 +1054,11 @@ function runMigrations(db: Database.Database): void {
           ON unique_index_entries (collection, index_name, index_value, doc_key);
       `);
 
+      // v2 does not record whether an index entry came from a unique index, so the
+      // migration can only backfill singleton ownership heuristically. This protects
+      // upgraded databases from missing obvious existing owners, but it may also
+      // temporarily over-classify a singleton non-unique index until that document is
+      // re-written under schema v3 with explicit uniqueIndexes metadata.
       db.exec(`
         INSERT INTO unique_index_entries (collection, doc_key, index_name, index_value)
         SELECT ix.collection, ix.doc_key, ix.index_name, ix.index_value
