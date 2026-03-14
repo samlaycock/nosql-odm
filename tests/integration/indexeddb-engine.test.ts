@@ -81,6 +81,7 @@ runQueryEngineConformanceSuite({
   engineName: "indexedDbEngine integration",
   getEngine: () => engine,
   nextCollection,
+  assertEngineUniqueConstraintConformance: true,
 });
 
 async function openRawDatabase(databaseName: string): Promise<RawDatabase> {
