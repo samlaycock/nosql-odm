@@ -1053,6 +1053,28 @@ function runMigrations(db: Database.Database): void {
         CREATE INDEX IF NOT EXISTS idx_unique_index_entries_lookup
           ON unique_index_entries (collection, index_name, index_value, doc_key);
       `);
+
+      db.exec(`
+        INSERT INTO unique_index_entries (collection, doc_key, index_name, index_value)
+        SELECT ix.collection, ix.doc_key, ix.index_name, ix.index_value
+        FROM index_entries ix
+        JOIN (
+          SELECT collection, index_name, index_value
+          FROM index_entries
+          GROUP BY collection, index_name, index_value
+          HAVING COUNT(*) = 1
+        ) unique_candidates
+          ON unique_candidates.collection = ix.collection
+          AND unique_candidates.index_name = ix.index_name
+          AND unique_candidates.index_value = ix.index_value
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM unique_index_entries existing
+          WHERE existing.collection = ix.collection
+            AND existing.doc_key = ix.doc_key
+            AND existing.index_name = ix.index_name
+        );
+      `);
     }
 
     setUserVersion(db, LATEST_SCHEMA_VERSION);

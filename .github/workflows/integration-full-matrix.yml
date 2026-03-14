@@ -88,12 +88,11 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           mkdir -p conformance-status
-          cat <<EOF > "conformance-status/${ENGINE}.md"
-          # ${ENGINE} conformance
-
-          - Status: ${STATUS}
-          - Workflow: ${RUN_URL}
-          EOF
+          printf '# %s conformance\n\n- Status: %s\n- Workflow: %s\n' \
+            "${ENGINE}" \
+            "${STATUS}" \
+            "${RUN_URL}" \
+            > "conformance-status/${ENGINE}.md"
           cat "conformance-status/${ENGINE}.md" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload conformance status (${{ matrix.engine }})

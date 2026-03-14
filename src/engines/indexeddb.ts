@@ -347,7 +347,7 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
 
           const uniqueIndexes = item.uniqueIndexes ?? {};
 
-          assertUniqueIndexes(collection, item.key, uniqueIndexes, recordsByKey.values());
+          assertUniqueIndexes(collection, item.key, uniqueIndexes, [...recordsByKey.values()]);
 
           const storedRecord = createStoredDocumentRecord({
             id: docId,
@@ -593,7 +593,7 @@ function assertUniqueIndexes(
   collection: string,
   key: string,
   uniqueIndexes: ResolvedIndexKeys,
-  records: Iterable<StoredDocumentRecord>,
+  records: readonly StoredDocumentRecord[],
 ): void {
   for (const [indexName, indexValue] of Object.entries(uniqueIndexes)) {
     const normalizedValue = String(indexValue);
