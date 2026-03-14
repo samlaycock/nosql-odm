@@ -72,6 +72,7 @@ async function connectWithRetry(): Promise<RedisClient> {
     const candidate = createClient({
       url: redisUrl,
     });
+    candidate.on("error", () => {});
 
     try {
       await candidate.connect();
