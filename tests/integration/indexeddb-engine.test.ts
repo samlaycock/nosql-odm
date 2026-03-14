@@ -5,6 +5,7 @@ import { indexedDbEngine, type IndexedDbQueryEngine } from "../../src/engines/in
 import {
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
+  EngineUniqueConstraintError,
   type ComparableVersion,
 } from "../../src/engines/types";
 import { runQueryEngineConformanceSuite } from "./conformance-suite";
@@ -306,6 +307,31 @@ describe("indexedDbEngine batch methods", () => {
     expect(docs[0]?.key).toBe("u1");
     expect(docs[1]?.key).toBe("u1");
     expect(docs[0]!.doc).not.toBe(docs[1]!.doc);
+  });
+
+  test("batchSet enforces every unique index field atomically", async () => {
+    try {
+      await engine.batchSet!("users", [
+        {
+          key: "u1",
+          doc: { id: "u1", email: "sam@example.com", username: "sam" },
+          indexes: { byEmail: "sam@example.com", byUsername: "sam" },
+          uniqueIndexes: { byEmail: "sam@example.com", byUsername: "sam" },
+        },
+        {
+          key: "u2",
+          doc: { id: "u2", email: "jamie@example.com", username: "sam" },
+          indexes: { byEmail: "jamie@example.com", byUsername: "sam" },
+          uniqueIndexes: { byEmail: "jamie@example.com", byUsername: "sam" },
+        },
+      ]);
+      throw new Error("expected batchSet to fail with unique constraint error");
+    } catch (error) {
+      expect(error).toBeInstanceOf(EngineUniqueConstraintError);
+    }
+
+    expect(await engine.get("users", "u1")).toBeNull();
+    expect(await engine.get("users", "u2")).toBeNull();
   });
 });
 

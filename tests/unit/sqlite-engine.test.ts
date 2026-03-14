@@ -262,6 +262,94 @@ describe("sqlite setup", () => {
       migratedEngine.close();
     }
   });
+
+  test("backfills unique index ownership from version 2 index entries", async () => {
+    const raw = new BunBetterSqliteCompat(":memory:");
+    raw.exec(`
+      CREATE TABLE IF NOT EXISTS documents (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        collection TEXT NOT NULL,
+        doc_key TEXT NOT NULL,
+        doc_json TEXT NOT NULL,
+        write_version INTEGER NOT NULL DEFAULT 1,
+        UNIQUE (collection, doc_key)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_documents_collection_id
+        ON documents (collection, id);
+
+      CREATE TABLE IF NOT EXISTS index_entries (
+        collection TEXT NOT NULL,
+        doc_key TEXT NOT NULL,
+        index_name TEXT NOT NULL,
+        index_value TEXT NOT NULL,
+        PRIMARY KEY (collection, doc_key, index_name),
+        FOREIGN KEY (collection, doc_key)
+          REFERENCES documents (collection, doc_key)
+          ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_index_entries_lookup
+        ON index_entries (collection, index_name, index_value, doc_key);
+
+      CREATE INDEX IF NOT EXISTS idx_index_entries_scan
+        ON index_entries (collection, index_name, doc_key);
+
+      CREATE TABLE IF NOT EXISTS migration_locks (
+        collection TEXT PRIMARY KEY,
+        lock_id TEXT NOT NULL,
+        acquired_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS migration_checkpoints (
+        collection TEXT PRIMARY KEY,
+        cursor TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS migration_metadata (
+        collection TEXT NOT NULL,
+        doc_key TEXT NOT NULL,
+        target_version INTEGER NULL,
+        version_state TEXT NULL,
+        index_signature TEXT NULL,
+        PRIMARY KEY (collection, doc_key),
+        FOREIGN KEY (collection, doc_key)
+          REFERENCES documents (collection, doc_key)
+          ON DELETE CASCADE
+      );
+
+      PRAGMA user_version = 2;
+    `);
+
+    raw
+      .prepare(`INSERT INTO documents (collection, doc_key, doc_json) VALUES (?, ?, ?)`)
+      .run("users", "u1", JSON.stringify({ id: "u1", email: "sam@example.com" }));
+    raw
+      .prepare(
+        `INSERT INTO index_entries (collection, doc_key, index_name, index_value) VALUES (?, ?, ?, ?)`,
+      )
+      .run("users", "u1", "byEmail", "sam@example.com");
+
+    const migratedEngine = sqliteEngine({
+      database: raw as unknown as BetterSqlite3.Database,
+    });
+
+    try {
+      await expect(
+        migratedEngine.create(
+          "users",
+          "u2",
+          { id: "u2", email: "sam@example.com" },
+          { byEmail: "sam@example.com" },
+          undefined,
+          undefined,
+          { byEmail: "sam@example.com" },
+        ),
+      ).rejects.toBeInstanceOf(EngineUniqueConstraintError);
+    } finally {
+      migratedEngine.close();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
