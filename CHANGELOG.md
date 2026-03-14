@@ -1,5 +1,20 @@
 # nosql-odm
 
+## 0.10.0
+
+### Minor Changes
+
+- 5100fd3: Add an optional `probeUnique()` engine hook so store-managed unique guards can batch unique prechecks by index instead of issuing one query per value. The store now falls back to the existing per-value query behavior when an engine does not implement the hook, and the memory engine exposes the new batched probe contract.
+- 31208f8: Add stable `code` values to the exported model, store, migrator, and engine error classes, and document the public error-code reference table in the README.
+- c21cc5c: Reject duplicate document keys inside a single store `batchSet()` call before any engine write occurs, and surface a dedicated error that reports the conflicting keys and their batch positions.
+
+### Patch Changes
+
+- 4d1fc76: Add a shared query-engine conformance suite across adapters, publish per-engine conformance status from the full integration matrix, and fix sqlite/indexeddb engine-level unique constraint enforcement to satisfy the shared parity checks. For SQLite upgrades from schema v2, backfill any obvious singleton unique-index owners from historical index entries, noting that this reconstruction is heuristic because v2 did not persist unique/non-unique index metadata separately.
+- 3c48ff0: Reject stale query cursors after model version or index metadata changes by salting cursor signatures with model query-shape metadata.
+
+  Version query cursor payloads explicitly so unsupported legacy cursor formats fail fast, and add regression coverage for model/version drift and index-metadata drift across paginated queries.
+
 ## 0.9.0
 
 ### Minor Changes
