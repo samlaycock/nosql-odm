@@ -6,7 +6,11 @@ import {
   EngineDocumentNotFoundError,
   type QueryEngine,
 } from "../../src/engines/types";
-import { encodeNumericIndexValue } from "../../src/index";
+import {
+  compareSemverVersions,
+  encodeNumericIndexValue,
+  parseSemverVersion,
+} from "../../src/index";
 import { runQueryEngineConformanceSuite } from "./conformance-suite";
 import { createCollectionNameFactory } from "./helpers";
 import { runMigrationIntegrationSuite } from "./migration-suite";
@@ -1488,6 +1492,36 @@ describe("migration getOutdated()", () => {
 
     expect(result.documents).toHaveLength(1);
     expect(result.documents[0]!.key).toBe("a");
+  });
+
+  test("supports semver helpers for migration outdated detection", async () => {
+    await engine.put(
+      "users",
+      "stale",
+      { __v: "1.4.2-beta.1+build.7", id: "stale", __indexes: ["byEmail", "primary"] },
+      {},
+    );
+    await engine.put(
+      "users",
+      "current",
+      { __v: "2.3.1", id: "current", __indexes: ["byEmail", "primary"] },
+      {},
+    );
+    await engine.put(
+      "users",
+      "invalid",
+      { __v: "release-candidate", id: "invalid", __indexes: ["byEmail", "primary"] },
+      {},
+    );
+
+    const result = await engine.migration.getOutdated("users", {
+      ...criteria,
+      parseVersion: parseSemverVersion,
+      compareVersions: compareSemverVersions,
+    });
+
+    expect(result.documents).toHaveLength(1);
+    expect(result.documents[0]!.key).toBe("stale");
   });
 
   test("ignores documents when custom compareVersions cannot safely compare", async () => {

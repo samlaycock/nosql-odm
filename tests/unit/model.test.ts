@@ -2,9 +2,11 @@ import { describe, expect, test } from "bun:test";
 import * as z from "zod";
 
 import {
+  compareSemverVersions,
   encodeNumericIndexValue,
   model,
   ModelDefinition,
+  parseSemverVersion,
   ValidationError,
   VersionError,
 } from "../../src/model";
@@ -113,6 +115,37 @@ function buildThreeVersionModel() {
 // ---------------------------------------------------------------------------
 // model() factory & builder
 // ---------------------------------------------------------------------------
+
+describe("semver version helpers", () => {
+  test("parseSemverVersion normalizes valid semver strings and defaults nullish values to v1", () => {
+    expect(parseSemverVersion(undefined)).toBe(1);
+    expect(parseSemverVersion(null)).toBe(1);
+    expect(parseSemverVersion(" v1.2.3-beta.1+build.7 ")).toBe("1.2.3-beta.1+build.7");
+  });
+
+  test("parseSemverVersion rejects invalid semver-like values", () => {
+    expect(parseSemverVersion("release-1")).toBeNull();
+    expect(parseSemverVersion("1.02.3")).toBeNull();
+    expect(parseSemverVersion(1.5)).toBeNull();
+  });
+
+  test("compareSemverVersions orders prerelease values and ignores build metadata", () => {
+    expect(compareSemverVersions("1.0.0-alpha.1", "1.0.0-alpha.beta")).toBeLessThan(0);
+    expect(compareSemverVersions("1.0.0-rc.1", "1.0.0")).toBeLessThan(0);
+    expect(compareSemverVersions("1.0.0+build.1", "1.0.0+build.2")).toBe(0);
+  });
+
+  test("compareSemverVersions uses ASCII ordering for string prerelease identifiers", () => {
+    expect(compareSemverVersions("1.0.0-alpha.A", "1.0.0-alpha.a")).toBeLessThan(0);
+  });
+
+  test("compareSemverVersions maps numeric schema versions to matching semver majors", () => {
+    expect(compareSemverVersions("1.4.2", 1)).toBe(0);
+    expect(compareSemverVersions("2.0.0-beta.1", 2)).toBe(0);
+    expect(compareSemverVersions("3.0.0", 2)).toBeGreaterThan(0);
+    expect(compareSemverVersions(1, "2.0.0")).toBeLessThan(0);
+  });
+});
 
 describe("model() factory", () => {
   test("creates a model with a single schema version", () => {
@@ -1107,6 +1140,30 @@ describe("edge cases", () => {
 
     const result = await m.migrate({
       __v: "release-1",
+      id: "abc",
+      name: "Sam",
+    });
+
+    expect(result).toEqual({
+      id: "abc",
+      name: "Sam",
+      active: true,
+    });
+  });
+
+  test("migrate supports semver helpers without custom parser/comparator boilerplate", async () => {
+    const m = model("user", {
+      parseVersion: parseSemverVersion,
+      compareVersions: compareSemverVersions,
+    })
+      .schema(1, z.object({ id: z.string(), name: z.string() }))
+      .schema(2, z.object({ id: z.string(), name: z.string(), active: z.boolean() }), {
+        migrate: (old) => ({ ...old, active: true }),
+      })
+      .build();
+
+    const result = await m.migrate({
+      __v: "1.4.9-beta.2+build.7",
       id: "abc",
       name: "Sam",
     });

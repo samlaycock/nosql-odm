@@ -15,6 +15,7 @@ export {
   type CompareVersions,
   type ProjectionSkipReason,
   type ProjectionResult,
+  compareSemverVersions,
   encodeNumericIndexValue,
   type IndexValue,
   type IndexDefinition,
@@ -22,6 +23,7 @@ export {
   type Model,
   type ModelBuilder,
   type InitialModelBuilder,
+  parseSemverVersion,
 } from "./model";
 
 export {
