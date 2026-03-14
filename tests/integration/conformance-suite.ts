@@ -1,17 +1,26 @@
 import { describe, expect, test } from "bun:test";
 
-import { type QueryEngine } from "../../src/engines/types";
+import { EngineUniqueConstraintError, type QueryEngine } from "../../src/engines/types";
 
 interface QueryEngineConformanceSuiteOptions<TOptions = Record<string, unknown>> {
   readonly engineName: string;
   readonly getEngine: () => QueryEngine<TOptions>;
   readonly nextCollection: (prefix: string) => string;
+  readonly assertEngineUniqueConstraintConformance?: boolean;
 }
 
 export function runQueryEngineConformanceSuite<TOptions = Record<string, unknown>>(
   options: QueryEngineConformanceSuiteOptions<TOptions>,
 ): void {
-  const { engineName, getEngine, nextCollection } = options;
+  const {
+    engineName,
+    getEngine,
+    nextCollection,
+    assertEngineUniqueConstraintConformance = false,
+  } = options;
+  const uniqueConstraintConformanceTest = assertEngineUniqueConstraintConformance
+    ? test
+    : test.skip;
 
   describe(`${engineName} conformance`, () => {
     test("preserves batchGet request order and duplicates", async () => {
@@ -130,10 +139,73 @@ export function runQueryEngineConformanceSuite<TOptions = Record<string, unknown
       expect(page2.cursor).toBeNull();
     });
 
+    uniqueConstraintConformanceTest(
+      "enforces engine-level unique index ownership consistently when opted in",
+      async () => {
+        const engine = getEngine();
+        const collection = nextCollection("unique_users");
+
+        await engine.create(
+          collection,
+          "u1",
+          { id: "u1", email: "sam@example.com" },
+          { primary: "u1" },
+          undefined,
+          undefined,
+          { byEmail: "sam@example.com" },
+        );
+        await engine.create(
+          collection,
+          "u2",
+          { id: "u2", email: "other@example.com" },
+          { primary: "u2" },
+          undefined,
+          undefined,
+          { byEmail: "other@example.com" },
+        );
+
+        await expect(
+          engine.create(
+            collection,
+            "u3",
+            { id: "u3", email: "sam@example.com" },
+            { primary: "u3" },
+            undefined,
+            undefined,
+            { byEmail: "sam@example.com" },
+          ),
+        ).rejects.toBeInstanceOf(EngineUniqueConstraintError);
+
+        await expect(
+          engine.update(
+            collection,
+            "u2",
+            { id: "u2", email: "sam@example.com" },
+            { primary: "u2" },
+            undefined,
+            undefined,
+            { byEmail: "sam@example.com" },
+          ),
+        ).rejects.toBeInstanceOf(EngineUniqueConstraintError);
+
+        await expect(
+          engine.batchSet(collection, [
+            {
+              key: "u4",
+              doc: { id: "u4", email: "sam@example.com" },
+              indexes: { primary: "u4" },
+              uniqueIndexes: { byEmail: "sam@example.com" },
+            },
+          ]),
+        ).rejects.toBeInstanceOf(EngineUniqueConstraintError);
+      },
+    );
+
     test("skips stale migration writes consistently when supported", async () => {
       const engine = getEngine();
 
       if (!engine.batchSetWithResult) {
+        expect(engine.batchSetWithResult).toBeUndefined();
         return;
       }
 

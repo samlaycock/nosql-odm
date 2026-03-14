@@ -32,6 +32,7 @@ runQueryEngineConformanceSuite({
   engineName: "memoryEngine integration",
   getEngine: () => engine,
   nextCollection,
+  assertEngineUniqueConstraintConformance: true,
 });
 
 // ---------------------------------------------------------------------------

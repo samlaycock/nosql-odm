@@ -80,4 +80,5 @@ runQueryEngineConformanceSuite({
   engineName: "sqliteEngine integration",
   getEngine: () => engine,
   nextCollection,
+  assertEngineUniqueConstraintConformance: true,
 });
