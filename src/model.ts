@@ -697,6 +697,74 @@ function resolveIndexValue<T>(value: IndexValue<T>, data: T): string | undefined
   return String(fieldValue as string | number | boolean | bigint | symbol);
 }
 
+interface ParsedSemverVersion {
+  readonly major: number;
+  readonly minor: number;
+  readonly patch: number;
+  readonly prerelease: readonly string[];
+  readonly build: readonly string[];
+}
+
+type ParsedSemverComparable =
+  | {
+      readonly kind: "schema";
+      readonly major: number;
+    }
+  | ({
+      readonly kind: "semver";
+    } & ParsedSemverVersion);
+
+export function parseSemverVersion(raw: unknown): VersionValue | null {
+  if (raw === undefined || raw === null) {
+    return 1;
+  }
+
+  if (typeof raw === "number") {
+    return normalizeSemverSchemaVersion(raw);
+  }
+
+  if (typeof raw !== "string") {
+    return null;
+  }
+
+  const trimmed = raw.trim();
+
+  if (trimmed.length === 0) {
+    return null;
+  }
+
+  const numeric = normalizeNumericVersion(trimmed);
+
+  if (numeric !== null) {
+    return normalizeSemverSchemaVersion(numeric);
+  }
+
+  const parsed = parseStrictSemver(trimmed);
+
+  if (!parsed) {
+    return null;
+  }
+
+  return formatSemver(parsed);
+}
+
+export function compareSemverVersions(a: VersionValue, b: VersionValue): number {
+  const left = parseComparableSemverVersion(a);
+  const right = parseComparableSemverVersion(b);
+
+  if (!left || !right) {
+    throw new Error(
+      "compareSemverVersions requires integer schema versions or valid semver strings",
+    );
+  }
+
+  if (left.kind === "schema" || right.kind === "schema") {
+    return left.major - right.major;
+  }
+
+  return compareStrictSemver(left, right);
+}
+
 function defaultParseVersion(raw: unknown): VersionValue | null {
   if (raw === undefined || raw === null) {
     return 1;
@@ -754,6 +822,194 @@ function normalizeNumericVersion(value: string): number | null {
   const parsed = Number(match[1]);
 
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+function normalizeSemverSchemaVersion(value: number): number | null {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    return null;
+  }
+
+  return value;
+}
+
+function parseComparableSemverVersion(value: VersionValue): ParsedSemverComparable | null {
+  if (typeof value === "number") {
+    const normalized = normalizeSemverSchemaVersion(value);
+
+    return normalized === null
+      ? null
+      : {
+          kind: "schema",
+          major: normalized,
+        };
+  }
+
+  const trimmed = value.trim();
+
+  if (trimmed.length === 0) {
+    return null;
+  }
+
+  const numeric = normalizeNumericVersion(trimmed);
+
+  if (numeric !== null) {
+    const normalized = normalizeSemverSchemaVersion(numeric);
+
+    return normalized === null
+      ? null
+      : {
+          kind: "schema",
+          major: normalized,
+        };
+  }
+
+  const parsed = parseStrictSemver(trimmed);
+
+  return parsed
+    ? {
+        kind: "semver",
+        ...parsed,
+      }
+    : null;
+}
+
+function parseStrictSemver(value: string): ParsedSemverVersion | null {
+  const match =
+    /^(?:v)?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/.exec(
+      value.trim(),
+    );
+
+  if (!match) {
+    return null;
+  }
+
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  const patch = Number(match[3]);
+  const prerelease = splitSemverIdentifiers(match[4]);
+  const build = splitSemverIdentifiers(match[5]);
+
+  if (
+    !Number.isSafeInteger(major) ||
+    !Number.isSafeInteger(minor) ||
+    !Number.isSafeInteger(patch)
+  ) {
+    return null;
+  }
+
+  if (!isValidSemverPrerelease(prerelease)) {
+    return null;
+  }
+
+  return {
+    major,
+    minor,
+    patch,
+    prerelease,
+    build,
+  };
+}
+
+function splitSemverIdentifiers(value: string | undefined): readonly string[] {
+  if (!value) {
+    return [];
+  }
+
+  return value.split(".");
+}
+
+function isValidSemverPrerelease(prerelease: readonly string[]): boolean {
+  return prerelease.every(
+    (identifier) => !/^\d+$/.test(identifier) || identifier === "0" || !identifier.startsWith("0"),
+  );
+}
+
+function formatSemver(version: ParsedSemverVersion): string {
+  let formatted = `${version.major}.${version.minor}.${version.patch}`;
+
+  if (version.prerelease.length > 0) {
+    formatted += `-${version.prerelease.join(".")}`;
+  }
+
+  if (version.build.length > 0) {
+    formatted += `+${version.build.join(".")}`;
+  }
+
+  return formatted;
+}
+
+function compareStrictSemver(a: ParsedSemverVersion, b: ParsedSemverVersion): number {
+  if (a.major !== b.major) {
+    return a.major - b.major;
+  }
+
+  if (a.minor !== b.minor) {
+    return a.minor - b.minor;
+  }
+
+  if (a.patch !== b.patch) {
+    return a.patch - b.patch;
+  }
+
+  return compareSemverPrereleaseIdentifiers(a.prerelease, b.prerelease);
+}
+
+function compareSemverPrereleaseIdentifiers(a: readonly string[], b: readonly string[]): number {
+  if (a.length === 0 && b.length === 0) {
+    return 0;
+  }
+
+  if (a.length === 0) {
+    return 1;
+  }
+
+  if (b.length === 0) {
+    return -1;
+  }
+
+  const length = Math.max(a.length, b.length);
+
+  for (let i = 0; i < length; i++) {
+    const left = a[i];
+    const right = b[i];
+
+    if (left === undefined) {
+      return -1;
+    }
+
+    if (right === undefined) {
+      return 1;
+    }
+
+    const leftNumeric = /^\d+$/.test(left);
+    const rightNumeric = /^\d+$/.test(right);
+
+    if (leftNumeric && rightNumeric) {
+      const diff = Number(left) - Number(right);
+
+      if (diff !== 0) {
+        return diff;
+      }
+
+      continue;
+    }
+
+    if (leftNumeric) {
+      return -1;
+    }
+
+    if (rightNumeric) {
+      return 1;
+    }
+
+    const diff = left.localeCompare(right);
+
+    if (diff !== 0) {
+      return diff;
+    }
+  }
+
+  return 0;
 }
 
 // ---------------------------------------------------------------------------

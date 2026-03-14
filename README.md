@@ -1237,6 +1237,22 @@ const User = model("user", {
 });
 ```
 
+For semver-style stored versions, use the built-in helpers:
+
+```ts
+import { compareSemverVersions, model, parseSemverVersion } from "nosql-odm";
+
+const User = model("user", {
+  parseVersion: parseSemverVersion,
+  compareVersions: compareSemverVersions,
+})
+  .schema(/* version 1 */)
+  .schema(/* version 2 */)
+  .build();
+```
+
+These helpers validate semver strings like `1.4.2-beta.1+build.7`, compare prerelease values correctly, ignore build metadata for precedence, and map semver major versions onto the model's numeric schema steps.
+
 Example for release tags:
 
 ```ts
