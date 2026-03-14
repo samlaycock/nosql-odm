@@ -529,10 +529,20 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
       const stagedOwners = new Map<string, string>();
 
       for (const item of items) {
-        assertUniqueIndexes(collection, item.key, item.uniqueIndexes, stagedOwners);
-
         if (item.expectedWriteToken !== undefined) {
           const expectedWriteVersion = parseWriteToken(item.expectedWriteToken);
+          const existing = selectDocumentByKeyStmt.get(collection, item.key);
+          const currentWriteVersion = Number(existing?.write_version ?? Number.NaN);
+
+          if (
+            !Number.isFinite(currentWriteVersion) ||
+            currentWriteVersion !== expectedWriteVersion
+          ) {
+            conflictedKeys.push(item.key);
+            continue;
+          }
+
+          assertUniqueIndexes(collection, item.key, item.uniqueIndexes, stagedOwners);
           const result = updateDocumentWithTokenStmt.run(
             item.docJson,
             collection,
@@ -546,6 +556,7 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
             continue;
           }
         } else {
+          assertUniqueIndexes(collection, item.key, item.uniqueIndexes, stagedOwners);
           upsertDocumentStmt.run(collection, item.key, item.docJson);
         }
 

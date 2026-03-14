@@ -1008,6 +1008,72 @@ describe("batchSetWithResult()", () => {
       email: "concurrent@example.com",
     });
   });
+
+  test("preserves earlier successful writes when a later stale-token item conflicts on uniqueness", async () => {
+    await engine.put(
+      "users",
+      "u1",
+      { id: "u1", email: "u1-old@example.com" },
+      { primary: "u1", byEmail: "u1-old@example.com" },
+      undefined,
+      undefined,
+      { byEmail: "u1-old@example.com" },
+    );
+    await engine.put(
+      "users",
+      "u2",
+      { id: "u2", email: "u2-old@example.com" },
+      { primary: "u2", byEmail: "u2-old@example.com" },
+      undefined,
+      undefined,
+      { byEmail: "u2-old@example.com" },
+    );
+
+    const withMetadata = await engine.batchGetWithMetadata!("users", ["u1", "u2"]);
+    const tokenU1 = withMetadata.find((entry) => entry.key === "u1")?.writeToken;
+    const tokenU2 = withMetadata.find((entry) => entry.key === "u2")?.writeToken;
+
+    expect(typeof tokenU1).toBe("string");
+    expect(typeof tokenU2).toBe("string");
+
+    await engine.update(
+      "users",
+      "u2",
+      { id: "u2", email: "u2-current@example.com" },
+      { primary: "u2", byEmail: "u2-current@example.com" },
+      undefined,
+      undefined,
+      { byEmail: "u2-current@example.com" },
+    );
+
+    const result = await engine.batchSetWithResult!("users", [
+      {
+        key: "u1",
+        doc: { id: "u1", email: "shared@example.com" },
+        indexes: { primary: "u1", byEmail: "shared@example.com" },
+        uniqueIndexes: { byEmail: "shared@example.com" },
+        expectedWriteToken: tokenU1,
+      },
+      {
+        key: "u2",
+        doc: { id: "u2", email: "shared@example.com" },
+        indexes: { primary: "u2", byEmail: "shared@example.com" },
+        uniqueIndexes: { byEmail: "shared@example.com" },
+        expectedWriteToken: tokenU2,
+      },
+    ]);
+
+    expect(result.persistedKeys).toEqual(["u1"]);
+    expect(result.conflictedKeys).toEqual(["u2"]);
+    expect(await engine.get("users", "u1")).toEqual({
+      id: "u1",
+      email: "shared@example.com",
+    });
+    expect(await engine.get("users", "u2")).toEqual({
+      id: "u2",
+      email: "u2-current@example.com",
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
