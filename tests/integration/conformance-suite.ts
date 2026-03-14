@@ -210,6 +210,23 @@ export function runQueryEngineConformanceSuite<TOptions = Record<string, unknown
             },
           ]),
         ).rejects.toBeInstanceOf(EngineUniqueConstraintError);
+
+        await expect(
+          engine.batchSet(collection, [
+            {
+              key: "u4",
+              doc: { id: "u4", email: "fresh@example.com" },
+              indexes: { primary: "u4" },
+              uniqueIndexes: { byEmail: "fresh@example.com" },
+            },
+            {
+              key: "u5",
+              doc: { id: "u5", email: "fresh@example.com" },
+              indexes: { primary: "u5" },
+              uniqueIndexes: { byEmail: "fresh@example.com" },
+            },
+          ]),
+        ).rejects.toBeInstanceOf(EngineUniqueConstraintError);
       },
     );
 
