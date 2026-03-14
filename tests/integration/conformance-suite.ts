@@ -189,6 +189,18 @@ export function runQueryEngineConformanceSuite<TOptions = Record<string, unknown
         ).rejects.toBeInstanceOf(EngineUniqueConstraintError);
 
         await expect(
+          engine.put(
+            collection,
+            "u2",
+            { id: "u2", email: "sam@example.com" },
+            { primary: "u2" },
+            undefined,
+            undefined,
+            { byEmail: "sam@example.com" },
+          ),
+        ).rejects.toBeInstanceOf(EngineUniqueConstraintError);
+
+        await expect(
           engine.batchSet(collection, [
             {
               key: "u4",
