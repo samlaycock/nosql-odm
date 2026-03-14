@@ -135,6 +135,10 @@ describe("semver version helpers", () => {
     expect(compareSemverVersions("1.0.0+build.1", "1.0.0+build.2")).toBe(0);
   });
 
+  test("compareSemverVersions uses ASCII ordering for string prerelease identifiers", () => {
+    expect(compareSemverVersions("1.0.0-alpha.A", "1.0.0-alpha.a")).toBeLessThan(0);
+  });
+
   test("compareSemverVersions maps numeric schema versions to matching semver majors", () => {
     expect(compareSemverVersions("1.4.2", 1)).toBe(0);
     expect(compareSemverVersions("2.0.0-beta.1", 2)).toBe(0);

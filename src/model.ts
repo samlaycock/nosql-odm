@@ -1002,7 +1002,7 @@ function compareSemverPrereleaseIdentifiers(a: readonly string[], b: readonly st
       return 1;
     }
 
-    const diff = left.localeCompare(right);
+    const diff = left < right ? -1 : left > right ? 1 : 0;
 
     if (diff !== 0) {
       return diff;
