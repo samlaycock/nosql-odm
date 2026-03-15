@@ -758,7 +758,12 @@ export function compareSemverVersions(a: VersionValue, b: VersionValue): number 
     );
   }
 
+  if (left.kind === "schema" && right.kind === "schema") {
+    return left.major - right.major;
+  }
+
   if (left.kind === "schema" || right.kind === "schema") {
+    // Bridge semver strings onto the numeric schema chain by comparing only major versions.
     return left.major - right.major;
   }
 
@@ -825,7 +830,7 @@ function normalizeNumericVersion(value: string): number | null {
 }
 
 function normalizeSemverSchemaVersion(value: number): number | null {
-  if (!Number.isSafeInteger(value) || value < 0) {
+  if (!Number.isSafeInteger(value) || value <= 0) {
     return null;
   }
 

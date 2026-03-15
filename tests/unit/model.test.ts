@@ -124,6 +124,8 @@ describe("semver version helpers", () => {
   });
 
   test("parseSemverVersion rejects invalid semver-like values", () => {
+    expect(parseSemverVersion(0)).toBeNull();
+    expect(parseSemverVersion("0")).toBeNull();
     expect(parseSemverVersion("release-1")).toBeNull();
     expect(parseSemverVersion("1.02.3")).toBeNull();
     expect(parseSemverVersion(1.5)).toBeNull();
