@@ -985,7 +985,7 @@ function compareSemverPrereleaseIdentifiers(a: readonly string[], b: readonly st
     const rightNumeric = /^\d+$/.test(right);
 
     if (leftNumeric && rightNumeric) {
-      const diff = Number(left) - Number(right);
+      const diff = compareSemverNumericIdentifiers(left, right);
 
       if (diff !== 0) {
         return diff;
@@ -1010,6 +1010,14 @@ function compareSemverPrereleaseIdentifiers(a: readonly string[], b: readonly st
   }
 
   return 0;
+}
+
+function compareSemverNumericIdentifiers(left: string, right: string): number {
+  if (left.length !== right.length) {
+    return left.length - right.length;
+  }
+
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 // ---------------------------------------------------------------------------
