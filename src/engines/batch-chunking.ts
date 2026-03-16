@@ -17,7 +17,13 @@ export function* chunkArray<T>(
   items: readonly T[],
   size: number,
 ): Generator<readonly T[], void, undefined> {
-  for (let index = 0; index < items.length; index += size) {
-    yield items.slice(index, index + size);
+  if (!Number.isFinite(size) || size <= 0) {
+    throw new Error("chunkArray size must be a positive number");
+  }
+
+  const normalizedSize = Math.floor(size);
+
+  for (let index = 0; index < items.length; index += normalizedSize) {
+    yield items.slice(index, index + normalizedSize);
   }
 }
