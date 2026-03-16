@@ -1,4 +1,5 @@
 import { DefaultMigrator } from "../migrator";
+import { chunkArray, normalizeBatchChunkSize } from "./batch-chunking";
 import { getPreparedSerializedDocument, prepareDocumentForStorage } from "./document-preparation";
 import {
   encodeQueryPageCursor,
@@ -28,6 +29,8 @@ const DEFAULT_INDEXES_TABLE = "nosql_odm_index_entries";
 const DEFAULT_MIGRATION_METADATA_TABLE = "nosql_odm_migration_metadata";
 const DEFAULT_MIGRATION_LOCKS_TABLE = "nosql_odm_migration_locks";
 const DEFAULT_MIGRATION_CHECKPOINTS_TABLE = "nosql_odm_migration_checkpoints";
+const DEFAULT_BATCH_GET_CHUNK_SIZE = 1_000;
+const DEFAULT_BATCH_SET_CHUNK_SIZE = 250;
 const OUTDATED_PAGE_LIMIT = 100;
 const OUTDATED_SCAN_CHUNK_SIZE = 256;
 
@@ -56,6 +59,8 @@ export interface PostgresEngineOptions {
   migrationMetadataTable?: string;
   migrationLocksTable?: string;
   migrationCheckpointsTable?: string;
+  batchGetChunkSize?: number;
+  batchSetChunkSize?: number;
 }
 
 export interface PostgresQueryEngine extends QueryEngine<never> {}
@@ -82,6 +87,14 @@ interface TableRefs {
 
 export function postgresEngine(options: PostgresEngineOptions): PostgresQueryEngine {
   const client = options.client;
+  const batchGetChunkSize = normalizeBatchChunkSize(
+    options.batchGetChunkSize,
+    DEFAULT_BATCH_GET_CHUNK_SIZE,
+  );
+  const batchSetChunkSize = normalizeBatchChunkSize(
+    options.batchSetChunkSize,
+    DEFAULT_BATCH_SET_CHUNK_SIZE,
+  );
   const refs: TableRefs = {
     schema: quoteIdentifier(normalizeIdentifier(options.schema ?? DEFAULT_SCHEMA, "schema")),
     documentsTable: qualifyTableName(
@@ -112,6 +125,39 @@ export function postgresEngine(options: PostgresEngineOptions): PostgresQueryEng
   };
 
   const ready = ensureSchema(client, refs);
+
+  const fetchBatchGetDocuments = async (
+    collection: string,
+    keys: string[],
+  ): Promise<Map<string, QueryRow>> => {
+    const uniqueKeys = uniqueStrings(keys);
+
+    if (uniqueKeys.length === 0) {
+      return new Map();
+    }
+
+    const fetched = new Map<string, QueryRow>();
+
+    for (const chunk of chunkArray(uniqueKeys, batchGetChunkSize)) {
+      const rows = await fetchRows(client, {
+        sql: `
+          SELECT doc_key AS key, doc_json, write_version
+          FROM ${refs.documentsTable}
+          WHERE collection = $1
+            AND doc_key = ANY($2::text[])
+        `,
+        params: [collection, chunk],
+        errorMessage: "Postgres returned an invalid batch get result",
+      });
+
+      for (const row of rows) {
+        const parsed = parseQueryRow(row, collection);
+        fetched.set(parsed.key, parsed);
+      }
+    }
+
+    return fetched;
+  };
 
   const engine: PostgresQueryEngine = {
     capabilities: {
@@ -280,29 +326,11 @@ export function postgresEngine(options: PostgresEngineOptions): PostgresQueryEng
     async batchGet(collection, keys) {
       await ready;
 
-      const uniqueKeys = uniqueStrings(keys);
-
-      if (uniqueKeys.length === 0) {
+      if (keys.length === 0) {
         return [];
       }
 
-      const rows = await fetchRows(client, {
-        sql: `
-          SELECT doc_key AS key, doc_json, write_version
-          FROM ${refs.documentsTable}
-          WHERE collection = $1
-            AND doc_key = ANY($2::text[])
-        `,
-        params: [collection, uniqueKeys],
-        errorMessage: "Postgres returned an invalid batch get result",
-      });
-
-      const fetched = new Map<string, QueryRow>();
-
-      for (const row of rows) {
-        const parsed = parseQueryRow(row, collection);
-        fetched.set(parsed.key, parsed);
-      }
+      const fetched = await fetchBatchGetDocuments(collection, keys);
 
       const results: KeyedDocument[] = [];
 
@@ -325,29 +353,11 @@ export function postgresEngine(options: PostgresEngineOptions): PostgresQueryEng
     async batchGetWithMetadata(collection, keys) {
       await ready;
 
-      const uniqueKeys = uniqueStrings(keys);
-
-      if (uniqueKeys.length === 0) {
+      if (keys.length === 0) {
         return [];
       }
 
-      const rows = await fetchRows(client, {
-        sql: `
-          SELECT doc_key AS key, doc_json, write_version
-          FROM ${refs.documentsTable}
-          WHERE collection = $1
-            AND doc_key = ANY($2::text[])
-        `,
-        params: [collection, uniqueKeys],
-        errorMessage: "Postgres returned an invalid batch get result",
-      });
-
-      const fetched = new Map<string, QueryRow>();
-
-      for (const row of rows) {
-        const parsed = parseQueryRow(row, collection);
-        fetched.set(parsed.key, parsed);
-      }
+      const fetched = await fetchBatchGetDocuments(collection, keys);
 
       const results: KeyedDocument[] = [];
 
@@ -372,14 +382,16 @@ export function postgresEngine(options: PostgresEngineOptions): PostgresQueryEng
       await ready;
 
       await withTransaction(client, async (tx) => {
-        await applyBatchSet(tx, refs, collection, items);
+        await applyBatchSet(tx, refs, collection, items, batchSetChunkSize);
       });
     },
 
     async batchSetWithResult(collection, items) {
       await ready;
 
-      return withTransaction(client, async (tx) => applyBatchSet(tx, refs, collection, items));
+      return withTransaction(client, async (tx) =>
+        applyBatchSet(tx, refs, collection, items, batchSetChunkSize),
+      );
     },
 
     async batchDelete(collection, keys) {
@@ -912,7 +924,29 @@ async function applyBatchSet(
   tx: PostgresSessionLike,
   refs: TableRefs,
   collection: string,
-  items: BatchSetItem[],
+  items: readonly BatchSetItem[],
+  chunkSize: number,
+): Promise<BatchSetResult> {
+  const persistedKeys: string[] = [];
+  const conflictedKeys: string[] = [];
+
+  for (const chunk of chunkArray(items, chunkSize)) {
+    const result = await applyBatchSetChunk(tx, refs, collection, chunk);
+    persistedKeys.push(...result.persistedKeys);
+    conflictedKeys.push(...result.conflictedKeys);
+  }
+
+  return {
+    persistedKeys,
+    conflictedKeys,
+  };
+}
+
+async function applyBatchSetChunk(
+  tx: PostgresSessionLike,
+  refs: TableRefs,
+  collection: string,
+  items: readonly BatchSetItem[],
 ): Promise<BatchSetResult> {
   const persistedKeys: string[] = [];
   const conflictedKeys: string[] = [];

@@ -389,6 +389,39 @@ describe("postgresEngine integration", () => {
     expect(first.nested).not.toBe(second.nested);
   });
 
+  test("batchGet and batchSet support configured chunking for large batches", async () => {
+    const customEngine = postgresEngine({
+      client: requirePool(),
+      schema: schemaName,
+      batchGetChunkSize: 11,
+      batchSetChunkSize: 13,
+    });
+    const customCollection = nextCollection("chunked_users");
+    const items = Array.from({ length: 130 }, (_, i) => {
+      const key = `u${String(i).padStart(3, "0")}`;
+
+      return {
+        key,
+        doc: { id: key, order: i },
+        indexes: { primary: key },
+      };
+    });
+
+    await customEngine.batchSet(customCollection, items);
+
+    const docs = await customEngine.batchGet(
+      customCollection,
+      items.map((item) => item.key),
+    );
+
+    expect(docs).toHaveLength(items.length);
+    expect(docs.map((item) => item.key)).toEqual(items.map((item) => item.key));
+    expect(await customEngine.get(customCollection, "u064")).toEqual({
+      id: "u064",
+      order: 64,
+    });
+  });
+
   test("query supports equality, sorting, and cursor pagination", async () => {
     await engine.put(collection, "u1", { id: "u1" }, { byRole: "member#a" });
     await engine.put(collection, "u2", { id: "u2" }, { byRole: "member#c" });
