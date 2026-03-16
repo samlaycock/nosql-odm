@@ -1,4 +1,5 @@
 import { DefaultMigrator } from "../migrator";
+import { chunkArray, normalizeBatchChunkSize } from "./batch-chunking";
 import { getPreparedSerializedDocument, prepareDocumentForStorage } from "./document-preparation";
 import {
   encodeQueryPageCursor,
@@ -27,6 +28,9 @@ const DEFAULT_INDEXES_TABLE = "nosql_odm_index_entries";
 const DEFAULT_MIGRATION_METADATA_TABLE = "nosql_odm_migration_metadata";
 const DEFAULT_MIGRATION_LOCKS_TABLE = "nosql_odm_migration_locks";
 const DEFAULT_MIGRATION_CHECKPOINTS_TABLE = "nosql_odm_migration_checkpoints";
+const DEFAULT_BATCH_GET_CHUNK_SIZE = 1_000;
+const DEFAULT_BATCH_SET_CHUNK_SIZE = 250;
+const MYSQL_MAX_BATCH_GET_KEYS_PER_QUERY = 65_534;
 
 const OUTDATED_PAGE_LIMIT = 100;
 const OUTDATED_SCAN_CHUNK_SIZE = 256;
@@ -55,6 +59,8 @@ export interface MySqlEngineOptions {
   migrationMetadataTable?: string;
   migrationLocksTable?: string;
   migrationCheckpointsTable?: string;
+  batchGetChunkSize?: number;
+  batchSetChunkSize?: number;
 }
 
 export interface MySqlQueryEngine extends QueryEngine<never> {}
@@ -82,6 +88,48 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
   const client = options.client;
   const refs = buildTableRefs(options);
   const ready = ensureSchema(client, refs);
+  const batchGetChunkSize = normalizeBatchChunkSize(
+    options.batchGetChunkSize,
+    DEFAULT_BATCH_GET_CHUNK_SIZE,
+    MYSQL_MAX_BATCH_GET_KEYS_PER_QUERY,
+  );
+  const batchSetChunkSize = normalizeBatchChunkSize(
+    options.batchSetChunkSize,
+    DEFAULT_BATCH_SET_CHUNK_SIZE,
+  );
+
+  const fetchBatchGetDocuments = async (
+    collection: string,
+    keys: string[],
+  ): Promise<Map<string, QueryRow>> => {
+    const uniqueKeys = uniqueStrings(keys);
+
+    if (uniqueKeys.length === 0) {
+      return new Map();
+    }
+
+    const fetched = new Map<string, QueryRow>();
+
+    for (const chunk of chunkArray(uniqueKeys, batchGetChunkSize)) {
+      const placeholders = createPlaceholders(chunk.length);
+      const rows = await fetchRows(client, {
+        sql: `
+          SELECT doc_key AS \`key\`, doc_json, write_version
+          FROM ${refs.documentsTable}
+          WHERE collection = ? AND doc_key IN (${placeholders})
+        `,
+        params: [collection, ...chunk],
+        errorMessage: "MySQL returned an invalid batch get result",
+      });
+
+      for (const row of rows) {
+        const parsed = parseQueryRow(row, collection);
+        fetched.set(parsed.key, parsed);
+      }
+    }
+
+    return fetched;
+  };
 
   const engine: MySqlQueryEngine = {
     capabilities: {
@@ -252,29 +300,11 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
     async batchGet(collection, keys) {
       await ready;
 
-      const uniqueKeys = uniqueStrings(keys);
-
-      if (uniqueKeys.length === 0) {
+      if (keys.length === 0) {
         return [];
       }
 
-      const placeholders = createPlaceholders(uniqueKeys.length);
-      const rows = await fetchRows(client, {
-        sql: `
-          SELECT doc_key AS \`key\`, doc_json, write_version
-          FROM ${refs.documentsTable}
-          WHERE collection = ? AND doc_key IN (${placeholders})
-        `,
-        params: [collection, ...uniqueKeys],
-        errorMessage: "MySQL returned an invalid batch get result",
-      });
-
-      const fetched = new Map<string, QueryRow>();
-
-      for (const row of rows) {
-        const parsed = parseQueryRow(row, collection);
-        fetched.set(parsed.key, parsed);
-      }
+      const fetched = await fetchBatchGetDocuments(collection, keys);
 
       const results: KeyedDocument[] = [];
 
@@ -297,29 +327,11 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
     async batchGetWithMetadata(collection, keys) {
       await ready;
 
-      const uniqueKeys = uniqueStrings(keys);
-
-      if (uniqueKeys.length === 0) {
+      if (keys.length === 0) {
         return [];
       }
 
-      const placeholders = createPlaceholders(uniqueKeys.length);
-      const rows = await fetchRows(client, {
-        sql: `
-          SELECT doc_key AS \`key\`, doc_json, write_version
-          FROM ${refs.documentsTable}
-          WHERE collection = ? AND doc_key IN (${placeholders})
-        `,
-        params: [collection, ...uniqueKeys],
-        errorMessage: "MySQL returned an invalid batch get result",
-      });
-
-      const fetched = new Map<string, QueryRow>();
-
-      for (const row of rows) {
-        const parsed = parseQueryRow(row, collection);
-        fetched.set(parsed.key, parsed);
-      }
+      const fetched = await fetchBatchGetDocuments(collection, keys);
 
       const results: KeyedDocument[] = [];
 
@@ -344,14 +356,16 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
       await ready;
 
       await withTransaction(client, async (tx) => {
-        await applyBatchSet(tx, refs, collection, items);
+        await applyBatchSet(tx, refs, collection, items, batchSetChunkSize);
       });
     },
 
     async batchSetWithResult(collection, items) {
       await ready;
 
-      return withTransaction(client, async (tx) => applyBatchSet(tx, refs, collection, items));
+      return withTransaction(client, async (tx) =>
+        applyBatchSet(tx, refs, collection, items, batchSetChunkSize),
+      );
     },
 
     async batchDelete(collection, keys) {
@@ -869,7 +883,29 @@ async function applyBatchSet(
   tx: MySqlConnectionLike,
   refs: TableRefs,
   collection: string,
-  items: BatchSetItem[],
+  items: readonly BatchSetItem[],
+  chunkSize: number,
+): Promise<BatchSetResult> {
+  const persistedKeys: string[] = [];
+  const conflictedKeys: string[] = [];
+
+  for (const chunk of chunkArray(items, chunkSize)) {
+    const result = await applyBatchSetChunk(tx, refs, collection, chunk);
+    persistedKeys.push(...result.persistedKeys);
+    conflictedKeys.push(...result.conflictedKeys);
+  }
+
+  return {
+    persistedKeys,
+    conflictedKeys,
+  };
+}
+
+async function applyBatchSetChunk(
+  tx: MySqlConnectionLike,
+  refs: TableRefs,
+  collection: string,
+  items: readonly BatchSetItem[],
 ): Promise<BatchSetResult> {
   const persistedKeys: string[] = [];
   const conflictedKeys: string[] = [];

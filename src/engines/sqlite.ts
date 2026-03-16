@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 
 import { DefaultMigrator } from "../migrator";
+import { chunkArray, normalizeBatchChunkSize } from "./batch-chunking";
 import { getPreparedSerializedDocument, prepareDocumentForStorage } from "./document-preparation";
 import {
   encodeQueryPageCursor,
@@ -8,6 +9,7 @@ import {
   type QueryCursorPosition,
 } from "./query-cursor";
 import {
+  type BatchSetItem,
   type BatchSetResult,
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
@@ -31,6 +33,7 @@ const OUTDATED_PAGE_LIMIT = 100;
 const OUTDATED_SCAN_CHUNK_SIZE = 256;
 const SQLITE_MAX_VARIABLES = 999;
 const SQLITE_BATCH_GET_KEYS_PER_QUERY = SQLITE_MAX_VARIABLES - 1;
+const DEFAULT_BATCH_SET_CHUNK_SIZE = 250;
 
 interface DocumentRow {
   id: number;
@@ -80,6 +83,8 @@ interface MigrationMetadata {
 
 export interface SqliteEngineOptions {
   database: Database.Database;
+  batchGetChunkSize?: number;
+  batchSetChunkSize?: number;
 }
 
 export interface SqliteQueryEngine extends QueryEngine<never> {
@@ -89,6 +94,15 @@ export interface SqliteQueryEngine extends QueryEngine<never> {
 
 export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
   const db = options.database;
+  const batchGetChunkSize = normalizeBatchChunkSize(
+    options.batchGetChunkSize,
+    SQLITE_BATCH_GET_KEYS_PER_QUERY,
+    SQLITE_BATCH_GET_KEYS_PER_QUERY,
+  );
+  const batchSetChunkSize = normalizeBatchChunkSize(
+    options.batchSetChunkSize,
+    DEFAULT_BATCH_SET_CHUNK_SIZE,
+  );
 
   configureDatabase(db, options);
   runMigrations(db);
@@ -294,8 +308,7 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
 
     const rowsByKey = new Map<string, BatchGetRow>();
 
-    for (let index = 0; index < uniqueKeys.length; index += SQLITE_BATCH_GET_KEYS_PER_QUERY) {
-      const chunk = uniqueKeys.slice(index, index + SQLITE_BATCH_GET_KEYS_PER_QUERY);
+    for (const chunk of chunkArray(uniqueKeys, batchGetChunkSize)) {
       const statement = getSelectDocumentsByKeysStmt(chunk.length);
       const rows = statement.all(collection, ...chunk) as BatchGetRow[];
 
@@ -385,6 +398,115 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
 
     for (const [indexName, indexValue] of Object.entries(uniqueIndexes)) {
       stagedOwners.set(getUniqueOwnershipKey(indexName, String(indexValue)), key);
+    }
+  };
+
+  interface PreparedBatchSetItem {
+    key: string;
+    docJson: string;
+    indexes: ResolvedIndexKeys;
+    uniqueIndexes: ResolvedIndexKeys;
+    metadata: MigrationMetadata;
+  }
+
+  interface PreparedBatchSetWithResultItem extends PreparedBatchSetItem {
+    expectedWriteToken?: string;
+  }
+
+  const prepareBatchSetItem = (collection: string, item: BatchSetItem): PreparedBatchSetItem => ({
+    key: item.key,
+    docJson: serializeDocument(item.doc, collection, item.key),
+    indexes: item.indexes,
+    uniqueIndexes: item.uniqueIndexes ?? {},
+    metadata: normalizeMigrationMetadata(item.migrationMetadata) ?? deriveLegacyMetadata(item.doc),
+  });
+
+  const prepareBatchSetWithResultItem = (
+    collection: string,
+    item: BatchSetItem,
+  ): PreparedBatchSetWithResultItem => ({
+    ...prepareBatchSetItem(collection, item),
+    expectedWriteToken: item.expectedWriteToken,
+  });
+
+  const applyPreparedBatchSetChunk = (
+    collection: string,
+    items: readonly PreparedBatchSetItem[],
+    stagedOwners: Map<string, string>,
+  ): void => {
+    for (const item of items) {
+      assertUniqueIndexes(collection, item.key, item.uniqueIndexes, stagedOwners);
+      upsertDocumentStmt.run(collection, item.key, item.docJson);
+      deleteIndexesForDocumentStmt.run(collection, item.key);
+      replaceUniqueIndexes(collection, item.key, item.uniqueIndexes);
+      rememberStagedUniqueIndexes(item.key, item.uniqueIndexes, stagedOwners);
+
+      for (const [indexName, indexValue] of Object.entries(item.indexes)) {
+        insertIndexStmt.run(collection, item.key, indexName, String(indexValue));
+      }
+
+      upsertMigrationMetadataStmt.run(
+        collection,
+        item.key,
+        item.metadata.targetVersion,
+        item.metadata.versionState,
+        item.metadata.indexSignature,
+      );
+    }
+  };
+
+  const applyPreparedBatchSetChunkWithResult = (
+    collection: string,
+    items: readonly PreparedBatchSetWithResultItem[],
+    stagedOwners: Map<string, string>,
+    persistedKeys: string[],
+    conflictedKeys: string[],
+  ): void => {
+    for (const item of items) {
+      if (item.expectedWriteToken !== undefined) {
+        const expectedWriteVersion = parseWriteToken(item.expectedWriteToken);
+        const existing = selectDocumentByKeyStmt.get(collection, item.key);
+        const currentWriteVersion = Number(existing?.write_version ?? Number.NaN);
+
+        if (!Number.isFinite(currentWriteVersion) || currentWriteVersion !== expectedWriteVersion) {
+          conflictedKeys.push(item.key);
+          continue;
+        }
+
+        assertUniqueIndexes(collection, item.key, item.uniqueIndexes, stagedOwners);
+        const result = updateDocumentWithTokenStmt.run(
+          item.docJson,
+          collection,
+          item.key,
+          expectedWriteVersion,
+        ) as { changes?: unknown };
+        const changes = Number(result?.changes ?? 0);
+
+        if (!Number.isFinite(changes) || changes < 1) {
+          conflictedKeys.push(item.key);
+          continue;
+        }
+      } else {
+        assertUniqueIndexes(collection, item.key, item.uniqueIndexes, stagedOwners);
+        upsertDocumentStmt.run(collection, item.key, item.docJson);
+      }
+
+      deleteIndexesForDocumentStmt.run(collection, item.key);
+      replaceUniqueIndexes(collection, item.key, item.uniqueIndexes);
+      rememberStagedUniqueIndexes(item.key, item.uniqueIndexes, stagedOwners);
+
+      for (const [indexName, indexValue] of Object.entries(item.indexes)) {
+        insertIndexStmt.run(collection, item.key, indexName, String(indexValue));
+      }
+
+      upsertMigrationMetadataStmt.run(
+        collection,
+        item.key,
+        item.metadata.targetVersion,
+        item.metadata.versionState,
+        item.metadata.indexSignature,
+      );
+      persistedKeys.push(item.key);
     }
   };
 
@@ -478,104 +600,33 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
   );
 
   const batchSetTxn = db.transaction(
-    (
-      collection: string,
-      items: {
-        key: string;
-        docJson: string;
-        indexes: ResolvedIndexKeys;
-        uniqueIndexes: ResolvedIndexKeys;
-        metadata: MigrationMetadata;
-      }[],
-    ): void => {
+    (collection: string, items: readonly BatchSetItem[], chunkSize: number): void => {
       const stagedOwners = new Map<string, string>();
 
-      for (const item of items) {
-        assertUniqueIndexes(collection, item.key, item.uniqueIndexes, stagedOwners);
-        upsertDocumentStmt.run(collection, item.key, item.docJson);
-        deleteIndexesForDocumentStmt.run(collection, item.key);
-        replaceUniqueIndexes(collection, item.key, item.uniqueIndexes);
-        rememberStagedUniqueIndexes(item.key, item.uniqueIndexes, stagedOwners);
-
-        for (const [indexName, indexValue] of Object.entries(item.indexes)) {
-          insertIndexStmt.run(collection, item.key, indexName, String(indexValue));
-        }
-
-        upsertMigrationMetadataStmt.run(
+      for (const chunk of chunkArray(items, chunkSize)) {
+        applyPreparedBatchSetChunk(
           collection,
-          item.key,
-          item.metadata.targetVersion,
-          item.metadata.versionState,
-          item.metadata.indexSignature,
+          chunk.map((item) => prepareBatchSetItem(collection, item)),
+          stagedOwners,
         );
       }
     },
   );
 
   const batchSetWithResultTxn = db.transaction(
-    (
-      collection: string,
-      items: {
-        key: string;
-        docJson: string;
-        indexes: ResolvedIndexKeys;
-        uniqueIndexes: ResolvedIndexKeys;
-        metadata: MigrationMetadata;
-        expectedWriteToken?: string;
-      }[],
-    ): BatchSetResult => {
+    (collection: string, items: readonly BatchSetItem[], chunkSize: number): BatchSetResult => {
       const persistedKeys: string[] = [];
       const conflictedKeys: string[] = [];
       const stagedOwners = new Map<string, string>();
 
-      for (const item of items) {
-        if (item.expectedWriteToken !== undefined) {
-          const expectedWriteVersion = parseWriteToken(item.expectedWriteToken);
-          const existing = selectDocumentByKeyStmt.get(collection, item.key);
-          const currentWriteVersion = Number(existing?.write_version ?? Number.NaN);
-
-          if (
-            !Number.isFinite(currentWriteVersion) ||
-            currentWriteVersion !== expectedWriteVersion
-          ) {
-            conflictedKeys.push(item.key);
-            continue;
-          }
-
-          assertUniqueIndexes(collection, item.key, item.uniqueIndexes, stagedOwners);
-          const result = updateDocumentWithTokenStmt.run(
-            item.docJson,
-            collection,
-            item.key,
-            expectedWriteVersion,
-          ) as { changes?: unknown };
-          const changes = Number(result?.changes ?? 0);
-
-          if (!Number.isFinite(changes) || changes < 1) {
-            conflictedKeys.push(item.key);
-            continue;
-          }
-        } else {
-          assertUniqueIndexes(collection, item.key, item.uniqueIndexes, stagedOwners);
-          upsertDocumentStmt.run(collection, item.key, item.docJson);
-        }
-
-        deleteIndexesForDocumentStmt.run(collection, item.key);
-        replaceUniqueIndexes(collection, item.key, item.uniqueIndexes);
-        rememberStagedUniqueIndexes(item.key, item.uniqueIndexes, stagedOwners);
-
-        for (const [indexName, indexValue] of Object.entries(item.indexes)) {
-          insertIndexStmt.run(collection, item.key, indexName, String(indexValue));
-        }
-
-        upsertMigrationMetadataStmt.run(
+      for (const chunk of chunkArray(items, chunkSize)) {
+        applyPreparedBatchSetChunkWithResult(
           collection,
-          item.key,
-          item.metadata.targetVersion,
-          item.metadata.versionState,
-          item.metadata.indexSignature,
+          chunk.map((item) => prepareBatchSetWithResultItem(collection, item)),
+          stagedOwners,
+          persistedKeys,
+          conflictedKeys,
         );
-        persistedKeys.push(item.key);
       }
 
       return {
@@ -745,30 +796,11 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
     },
 
     async batchSet(collection, items) {
-      const prepared = items.map((item) => ({
-        key: item.key,
-        docJson: serializeDocument(item.doc, collection, item.key),
-        indexes: item.indexes,
-        uniqueIndexes: item.uniqueIndexes ?? {},
-        metadata:
-          normalizeMigrationMetadata(item.migrationMetadata) ?? deriveLegacyMetadata(item.doc),
-      }));
-
-      batchSetTxn(collection, prepared);
+      batchSetTxn(collection, items, batchSetChunkSize);
     },
 
     async batchSetWithResult(collection, items) {
-      const prepared = items.map((item) => ({
-        key: item.key,
-        docJson: serializeDocument(item.doc, collection, item.key),
-        indexes: item.indexes,
-        uniqueIndexes: item.uniqueIndexes ?? {},
-        metadata:
-          normalizeMigrationMetadata(item.migrationMetadata) ?? deriveLegacyMetadata(item.doc),
-        expectedWriteToken: item.expectedWriteToken,
-      }));
-
-      return batchSetWithResultTxn(collection, prepared);
+      return batchSetWithResultTxn(collection, items, batchSetChunkSize);
     },
 
     async batchDelete(collection, keys) {

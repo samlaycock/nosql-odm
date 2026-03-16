@@ -1,7 +1,7 @@
 import type BetterSqlite3 from "better-sqlite3";
 
 import { Database as BunDatabase } from "bun:sqlite";
-import { afterEach, beforeEach } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
 import { sqliteEngine, type SqliteQueryEngine } from "../../src/engines/sqlite";
 import { runQueryEngineConformanceSuite } from "./conformance-suite";
@@ -81,4 +81,42 @@ runQueryEngineConformanceSuite({
   getEngine: () => engine,
   nextCollection,
   assertEngineUniqueConstraintConformance: true,
+});
+
+describe("sqliteEngine integration", () => {
+  test("batchGet and batchSet support configured chunking for large batches", async () => {
+    const customEngine = sqliteEngine({
+      database: new BunBetterSqliteCompat(":memory:") as unknown as BetterSqlite3.Database,
+      batchGetChunkSize: 11,
+      batchSetChunkSize: 13,
+    });
+    const collection = nextCollection("chunked_users");
+    const items = Array.from({ length: 130 }, (_, i) => {
+      const key = `u${String(i).padStart(3, "0")}`;
+
+      return {
+        key,
+        doc: { id: key, order: i },
+        indexes: { primary: key },
+      };
+    });
+
+    try {
+      await customEngine.batchSet(collection, items);
+
+      const docs = await customEngine.batchGet(
+        collection,
+        items.map((item) => item.key),
+      );
+
+      expect(docs).toHaveLength(items.length);
+      expect(docs.map((item) => item.key)).toEqual(items.map((item) => item.key));
+      expect(await customEngine.get(collection, "u064")).toEqual({
+        id: "u064",
+        order: 64,
+      });
+    } finally {
+      customEngine.close();
+    }
+  });
 });
