@@ -2194,6 +2194,130 @@ describe("store.batchGet()", () => {
 });
 
 // ---------------------------------------------------------------------------
+// CRUD - batchGetOrdered
+// ---------------------------------------------------------------------------
+
+describe("store.batchGetOrdered()", () => {
+  test("returns documents in request order and includes nulls for missing keys", async () => {
+    const store = createStore(engine, [buildUserV1()]);
+
+    await store.user.create("u1", {
+      id: "u1",
+      name: "Sam",
+      email: "sam@example.com",
+    });
+    await store.user.create("u2", {
+      id: "u2",
+      name: "Other",
+      email: "other@example.com",
+    });
+
+    const results = await store.user.batchGetOrdered(["u2", "missing", "u1", "u2"]);
+
+    expect(results).toEqual([
+      {
+        id: "u2",
+        name: "Other",
+        email: "other@example.com",
+      },
+      null,
+      {
+        id: "u1",
+        name: "Sam",
+        email: "sam@example.com",
+      },
+      {
+        id: "u2",
+        name: "Other",
+        email: "other@example.com",
+      },
+    ]);
+    expect(results[0]).not.toBeNull();
+    expect(results[3]).not.toBeNull();
+    expect(results[0]).not.toBe(results[3]);
+  });
+
+  test("reconstructs ordered results from unordered engine.batchGet responses", async () => {
+    const calls: string[] = [];
+    const trackingEngine: QueryEngine<never> = {
+      async get() {
+        calls.push("get");
+        throw new Error("batchGetOrdered should not call engine.get");
+      },
+      async create() {},
+      async put() {},
+      async update() {},
+      async delete() {},
+      async query() {
+        return { documents: [], cursor: null };
+      },
+      async batchGet() {
+        calls.push("batchGet");
+        return [
+          {
+            key: "u1",
+            doc: {
+              __v: 1,
+              __indexes: ["byEmail", "primary"],
+              id: "u1",
+              name: "Sam",
+              email: "sam@example.com",
+            },
+          },
+          {
+            key: "u2",
+            doc: {
+              __v: 1,
+              __indexes: ["byEmail", "primary"],
+              id: "u2",
+              name: "Other",
+              email: "other@example.com",
+            },
+          },
+        ];
+      },
+      async batchSet() {},
+      async batchDelete() {},
+      migration: {
+        async acquireLock() {
+          return null;
+        },
+        async releaseLock() {},
+        async getOutdated() {
+          return { documents: [], cursor: null };
+        },
+      },
+    };
+
+    const store = createStore(trackingEngine, [buildUserV1()]);
+    const results = await store.user.batchGetOrdered(["u2", "missing", "u1", "u2"]);
+
+    expect(results).toEqual([
+      {
+        id: "u2",
+        name: "Other",
+        email: "other@example.com",
+      },
+      null,
+      {
+        id: "u1",
+        name: "Sam",
+        email: "sam@example.com",
+      },
+      {
+        id: "u2",
+        name: "Other",
+        email: "other@example.com",
+      },
+    ]);
+    expect(results[0]).not.toBeNull();
+    expect(results[3]).not.toBeNull();
+    expect(results[0]).not.toBe(results[3]);
+    expect(calls).toEqual(["batchGet"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // CRUD — batchSet
 // ---------------------------------------------------------------------------
 
@@ -5744,6 +5868,22 @@ describe("engine options passthrough", () => {
 
     expect(calls).toHaveLength(1);
     expect((calls[0] as any).options).toEqual({ trace: "batch-get-trace" });
+  });
+
+  test("batchGetOrdered passes options to engine.batchGet", async () => {
+    const calls: unknown[] = [];
+    const trackingEngine = buildTrackingEngine(calls, {
+      async batchGet(_collection, _ids, options) {
+        calls.push({ method: "batchGet", options });
+        return [];
+      },
+    });
+
+    const store = createStore(trackingEngine, [buildUserV1()]);
+    await store.user.batchGetOrdered(["u1", "u2"], { trace: "batch-get-ordered-trace" });
+
+    expect(calls).toHaveLength(1);
+    expect((calls[0] as any).options).toEqual({ trace: "batch-get-ordered-trace" });
   });
 
   test("batchDelete passes options to engine.batchDelete when available", async () => {
