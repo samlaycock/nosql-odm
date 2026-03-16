@@ -22,4 +22,13 @@ describe("batch chunking helpers", () => {
       ["e"],
     ]);
   });
+
+  test("rejects non-positive chunk sizes", () => {
+    expect(() => Array.from(chunkArray(["a"], 0))).toThrow(
+      "chunkArray size must be a positive number",
+    );
+    expect(() => Array.from(chunkArray(["a"], -1))).toThrow(
+      "chunkArray size must be a positive number",
+    );
+  });
 });
