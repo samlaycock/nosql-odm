@@ -126,6 +126,7 @@ export interface BoundModel<
   delete(key: string, options?: TOptions): Promise<void>;
 
   batchGet(keys: string[], options?: TOptions): Promise<T[]>;
+  batchGetOrdered(keys: string[], options?: TOptions): Promise<(T | null)[]>;
   batchSet(items: BatchSetInputItem<T>[], options?: TOptions): Promise<T[]>;
   batchDelete(keys: string[], options?: TOptions): Promise<void>;
 
@@ -751,10 +752,60 @@ class BoundModelImpl<
   }
 
   async batchGet(keys: string[], options?: TOptions): Promise<T[]> {
+    const results = await this.projectBatchGetResults(keys, options);
+    return results.map((result) => result.value);
+  }
+
+  async batchGetOrdered(keys: string[], options?: TOptions): Promise<(T | null)[]> {
+    const results = await this.projectBatchGetResults(keys, options);
+    const valuesByKey = new Map<
+      string,
+      {
+        fallback: T;
+        nextIndex: number;
+        values: T[];
+      }
+    >();
+
+    for (const result of results) {
+      const existing = valuesByKey.get(result.key);
+
+      if (existing) {
+        existing.values.push(result.value);
+      } else {
+        valuesByKey.set(result.key, {
+          fallback: result.value,
+          nextIndex: 0,
+          values: [result.value],
+        });
+      }
+    }
+
+    return keys.map((key) => {
+      const queued = valuesByKey.get(key);
+
+      if (!queued) {
+        return null;
+      }
+
+      if (queued.nextIndex < queued.values.length) {
+        const value = queued.values[queued.nextIndex];
+        queued.nextIndex += 1;
+        return value!;
+      }
+
+      return structuredClone(queued.fallback);
+    });
+  }
+
+  private async projectBatchGetResults(
+    keys: string[],
+    options?: TOptions,
+  ): Promise<{ key: string; value: T }[]> {
     const rawDocs = this.engine.batchGetWithMetadata
       ? await this.engine.batchGetWithMetadata(this.model.name, keys, options)
       : await this.engine.batchGet(this.model.name, keys, options);
-    const results: T[] = [];
+    const results: { key: string; value: T }[] = [];
     const writebacks: { key: string; value: T; expectedWriteToken?: string }[] = [];
 
     for (const { key, doc: rawDoc, writeToken } of rawDocs) {
@@ -773,7 +824,7 @@ class BoundModelImpl<
         });
       }
 
-      results.push(projected.value);
+      results.push({ key, value: projected.value });
     }
 
     await this.writebackMany(writebacks, "batchGet", options);
@@ -1858,6 +1909,7 @@ export function createStore<
       update: boundModel.update.bind(boundModel),
       delete: boundModel.delete.bind(boundModel),
       batchGet: boundModel.batchGet.bind(boundModel),
+      batchGetOrdered: boundModel.batchGetOrdered.bind(boundModel),
       batchSet: boundModel.batchSet.bind(boundModel),
       batchDelete: boundModel.batchDelete.bind(boundModel),
       getOrCreateMigration: boundModel.getOrCreateMigration.bind(boundModel),

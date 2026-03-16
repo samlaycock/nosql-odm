@@ -10,7 +10,7 @@ A lightweight, schema-first ODM for NoSQL-style data stores.
 - Optional strict migration error mode (`migrationErrors: "throw"`)
 - Ignore-first migration behavior for non-migratable documents
 - Dynamic index names (multi-tenant style index partitions)
-- Explicit bulk operations (`batchGet`, `batchSet`, `batchDelete`)
+- Explicit bulk operations (`batchGet`, `batchGetOrdered`, `batchSet`, `batchDelete`)
 - Pluggable query engine interface (memory, SQLite, IndexedDB, DynamoDB, Cassandra, Redis, MongoDB, and Firestore adapters included)
 
 ## Package Intent
@@ -581,7 +581,17 @@ await store.user.batchSet([
 ]);
 
 await store.user.batchDelete(["u2", "u3"]);
+
+const orderedUsers = await store.user.batchGetOrdered(["u3", "missing", "u2", "u3"]);
+// => [
+//   { id: "u3", firstName: "Alex", lastName: "Smith", email: "alex@example.com", role: "guest" },
+//   null,
+//   { id: "u2", firstName: "Jane", lastName: "Doe", email: "jane@example.com", role: "member" },
+//   { id: "u3", firstName: "Alex", lastName: "Smith", email: "alex@example.com", role: "guest" },
+// ]
 ```
+
+`batchGet()` keeps its existing "found documents only" behavior. Use `batchGetOrdered()` when you need positional parity with the requested keys, including `null` placeholders for missing documents.
 
 ## Querying
 
@@ -1048,6 +1058,7 @@ Read-path handling for skipped docs:
 
 - `findByKey()` returns `null`
 - `query()` and `batchGet()` omit them
+- `batchGetOrdered()` returns `null` placeholders to preserve request order
 
 ### 10. Event hooks
 
