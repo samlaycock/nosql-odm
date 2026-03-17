@@ -57,10 +57,12 @@ async function sleep(ms: number): Promise<void> {
 async function expectUniqueConstraintReject(work: Promise<unknown>): Promise<void> {
   try {
     await work;
-    throw new Error("expected unique constraint violation");
   } catch (error) {
     expect(error).toBeInstanceOf(UniqueConstraintError);
+    return;
   }
+
+  throw new Error("expected unique constraint violation");
 }
 
 function documentsCollection() {
