@@ -1346,6 +1346,9 @@ Unique index guarantees depend on engine capability declarations:
 
 - If a model declares `unique: true` indexes, `createStore()` requires an engine with
   `capabilities.uniqueConstraints === "atomic"`.
+- Engines that declare `capabilities.uniqueConstraints === "none"` can still be used with
+  unique indexes by opting into store-managed guards via
+  `createStore(..., { allowStoreManagedUniqueConstraints: true })`.
 - If not atomic, `createStore()` throws during startup (before runtime writes).
 - Runtime unique violations throw `UniqueConstraintError`.
 
@@ -1359,7 +1362,7 @@ Built-in engine capability matrix (`capabilities.uniqueConstraints`):
 | DynamoDB  | `nosql-odm/engines/dynamodb`  | `atomic`           |
 | Cassandra | `nosql-odm/engines/cassandra` | `atomic`           |
 | Redis     | `nosql-odm/engines/redis`     | `atomic`           |
-| MongoDB   | `nosql-odm/engines/mongodb`   | `atomic`           |
+| MongoDB   | `nosql-odm/engines/mongodb`   | `none`             |
 | Firestore | `nosql-odm/engines/firestore` | `atomic`           |
 | MySQL     | `nosql-odm/engines/mysql`     | `atomic`           |
 | Postgres  | `nosql-odm/engines/postgres`  | `atomic`           |
@@ -1432,7 +1435,9 @@ See `dist/index.d.ts` and `dist/engines/memory.d.ts` for full signatures.
   `encodeNumericIndexValue()` for numeric range/sort indexes.
 - Adding a new schema version resets builder indexes; re-add indexes for the latest shape.
 - `create`, `batchSet`, and `update` validate against the latest schema.
-- Unique indexes require an engine with atomic uniqueness support. `createStore()` throws if a model declares `unique: true` indexes and the selected engine cannot guarantee uniqueness.
+- Unique indexes require an engine with atomic uniqueness support unless you opt into
+  `allowStoreManagedUniqueConstraints` for engines that declare
+  `capabilities.uniqueConstraints === "none"` (including MongoDB).
 
 ## License
 
