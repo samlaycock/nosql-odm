@@ -247,6 +247,16 @@ class FakeMongoDocumentsCollectionWithShortBulkAck extends FakeMongoDocumentsCol
 }
 
 describe("mongodb engine batch operations", () => {
+  test('reports uniqueConstraints capability as "none"', () => {
+    const documents = new FakeMongoDocumentsCollection();
+    const metadata = new FakeMongoMetadataCollection();
+    const engine = mongoDbEngine({
+      database: new FakeMongoDatabase(documents, metadata),
+    });
+
+    expect(engine.capabilities?.uniqueConstraints).toBe("none");
+  });
+
   test("batchSet uses a single bulkWrite and sequence reservation for large batches", async () => {
     const documents = new FakeMongoDocumentsCollection();
     const metadata = new FakeMongoMetadataCollection();

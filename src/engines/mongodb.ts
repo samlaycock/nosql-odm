@@ -163,7 +163,7 @@ export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine
 
   const engine: MongoDbQueryEngine = {
     capabilities: {
-      uniqueConstraints: "atomic",
+      uniqueConstraints: "none",
     },
 
     prepareDocumentForWrite(doc, collection, key) {

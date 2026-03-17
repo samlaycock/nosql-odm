@@ -8,13 +8,17 @@ import {
   test,
 } from "bun:test";
 import { MongoClient, type Db } from "mongodb";
+import * as z from "zod";
 
-import { mongoDbEngine, type MongoDbQueryEngine } from "../../src/engines/mongodb";
 import {
+  createStore,
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
+  UniqueConstraintError,
+  model,
   type ComparableVersion,
-} from "../../src/engines/types";
+} from "../../src";
+import { mongoDbEngine, type MongoDbQueryEngine } from "../../src/engines/mongodb";
 import { runQueryEngineConformanceSuite } from "./conformance-suite";
 import { createCollectionNameFactory, createTestResourceName, expectReject } from "./helpers";
 import { runMigrationIntegrationSuite } from "./migration-suite";
@@ -48,6 +52,15 @@ async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
+}
+
+async function expectUniqueConstraintReject(work: Promise<unknown>): Promise<void> {
+  try {
+    await work;
+    throw new Error("expected unique constraint violation");
+  } catch (error) {
+    expect(error).toBeInstanceOf(UniqueConstraintError);
+  }
 }
 
 function documentsCollection() {
@@ -144,6 +157,10 @@ describe("mongoDbEngine integration", () => {
 
   test("get returns null for missing document", async () => {
     expect(await engine.get(collection, "missing")).toBeNull();
+  });
+
+  test('reports uniqueConstraints capability as "none"', () => {
+    expect(engine.capabilities?.uniqueConstraints).toBe("none");
   });
 
   test("create stores and get returns document", async () => {
@@ -286,6 +303,69 @@ describe("mongoDbEngine integration", () => {
     expect(await engine.get(collection, "u1")).toBeNull();
     expect(await engine.get(collection, "u2")).toEqual({ id: "u2", name: "B" });
     expect(await engine.get(collection, "u3")).toBeNull();
+  });
+
+  test("store-managed unique guards reject duplicate MongoDB writes when enabled", async () => {
+    const userModel = model("user")
+      .schema(
+        1,
+        z.object({
+          id: z.string(),
+          email: z.email(),
+        }),
+      )
+      .index({ name: "primary", value: "id" })
+      .index({ name: "byEmail", value: "email", unique: true })
+      .build();
+    const store = createStore(engine, [userModel], {
+      allowStoreManagedUniqueConstraints: true,
+    });
+
+    await store.user.create("u1", {
+      id: "u1",
+      email: "sam@example.com",
+    });
+    await store.user.create("u2", {
+      id: "u2",
+      email: "jamie@example.com",
+    });
+
+    await expectUniqueConstraintReject(
+      store.user.create("u3", {
+        id: "u3",
+        email: "sam@example.com",
+      }),
+    );
+    await expectUniqueConstraintReject(
+      store.user.update("u2", {
+        email: "sam@example.com",
+      }),
+    );
+    await expectUniqueConstraintReject(
+      store.user.batchSet([
+        {
+          key: "u4",
+          data: {
+            id: "u4",
+            email: "fresh@example.com",
+          },
+        },
+        {
+          key: "u5",
+          data: {
+            id: "u5",
+            email: "fresh@example.com",
+          },
+        },
+      ]),
+    );
+
+    expect(await store.user.findByKey("u2")).toEqual({
+      id: "u2",
+      email: "jamie@example.com",
+    });
+    expect(await store.user.findByKey("u4")).toBeNull();
+    expect(await store.user.findByKey("u5")).toBeNull();
   });
 
   test("batchSetWithResult skips stale migration writes when a document changed concurrently", async () => {
