@@ -1349,7 +1349,8 @@ Unique index guarantees depend on engine capability declarations:
 - Engines that declare `capabilities.uniqueConstraints === "none"` can still be used with
   unique indexes by opting into store-managed guards via
   `createStore(..., { allowStoreManagedUniqueConstraints: true })`.
-- If not atomic, `createStore()` throws during startup (before runtime writes).
+- If the engine is not atomic and `allowStoreManagedUniqueConstraints` is not set,
+  `createStore()` throws during startup (before runtime writes).
 - Runtime unique violations throw `UniqueConstraintError`.
 
 Built-in engine capability matrix (`capabilities.uniqueConstraints`):
