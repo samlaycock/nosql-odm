@@ -44,7 +44,15 @@ export interface BatchSetItem {
 }
 
 export interface BatchSetResult {
+  /**
+   * Keys that were durably persisted by the batch write.
+   */
   persistedKeys: string[];
+  /**
+   * Keys skipped due to optimistic-write token mismatches.
+   * Engines should still reject the full batch for structural validation
+   * failures or unique-constraint violations.
+   */
   conflictedKeys: string[];
 }
 
@@ -336,6 +344,11 @@ export interface QueryEngine<TOptions = Record<string, unknown>> {
     options?: TOptions,
   ): Promise<KeyedDocument[]>;
   batchSet(collection: string, items: BatchSetItem[], options?: TOptions): Promise<void>;
+  /**
+   * Like batchSet(), but reports per-item optimistic-write token conflicts
+   * through conflictedKeys. Engines should still reject on validation or
+   * unique-constraint errors rather than translating them into conflictedKeys.
+   */
   batchSetWithResult?(
     collection: string,
     items: BatchSetItem[],

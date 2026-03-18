@@ -255,6 +255,43 @@ export function runQueryEngineConformanceSuite<TOptions = Record<string, unknown
       },
     );
 
+    uniqueConstraintConformanceTest(
+      "batchSetWithResult rejects unique index violations instead of reporting conflicted keys",
+      async () => {
+        const engine = getEngine();
+
+        if (!engine.batchSetWithResult) {
+          expect(engine.batchSetWithResult).toBeUndefined();
+          return;
+        }
+
+        const collection = nextCollection("unique_batch_result_users");
+
+        await engine.create(
+          collection,
+          "u1",
+          { id: "u1", email: "sam@example.com" },
+          { primary: "u1" },
+          undefined,
+          undefined,
+          { byEmail: "sam@example.com" },
+        );
+
+        await expect(
+          engine.batchSetWithResult(collection, [
+            {
+              key: "u2",
+              doc: { id: "u2", email: "sam@example.com" },
+              indexes: { primary: "u2" },
+              uniqueIndexes: { byEmail: "sam@example.com" },
+            },
+          ]),
+        ).rejects.toBeInstanceOf(EngineUniqueConstraintError);
+
+        expect(await engine.get(collection, "u2")).toBeNull();
+      },
+    );
+
     test("skips stale migration writes consistently when supported", async () => {
       const engine = getEngine();
 
