@@ -198,12 +198,14 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
 
       const docJson = serializeDocument(doc);
       const normalizedIndexes = normalizeIndexes(indexes);
-      const normalizedUniqueIndexes = normalizeIndexes(uniqueIndexes ?? {});
+      const normalizedUniqueIndexes = normalizeOptionalUniqueIndexes(uniqueIndexes);
       const metadata = normalizeMigrationMetadata(migrationMetadata) ?? deriveLegacyMetadata(doc);
 
       try {
         await withTransaction(client, async (tx) => {
-          await assertUniqueIndexes(tx, refs, collection, key, normalizedUniqueIndexes);
+          if (normalizedUniqueIndexes) {
+            await assertUniqueIndexes(tx, refs, collection, key, normalizedUniqueIndexes);
+          }
           await tx.execute(
             `
               INSERT INTO ${refs.documentsTable} (collection, doc_key, doc_json)
@@ -212,7 +214,9 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
             [collection, key, docJson],
           );
 
-          await replaceUniqueIndexes(tx, refs, collection, key, normalizedUniqueIndexes);
+          if (normalizedUniqueIndexes) {
+            await replaceUniqueIndexes(tx, refs, collection, key, normalizedUniqueIndexes);
+          }
           await replaceIndexes(tx, refs, collection, key, normalizedIndexes, false);
           await upsertMigrationMetadata(tx, refs, collection, key, metadata);
         });
@@ -230,11 +234,13 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
 
       const docJson = serializeDocument(doc);
       const normalizedIndexes = normalizeIndexes(indexes);
-      const normalizedUniqueIndexes = normalizeIndexes(uniqueIndexes ?? {});
+      const normalizedUniqueIndexes = normalizeOptionalUniqueIndexes(uniqueIndexes);
       const metadata = normalizeMigrationMetadata(migrationMetadata) ?? deriveLegacyMetadata(doc);
 
       await withTransaction(client, async (tx) => {
-        await assertUniqueIndexes(tx, refs, collection, key, normalizedUniqueIndexes);
+        if (normalizedUniqueIndexes) {
+          await assertUniqueIndexes(tx, refs, collection, key, normalizedUniqueIndexes);
+        }
         await tx.execute(
           `
             INSERT INTO ${refs.documentsTable} (collection, doc_key, doc_json)
@@ -246,7 +252,9 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
           [collection, key, docJson],
         );
 
-        await replaceUniqueIndexes(tx, refs, collection, key, normalizedUniqueIndexes);
+        if (normalizedUniqueIndexes) {
+          await replaceUniqueIndexes(tx, refs, collection, key, normalizedUniqueIndexes);
+        }
         await replaceIndexes(tx, refs, collection, key, normalizedIndexes, true);
         await upsertMigrationMetadata(tx, refs, collection, key, metadata);
       });
@@ -257,10 +265,30 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
 
       const docJson = serializeDocument(doc);
       const normalizedIndexes = normalizeIndexes(indexes);
-      const normalizedUniqueIndexes = normalizeIndexes(uniqueIndexes ?? {});
+      const normalizedUniqueIndexes = normalizeOptionalUniqueIndexes(uniqueIndexes);
       const metadata = normalizeMigrationMetadata(migrationMetadata) ?? deriveLegacyMetadata(doc);
 
       await withTransaction(client, async (tx) => {
+        const existing = await fetchOptionalRow(tx, {
+          sql: `
+            SELECT doc_key
+            FROM ${refs.documentsTable}
+            WHERE collection = ? AND doc_key = ?
+            LIMIT 1
+            FOR UPDATE
+          `,
+          params: [collection, key],
+          errorMessage: "MySQL returned an invalid update result",
+        });
+
+        if (!existing) {
+          throw new EngineDocumentNotFoundError(collection, key);
+        }
+
+        if (normalizedUniqueIndexes) {
+          await assertUniqueIndexes(tx, refs, collection, key, normalizedUniqueIndexes);
+        }
+
         const [result] = await tx.execute(
           `
             UPDATE ${refs.documentsTable}
@@ -276,8 +304,9 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
           throw new EngineDocumentNotFoundError(collection, key);
         }
 
-        await assertUniqueIndexes(tx, refs, collection, key, normalizedUniqueIndexes);
-        await replaceUniqueIndexes(tx, refs, collection, key, normalizedUniqueIndexes);
+        if (normalizedUniqueIndexes) {
+          await replaceUniqueIndexes(tx, refs, collection, key, normalizedUniqueIndexes);
+        }
         await replaceIndexes(tx, refs, collection, key, normalizedIndexes, true);
         await upsertMigrationMetadata(tx, refs, collection, key, metadata);
       });
@@ -928,7 +957,7 @@ async function applyBatchSetChunk(
     key: item.key,
     docJson: serializeDocument(item.doc),
     normalizedIndexes: normalizeIndexes(item.indexes),
-    normalizedUniqueIndexes: normalizeIndexes(item.uniqueIndexes ?? {}),
+    normalizedUniqueIndexes: normalizeOptionalUniqueIndexes(item.uniqueIndexes),
     metadata: normalizeMigrationMetadata(item.migrationMetadata) ?? deriveLegacyMetadata(item.doc),
     expectedWriteToken: item.expectedWriteToken,
   }));
@@ -956,15 +985,19 @@ async function applyBatchSetChunk(
         continue;
       }
 
-      await assertUniqueIndexes(tx, refs, collection, item.key, item.normalizedUniqueIndexes);
-      await replaceUniqueIndexes(tx, refs, collection, item.key, item.normalizedUniqueIndexes);
+      if (item.normalizedUniqueIndexes) {
+        await assertUniqueIndexes(tx, refs, collection, item.key, item.normalizedUniqueIndexes);
+        await replaceUniqueIndexes(tx, refs, collection, item.key, item.normalizedUniqueIndexes);
+      }
       await replaceIndexes(tx, refs, collection, item.key, item.normalizedIndexes, true);
       await upsertMigrationMetadata(tx, refs, collection, item.key, item.metadata);
       persistedKeys.push(item.key);
       continue;
     }
 
-    await assertUniqueIndexes(tx, refs, collection, item.key, item.normalizedUniqueIndexes);
+    if (item.normalizedUniqueIndexes) {
+      await assertUniqueIndexes(tx, refs, collection, item.key, item.normalizedUniqueIndexes);
+    }
     await tx.execute(
       `
         INSERT INTO ${refs.documentsTable} (collection, doc_key, doc_json)
@@ -976,7 +1009,9 @@ async function applyBatchSetChunk(
       [collection, item.key, item.docJson],
     );
 
-    await replaceUniqueIndexes(tx, refs, collection, item.key, item.normalizedUniqueIndexes);
+    if (item.normalizedUniqueIndexes) {
+      await replaceUniqueIndexes(tx, refs, collection, item.key, item.normalizedUniqueIndexes);
+    }
     await replaceIndexes(tx, refs, collection, item.key, item.normalizedIndexes, true);
     await upsertMigrationMetadata(tx, refs, collection, item.key, item.metadata);
     persistedKeys.push(item.key);
@@ -1360,6 +1395,16 @@ function normalizeIndexes(indexes: ResolvedIndexKeys): ResolvedIndexKeys {
   return normalized;
 }
 
+function normalizeOptionalUniqueIndexes(
+  uniqueIndexes: ResolvedIndexKeys | undefined,
+): ResolvedIndexKeys | null {
+  if (uniqueIndexes === undefined) {
+    return null;
+  }
+
+  return normalizeIndexes(uniqueIndexes);
+}
+
 async function assertUniqueIndexes(
   client: MySqlQueryableLike,
   refs: TableRefs,
@@ -1562,6 +1607,7 @@ async function findUniqueIndexConflict(
         AND index_value = ?
         AND doc_key <> ?
       LIMIT 1
+      LOCK IN SHARE MODE
     `,
     params: [collection, indexName, indexValue, key],
     errorMessage: "MySQL returned an invalid legacy unique index row",
