@@ -292,6 +292,103 @@ export function runQueryEngineConformanceSuite<TOptions = Record<string, unknown
       },
     );
 
+    uniqueConstraintConformanceTest(
+      "batchSetWithResult reports stale-token conflicts before unique checks",
+      async () => {
+        const engine = getEngine();
+
+        if (!engine.batchSetWithResult) {
+          expect(engine.batchSetWithResult).toBeUndefined();
+          return;
+        }
+
+        const collection = nextCollection("unique_batch_stale_users");
+
+        await engine.put(
+          collection,
+          "u1",
+          {
+            __v: 1,
+            __indexes: ["primary"],
+            id: "u1",
+            name: "Before",
+            email: "before@example.com",
+          },
+          { primary: "u1" },
+          undefined,
+          undefined,
+          { byEmail: "before@example.com" },
+        );
+        await engine.put(
+          collection,
+          "u2",
+          {
+            __v: 1,
+            __indexes: ["primary"],
+            id: "u2",
+            name: "Taken",
+            email: "taken@example.com",
+          },
+          { primary: "u2" },
+          undefined,
+          undefined,
+          { byEmail: "taken@example.com" },
+        );
+
+        const outdated = await engine.migration.getOutdated(collection, {
+          version: 2,
+          versionField: "__v",
+          indexes: ["primary"],
+          indexesField: "__indexes",
+        });
+        const token = outdated.documents.find((entry) => entry.key === "u1")?.writeToken;
+
+        expect(typeof token).toBe("string");
+
+        await engine.update(
+          collection,
+          "u1",
+          {
+            __v: 1,
+            __indexes: ["primary"],
+            id: "u1",
+            name: "Concurrent",
+            email: "concurrent@example.com",
+          },
+          { primary: "u1" },
+          undefined,
+          undefined,
+          { byEmail: "concurrent@example.com" },
+        );
+
+        const result = await engine.batchSetWithResult(collection, [
+          {
+            key: "u1",
+            doc: {
+              __v: 2,
+              __indexes: ["primary"],
+              id: "u1",
+              name: "Migrated",
+              email: "taken@example.com",
+            },
+            indexes: { primary: "u1" },
+            expectedWriteToken: token,
+            uniqueIndexes: { byEmail: "taken@example.com" },
+          },
+        ]);
+
+        expect(result.persistedKeys).toEqual([]);
+        expect(result.conflictedKeys).toEqual(["u1"]);
+        expect(await engine.get(collection, "u1")).toEqual({
+          __v: 1,
+          __indexes: ["primary"],
+          id: "u1",
+          name: "Concurrent",
+          email: "concurrent@example.com",
+        });
+      },
+    );
+
     test("skips stale migration writes consistently when supported", async () => {
       const engine = getEngine();
 

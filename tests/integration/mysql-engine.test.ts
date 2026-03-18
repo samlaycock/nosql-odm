@@ -191,6 +191,7 @@ describe("mySqlEngine integration", () => {
       documentsTable: "custom_documents",
       indexesTable: "custom_indexes",
       uniqueIndexesTable: "custom_unique_indexes",
+      uniqueIndexBootstrapsTable: "custom_unique_index_bootstraps",
       migrationMetadataTable: "custom_migration_metadata",
       migrationLocksTable: "custom_locks",
       migrationCheckpointsTable: "custom_checkpoints",
@@ -223,12 +224,22 @@ describe("mySqlEngine integration", () => {
       `,
       [customCollection, "u1"],
     );
+    const [bootstrapRows] = await requirePool().query(
+      `
+        SELECT index_name
+        FROM ${qualifiedTableName("custom_unique_index_bootstraps")}
+        WHERE collection = ? AND index_name = ?
+      `,
+      [customCollection, "byEmail"],
+    );
     const lock = await customEngine.migration.acquireLock(customCollection);
 
     expect(Array.isArray(documentRows)).toBe(true);
     expect((documentRows as unknown[]).length).toBe(1);
     expect(Array.isArray(uniqueIndexRows)).toBe(true);
     expect((uniqueIndexRows as unknown[]).length).toBe(1);
+    expect(Array.isArray(bootstrapRows)).toBe(true);
+    expect((bootstrapRows as unknown[]).length).toBe(1);
     expect(lock).not.toBeNull();
   });
 
