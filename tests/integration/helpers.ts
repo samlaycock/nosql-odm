@@ -19,6 +19,18 @@ export async function expectReject(
   }
 }
 
+export async function expectRejectInstanceOf(
+  work: Promise<unknown>,
+  errorType: abstract new (...args: never[]) => Error,
+): Promise<void> {
+  try {
+    await work;
+    throw new Error(`expected operation to fail with ${errorType.name}`);
+  } catch (error) {
+    expect(error).toBeInstanceOf(errorType);
+  }
+}
+
 export function createCollectionNameFactory(): (prefix: string) => string {
   let counter = 0;
 

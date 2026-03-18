@@ -20,7 +20,12 @@ import {
 } from "../../src";
 import { mongoDbEngine, type MongoDbQueryEngine } from "../../src/engines/mongodb";
 import { runQueryEngineConformanceSuite } from "./conformance-suite";
-import { createCollectionNameFactory, createTestResourceName, expectReject } from "./helpers";
+import {
+  createCollectionNameFactory,
+  createTestResourceName,
+  expectReject,
+  expectRejectInstanceOf,
+} from "./helpers";
 import { runMigrationIntegrationSuite } from "./migration-suite";
 
 const mongoUrl = process.env.MONGODB_URL ?? "mongodb://127.0.0.1:27017";
@@ -52,17 +57,6 @@ async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
-}
-
-async function expectUniqueConstraintReject(work: Promise<unknown>): Promise<void> {
-  try {
-    await work;
-  } catch (error) {
-    expect(error).toBeInstanceOf(UniqueConstraintError);
-    return;
-  }
-
-  throw new Error("expected unique constraint violation");
 }
 
 function documentsCollection() {
@@ -332,18 +326,20 @@ describe("mongoDbEngine integration", () => {
       email: "jamie@example.com",
     });
 
-    await expectUniqueConstraintReject(
+    await expectRejectInstanceOf(
       store.user.create("u3", {
         id: "u3",
         email: "sam@example.com",
       }),
+      UniqueConstraintError,
     );
-    await expectUniqueConstraintReject(
+    await expectRejectInstanceOf(
       store.user.update("u2", {
         email: "sam@example.com",
       }),
+      UniqueConstraintError,
     );
-    await expectUniqueConstraintReject(
+    await expectRejectInstanceOf(
       store.user.batchSet([
         {
           key: "u4",
@@ -360,6 +356,7 @@ describe("mongoDbEngine integration", () => {
           },
         },
       ]),
+      UniqueConstraintError,
     );
 
     expect(await store.user.findByKey("u2")).toEqual({
