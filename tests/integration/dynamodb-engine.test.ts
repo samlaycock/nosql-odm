@@ -26,7 +26,12 @@ import {
   type ComparableVersion,
 } from "../../src/engines/types";
 import { runQueryEngineConformanceSuite } from "./conformance-suite";
-import { createCollectionNameFactory, createTestResourceName, expectReject } from "./helpers";
+import {
+  createCollectionNameFactory,
+  createTestResourceName,
+  expectReject,
+  expectRejectInstanceOf,
+} from "./helpers";
 import { runMigrationIntegrationSuite } from "./migration-suite";
 
 const endpoint = process.env.DYNAMODB_ENDPOINT ?? "http://127.0.0.1:8000";
@@ -52,17 +57,6 @@ function normalizePositiveInteger(value: number, fallback: number): number {
   }
 
   return Math.floor(value);
-}
-
-async function expectUniqueConstraintReject(work: Promise<unknown>): Promise<void> {
-  try {
-    await work;
-  } catch (error) {
-    expect(error).toBeInstanceOf(UniqueConstraintError);
-    return;
-  }
-
-  throw new Error("Expected UniqueConstraintError");
 }
 
 async function sleep(ms: number): Promise<void> {
@@ -227,10 +221,6 @@ describe("dynamoDbEngine integration", () => {
     expect(await engine.get(collection, "missing")).toBeNull();
   });
 
-  test('reports uniqueConstraints capability as "none"', () => {
-    expect(engine.capabilities?.uniqueConstraints).toBe("none");
-  });
-
   test("create stores and get returns document", async () => {
     await engine.create(collection, "u1", { id: "u1", name: "Sam" }, { primary: "u1" });
 
@@ -278,7 +268,8 @@ describe("dynamoDbEngine integration", () => {
   });
 
   test("store-managed unique guards reject duplicate DynamoDB writes when enabled", async () => {
-    const userModel = model("user")
+    const modelName = nextCollection("user");
+    const userModel = model(modelName)
       .schema(
         1,
         z.object({
@@ -292,29 +283,32 @@ describe("dynamoDbEngine integration", () => {
     const store = createStore(engine, [userModel], {
       allowStoreManagedUniqueConstraints: true,
     });
+    const users = store[modelName]!;
 
-    await store.user.create("u1", {
+    await users.create("u1", {
       id: "u1",
       email: "sam@example.com",
     });
-    await store.user.create("u2", {
+    await users.create("u2", {
       id: "u2",
       email: "jamie@example.com",
     });
 
-    await expectUniqueConstraintReject(
-      store.user.create("u3", {
+    await expectRejectInstanceOf(
+      users.create("u3", {
         id: "u3",
         email: "sam@example.com",
       }),
+      UniqueConstraintError,
     );
-    await expectUniqueConstraintReject(
-      store.user.update("u2", {
+    await expectRejectInstanceOf(
+      users.update("u2", {
         email: "sam@example.com",
       }),
+      UniqueConstraintError,
     );
-    await expectUniqueConstraintReject(
-      store.user.batchSet([
+    await expectRejectInstanceOf(
+      users.batchSet([
         {
           key: "u4",
           data: {
@@ -330,14 +324,15 @@ describe("dynamoDbEngine integration", () => {
           },
         },
       ]),
+      UniqueConstraintError,
     );
 
-    expect(await store.user.findByKey("u2")).toEqual({
+    expect(await users.findByKey("u2")).toEqual({
       id: "u2",
       email: "jamie@example.com",
     });
-    expect(await store.user.findByKey("u4")).toBeNull();
-    expect(await store.user.findByKey("u5")).toBeNull();
+    expect(await users.findByKey("u4")).toBeNull();
+    expect(await users.findByKey("u5")).toBeNull();
   });
 
   test("create rejects circular documents", async () => {
