@@ -1454,7 +1454,7 @@ async function claimUniqueIndexOwnership(
           AND index_name = ?
           AND index_value_hash = ?
         LIMIT 1
-        FOR SHARE
+        LOCK IN SHARE MODE
       `,
       params: [collection, indexName, indexValueHash],
       errorMessage: "MySQL returned an invalid unique index ownership row",
