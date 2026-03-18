@@ -909,10 +909,54 @@ async function synchronizeUniqueIndexWrites(
   key: string,
   uniqueIndexes: ResolvedIndexKeys,
 ): Promise<void> {
+  const lockTokens = new Set<string>();
+
+  await collectUniqueIndexLockTokens(client, refs, collection, key, uniqueIndexes, lockTokens);
+  await acquireUniqueIndexLocks(client, lockTokens);
+}
+
+async function synchronizeBatchUniqueIndexWrites(
+  client: PostgresQueryableLike,
+  refs: TableRefs,
+  collection: string,
+  items: readonly {
+    key: string;
+    uniqueIndexes: ResolvedIndexKeys;
+  }[],
+): Promise<void> {
+  const lockTokens = new Set<string>();
+
+  for (const item of items) {
+    await collectUniqueIndexLockTokens(
+      client,
+      refs,
+      collection,
+      item.key,
+      item.uniqueIndexes,
+      lockTokens,
+    );
+  }
+
+  await acquireUniqueIndexLocks(client, lockTokens);
+}
+
+async function collectUniqueIndexLockTokens(
+  client: PostgresQueryableLike,
+  refs: TableRefs,
+  collection: string,
+  key: string,
+  uniqueIndexes: ResolvedIndexKeys,
+  lockTokens: Set<string>,
+): Promise<void> {
   // Serialize ownership transfers on both current and target values so
   // concurrent writers cannot observe a stale owner mid-transaction.
-  const currentUniqueIndexes = await loadCurrentUniqueIndexes(client, refs, collection, key);
-  const lockTokens = new Set<string>();
+  const currentUniqueIndexes = await loadCurrentUniqueIndexes(
+    client,
+    refs,
+    collection,
+    key,
+    Object.keys(uniqueIndexes),
+  );
 
   for (const [indexName, indexValue] of Object.entries(currentUniqueIndexes)) {
     lockTokens.add(createUniqueLockToken(collection, indexName, indexValue));
@@ -921,7 +965,12 @@ async function synchronizeUniqueIndexWrites(
   for (const [indexName, indexValue] of Object.entries(uniqueIndexes)) {
     lockTokens.add(createUniqueLockToken(collection, indexName, indexValue));
   }
+}
 
+async function acquireUniqueIndexLocks(
+  client: PostgresQueryableLike,
+  lockTokens: ReadonlySet<string>,
+): Promise<void> {
   for (const token of [...lockTokens].sort()) {
     await client.query(`SELECT pg_advisory_xact_lock($1)`, [toAdvisoryLockKey(token)]);
   }
@@ -967,6 +1016,7 @@ async function loadCurrentUniqueIndexes(
   refs: TableRefs,
   collection: string,
   key: string,
+  desiredUniqueIndexNames: readonly string[],
 ): Promise<ResolvedIndexKeys> {
   const ownershipRows = await fetchRows(client, {
     sql: `
@@ -985,17 +1035,26 @@ async function loadCurrentUniqueIndexes(
     );
   }
 
+  if (desiredUniqueIndexNames.length === 0) {
+    return {};
+  }
+
+  // Legacy rows live in the shared indexes table, so only inspect the names
+  // that are still resolved as unique for this write to avoid locking
+  // unrelated non-unique index values during the migration window.
   const legacyRows = await fetchRows(client, {
     sql: `
       SELECT index_name, index_value
       FROM ${refs.indexesTable}
-      WHERE collection = $1 AND doc_key = $2
+      WHERE collection = $1
+        AND doc_key = $2
+        AND index_name = ANY($3::text[])
     `,
-    params: [collection, key],
-    errorMessage: "Postgres returned an invalid legacy index row",
+    params: [collection, key, desiredUniqueIndexNames],
+    errorMessage: "Postgres returned an invalid legacy unique index row",
   });
 
-  return parseResolvedIndexes(legacyRows, "Postgres returned an invalid legacy index row");
+  return parseResolvedIndexes(legacyRows, "Postgres returned an invalid legacy unique index row");
 }
 
 function parseResolvedIndexes(
@@ -1282,17 +1341,28 @@ async function applyBatchSetChunk(
 ): Promise<BatchSetResult> {
   const persistedKeys: string[] = [];
   const conflictedKeys: string[] = [];
+  const preparedItems = items.map((item) => ({
+    key: item.key,
+    docJson: serializeDocument(item.doc),
+    normalizedIndexes: normalizeIndexes(item.indexes),
+    normalizedUniqueIndexes: normalizeIndexes(item.uniqueIndexes ?? {}),
+    metadata: normalizeMigrationMetadata(item.migrationMetadata) ?? deriveLegacyMetadata(item.doc),
+    expectedWriteToken: item.expectedWriteToken,
+  }));
 
-  for (const item of items) {
-    const docJson = serializeDocument(item.doc);
-    const normalizedIndexes = normalizeIndexes(item.indexes);
-    const normalizedUniqueIndexes = normalizeIndexes(item.uniqueIndexes ?? {});
-    const metadata =
-      normalizeMigrationMetadata(item.migrationMetadata) ?? deriveLegacyMetadata(item.doc);
+  await synchronizeBatchUniqueIndexWrites(
+    tx,
+    refs,
+    collection,
+    preparedItems.map((item) => ({
+      key: item.key,
+      uniqueIndexes: item.normalizedUniqueIndexes,
+    })),
+  );
 
+  for (const item of preparedItems) {
     if (item.expectedWriteToken !== undefined) {
       const expectedWriteVersion = parseWriteToken(item.expectedWriteToken);
-      await synchronizeUniqueIndexWrites(tx, refs, collection, item.key, normalizedUniqueIndexes);
       const updateResult = await tx.query(
         `
           UPDATE ${refs.documentsTable}
@@ -1303,7 +1373,7 @@ async function applyBatchSetChunk(
             AND doc_key = $3
             AND write_version = $4
         `,
-        [docJson, collection, item.key, expectedWriteVersion],
+        [item.docJson, collection, item.key, expectedWriteVersion],
       );
 
       if (
@@ -1314,16 +1384,15 @@ async function applyBatchSetChunk(
         continue;
       }
 
-      await assertUniqueIndexes(tx, refs, collection, item.key, normalizedUniqueIndexes);
-      await replaceUniqueIndexes(tx, refs, collection, item.key, normalizedUniqueIndexes);
-      await replaceIndexes(tx, refs, collection, item.key, normalizedIndexes, true);
-      await upsertMigrationMetadata(tx, refs, collection, item.key, metadata);
+      await assertUniqueIndexes(tx, refs, collection, item.key, item.normalizedUniqueIndexes);
+      await replaceUniqueIndexes(tx, refs, collection, item.key, item.normalizedUniqueIndexes);
+      await replaceIndexes(tx, refs, collection, item.key, item.normalizedIndexes, true);
+      await upsertMigrationMetadata(tx, refs, collection, item.key, item.metadata);
       persistedKeys.push(item.key);
       continue;
     }
 
-    await synchronizeUniqueIndexWrites(tx, refs, collection, item.key, normalizedUniqueIndexes);
-    await assertUniqueIndexes(tx, refs, collection, item.key, normalizedUniqueIndexes);
+    await assertUniqueIndexes(tx, refs, collection, item.key, item.normalizedUniqueIndexes);
     await tx.query(
       `
         INSERT INTO ${refs.documentsTable} (collection, doc_key, doc_json)
@@ -1333,12 +1402,12 @@ async function applyBatchSetChunk(
           doc_json = EXCLUDED.doc_json,
           write_version = ${refs.documentsTable}.write_version + 1
       `,
-      [collection, item.key, docJson],
+      [collection, item.key, item.docJson],
     );
 
-    await replaceUniqueIndexes(tx, refs, collection, item.key, normalizedUniqueIndexes);
-    await replaceIndexes(tx, refs, collection, item.key, normalizedIndexes, true);
-    await upsertMigrationMetadata(tx, refs, collection, item.key, metadata);
+    await replaceUniqueIndexes(tx, refs, collection, item.key, item.normalizedUniqueIndexes);
+    await replaceIndexes(tx, refs, collection, item.key, item.normalizedIndexes, true);
+    await upsertMigrationMetadata(tx, refs, collection, item.key, item.metadata);
     persistedKeys.push(item.key);
   }
 
