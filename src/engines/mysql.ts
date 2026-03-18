@@ -37,6 +37,7 @@ const DEFAULT_BATCH_GET_CHUNK_SIZE = 1_000;
 const DEFAULT_BATCH_SET_CHUNK_SIZE = 250;
 const MYSQL_MAX_BATCH_GET_KEYS_PER_QUERY = 65_534;
 const UNIQUE_INDEX_INSERT_RETRY_LIMIT = 3;
+const TRANSACTION_DEADLOCK_RETRY_LIMIT = 3;
 
 const OUTDATED_PAGE_LIMIT = 100;
 const OUTDATED_SCAN_CHUNK_SIZE = 256;
@@ -1182,27 +1183,35 @@ async function withTransaction<T>(
   client: MySqlPoolLike,
   work: (tx: MySqlConnectionLike) => Promise<T>,
 ): Promise<T> {
-  const tx = await client.getConnection();
+  for (let attempt = 0; attempt < TRANSACTION_DEADLOCK_RETRY_LIMIT; attempt++) {
+    const tx = await client.getConnection();
 
-  try {
-    await tx.beginTransaction();
-
-    const result = await work(tx);
-
-    await tx.commit();
-
-    return result;
-  } catch (error) {
     try {
-      await tx.rollback();
-    } catch {
-      // Ignore rollback failures and preserve original error.
-    }
+      await tx.beginTransaction();
 
-    throw error;
-  } finally {
-    tx.release();
+      const result = await work(tx);
+
+      await tx.commit();
+
+      return result;
+    } catch (error) {
+      try {
+        await tx.rollback();
+      } catch {
+        // Ignore rollback failures and preserve original error.
+      }
+
+      if (isMySqlDeadlockError(error) && attempt < TRANSACTION_DEADLOCK_RETRY_LIMIT - 1) {
+        continue;
+      }
+
+      throw error;
+    } finally {
+      tx.release();
+    }
   }
+
+  throw new Error("MySQL transaction exceeded deadlock retry limit");
 }
 
 async function ensureIndex(
@@ -2328,6 +2337,14 @@ function isMySqlDuplicateKeyError(error: unknown): boolean {
   }
 
   return error.code === "ER_DUP_ENTRY" || error.errno === 1062;
+}
+
+function isMySqlDeadlockError(error: unknown): boolean {
+  if (!isRecord(error)) {
+    return false;
+  }
+
+  return error.code === "ER_LOCK_DEADLOCK" || error.errno === 1213;
 }
 
 function isMySqlDuplicateIndexError(error: unknown): boolean {
