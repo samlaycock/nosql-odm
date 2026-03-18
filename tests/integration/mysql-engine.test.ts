@@ -7,9 +7,13 @@ import {
   setDefaultTimeout,
   test,
 } from "bun:test";
-import { createPool, type Pool } from "mysql2/promise";
+import { createPool, type Pool, type PoolConnection } from "mysql2/promise";
 
-import { mySqlEngine, type MySqlQueryEngine } from "../../src/engines/mysql";
+import {
+  mySqlEngine,
+  type MySqlEngineOptions,
+  type MySqlQueryEngine,
+} from "../../src/engines/mysql";
 import {
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
@@ -19,6 +23,10 @@ import {
 import { runQueryEngineConformanceSuite } from "./conformance-suite";
 import { createCollectionNameFactory, createTestResourceName, expectReject } from "./helpers";
 import { runMigrationIntegrationSuite } from "./migration-suite";
+
+type MySqlTestClient = MySqlEngineOptions["client"];
+type MySqlTestConnection = Awaited<ReturnType<MySqlTestClient["getConnection"]>>;
+type MySqlQueryValues = Array<{} | null>;
 
 const host = process.env.MYSQL_HOST ?? "127.0.0.1";
 const port = Number(process.env.MYSQL_PORT ?? "3306");
@@ -82,6 +90,70 @@ function requireAdminPool(): Pool {
   }
 
   return adminPool;
+}
+
+function createTransientDeadlockClient(
+  basePool: Pool,
+  targetCollection: string,
+  targetKey: string,
+): {
+  client: MySqlTestClient;
+} {
+  let deadlockInjected = false;
+
+  const maybeInjectDeadlock = async (sql: string, params?: unknown[]): Promise<void> => {
+    if (deadlockInjected || !sql.includes("INSERT INTO") || !Array.isArray(params)) {
+      return;
+    }
+
+    const [collection, key] = params;
+
+    if (collection !== targetCollection || key !== targetKey) {
+      return;
+    }
+
+    deadlockInjected = true;
+    throw Object.assign(
+      new Error("Deadlock found when trying to get lock; try restarting transaction"),
+      {
+        code: "ER_LOCK_DEADLOCK",
+        errno: 1213,
+        sqlState: "40001",
+      },
+    );
+  };
+
+  const wrapConnection = (connection: PoolConnection): MySqlTestConnection => ({
+    query: (sql, params) =>
+      params === undefined
+        ? connection.query(sql)
+        : connection.query(sql, params as MySqlQueryValues),
+    execute: async (sql, params) => {
+      await maybeInjectDeadlock(sql, params);
+
+      return params === undefined
+        ? connection.execute(sql)
+        : connection.execute(sql, params as MySqlQueryValues);
+    },
+    beginTransaction: () => connection.beginTransaction(),
+    commit: () => connection.commit(),
+    rollback: () => connection.rollback(),
+    release: () => connection.release(),
+  });
+
+  return {
+    client: {
+      query: (sql, params) =>
+        params === undefined
+          ? basePool.query(sql)
+          : basePool.query(sql, params as MySqlQueryValues),
+      execute: (sql, params) =>
+        params === undefined
+          ? basePool.execute(sql)
+          : basePool.execute(sql, params as MySqlQueryValues),
+      getConnection: async () => wrapConnection(await basePool.getConnection()),
+    },
+  };
 }
 
 async function connectWithRetry(instance: Pool): Promise<void> {
@@ -419,6 +491,52 @@ describe("mySqlEngine integration", () => {
         { byEmail: "sam@example.com" },
       ),
     ).rejects.toBeInstanceOf(EngineUniqueConstraintError);
+  });
+
+  test("concurrent creates on the same unique value return a uniqueness error instead of a raw MySQL deadlock", async () => {
+    const contestedEmail = "race@example.com";
+    const wrappedClient = createTransientDeadlockClient(requirePool(), collection, "u2");
+    const racingEngine = mySqlEngine({
+      client: wrappedClient.client,
+      database: databaseName,
+    });
+
+    const firstCreate = racingEngine.create(
+      collection,
+      "u1",
+      { id: "u1", email: contestedEmail },
+      { primary: "u1" },
+      undefined,
+      undefined,
+      { byEmail: contestedEmail },
+    );
+    const secondCreate = racingEngine.create(
+      collection,
+      "u2",
+      { id: "u2", email: contestedEmail },
+      { primary: "u2" },
+      undefined,
+      undefined,
+      { byEmail: contestedEmail },
+    );
+
+    const results = await Promise.allSettled([firstCreate, secondCreate]);
+    const succeeded = results.filter(
+      (result): result is PromiseFulfilledResult<void> => result.status === "fulfilled",
+    );
+    const failed = results.filter(
+      (result): result is PromiseRejectedResult => result.status === "rejected",
+    );
+
+    expect(succeeded).toHaveLength(1);
+    expect(failed).toHaveLength(1);
+    expect(failed[0]?.reason).toBeInstanceOf(EngineUniqueConstraintError);
+    expect((failed[0]?.reason as { code?: string } | undefined)?.code).not.toBe("ER_LOCK_DEADLOCK");
+    expect(await engine.get(collection, "u1")).toEqual({
+      id: "u1",
+      email: contestedEmail,
+    });
+    expect(await engine.get(collection, "u2")).toBeNull();
   });
 
   test("put upserts and update replaces existing document", async () => {
