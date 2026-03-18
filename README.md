@@ -1360,7 +1360,7 @@ Built-in engine capability matrix (`capabilities.uniqueConstraints`):
 | Memory    | `nosql-odm/engines/memory`    | `atomic`           |
 | SQLite    | `nosql-odm/engines/sqlite`    | `atomic`           |
 | IndexedDB | `nosql-odm/engines/indexeddb` | `atomic`           |
-| DynamoDB  | `nosql-odm/engines/dynamodb`  | `atomic`           |
+| DynamoDB  | `nosql-odm/engines/dynamodb`  | `none`             |
 | Cassandra | `nosql-odm/engines/cassandra` | `atomic`           |
 | Redis     | `nosql-odm/engines/redis`     | `atomic`           |
 | MongoDB   | `nosql-odm/engines/mongodb`   | `none`             |

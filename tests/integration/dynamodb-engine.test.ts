@@ -16,7 +16,9 @@ import {
   setDefaultTimeout,
   test,
 } from "bun:test";
+import * as z from "zod";
 
+import { createStore, UniqueConstraintError, model } from "../../src";
 import { dynamoDbEngine, type DynamoDbQueryEngine } from "../../src/engines/dynamodb";
 import {
   EngineDocumentAlreadyExistsError,
@@ -50,6 +52,17 @@ function normalizePositiveInteger(value: number, fallback: number): number {
   }
 
   return Math.floor(value);
+}
+
+async function expectUniqueConstraintReject(work: Promise<unknown>): Promise<void> {
+  try {
+    await work;
+  } catch (error) {
+    expect(error).toBeInstanceOf(UniqueConstraintError);
+    return;
+  }
+
+  throw new Error("Expected UniqueConstraintError");
 }
 
 async function sleep(ms: number): Promise<void> {
@@ -214,6 +227,10 @@ describe("dynamoDbEngine integration", () => {
     expect(await engine.get(collection, "missing")).toBeNull();
   });
 
+  test('reports uniqueConstraints capability as "none"', () => {
+    expect(engine.capabilities?.uniqueConstraints).toBe("none");
+  });
+
   test("create stores and get returns document", async () => {
     await engine.create(collection, "u1", { id: "u1", name: "Sam" }, { primary: "u1" });
 
@@ -258,6 +275,69 @@ describe("dynamoDbEngine integration", () => {
       engine.create(collection, "u1", "not-an-object", { primary: "u1" }),
       /non-object document/,
     );
+  });
+
+  test("store-managed unique guards reject duplicate DynamoDB writes when enabled", async () => {
+    const userModel = model("user")
+      .schema(
+        1,
+        z.object({
+          id: z.string(),
+          email: z.email(),
+        }),
+      )
+      .index({ name: "primary", value: "id" })
+      .index({ name: "byEmail", value: "email", unique: true })
+      .build();
+    const store = createStore(engine, [userModel], {
+      allowStoreManagedUniqueConstraints: true,
+    });
+
+    await store.user.create("u1", {
+      id: "u1",
+      email: "sam@example.com",
+    });
+    await store.user.create("u2", {
+      id: "u2",
+      email: "jamie@example.com",
+    });
+
+    await expectUniqueConstraintReject(
+      store.user.create("u3", {
+        id: "u3",
+        email: "sam@example.com",
+      }),
+    );
+    await expectUniqueConstraintReject(
+      store.user.update("u2", {
+        email: "sam@example.com",
+      }),
+    );
+    await expectUniqueConstraintReject(
+      store.user.batchSet([
+        {
+          key: "u4",
+          data: {
+            id: "u4",
+            email: "fresh@example.com",
+          },
+        },
+        {
+          key: "u5",
+          data: {
+            id: "u5",
+            email: "fresh@example.com",
+          },
+        },
+      ]),
+    );
+
+    expect(await store.user.findByKey("u2")).toEqual({
+      id: "u2",
+      email: "jamie@example.com",
+    });
+    expect(await store.user.findByKey("u4")).toBeNull();
+    expect(await store.user.findByKey("u5")).toBeNull();
   });
 
   test("create rejects circular documents", async () => {
