@@ -227,6 +227,31 @@ export function runQueryEngineConformanceSuite<TOptions = Record<string, unknown
             },
           ]),
         ).rejects.toBeInstanceOf(EngineUniqueConstraintError);
+
+        await engine.update(
+          collection,
+          "u1",
+          { id: "u1", email: "renamed@example.com" },
+          { primary: "u1" },
+          undefined,
+          undefined,
+          { byEmail: "renamed@example.com" },
+        );
+
+        await engine.create(
+          collection,
+          "u3",
+          { id: "u3", email: "sam@example.com" },
+          { primary: "u3" },
+          undefined,
+          undefined,
+          { byEmail: "sam@example.com" },
+        );
+
+        expect(await engine.get(collection, "u3")).toEqual({
+          id: "u3",
+          email: "sam@example.com",
+        });
       },
     );
 
