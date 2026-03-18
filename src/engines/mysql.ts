@@ -964,6 +964,10 @@ async function applyBatchSetChunk(
 
   for (const item of preparedItems) {
     if (item.expectedWriteToken !== undefined) {
+      if (item.normalizedUniqueIndexes) {
+        await assertUniqueIndexes(tx, refs, collection, item.key, item.normalizedUniqueIndexes);
+      }
+
       const expectedWriteVersion = parseWriteToken(item.expectedWriteToken);
       const [result] = await tx.execute(
         `
@@ -986,7 +990,6 @@ async function applyBatchSetChunk(
       }
 
       if (item.normalizedUniqueIndexes) {
-        await assertUniqueIndexes(tx, refs, collection, item.key, item.normalizedUniqueIndexes);
         await replaceUniqueIndexes(tx, refs, collection, item.key, item.normalizedUniqueIndexes);
       }
       await replaceIndexes(tx, refs, collection, item.key, item.normalizedIndexes, true);
@@ -1585,6 +1588,7 @@ async function findUniqueIndexConflict(
         AND index_value = ?
         AND doc_key <> ?
       LIMIT 1
+      LOCK IN SHARE MODE
     `,
     params: [collection, indexName, hashIndexValue(indexValue), indexValue, key],
     errorMessage: "MySQL returned an invalid unique index ownership row",
