@@ -331,6 +331,96 @@ describe("mySqlEngine integration", () => {
     ).rejects.toBeInstanceOf(EngineUniqueConstraintError);
   });
 
+  test("legacy duplicate unique rows do not permanently block bootstrap writes", async () => {
+    await engine.get(collection, "bootstrap");
+
+    await requirePool().query(
+      `
+        INSERT INTO ${qualifiedTableName("nosql_odm_documents")} (collection, doc_key, doc_json)
+        VALUES (?, ?, CAST(? AS JSON)), (?, ?, CAST(? AS JSON))
+      `,
+      [
+        collection,
+        "u1",
+        JSON.stringify({ id: "u1", email: "sam@example.com" }),
+        collection,
+        "u2",
+        JSON.stringify({ id: "u2", email: "sam@example.com" }),
+      ],
+    );
+    await requirePool().query(
+      `
+        INSERT INTO ${qualifiedTableName("nosql_odm_index_entries")} (
+          collection,
+          doc_key,
+          index_name,
+          index_value
+        )
+        VALUES (?, ?, ?, ?), (?, ?, ?, ?)
+      `,
+      [
+        collection,
+        "u1",
+        "byEmail",
+        "sam@example.com",
+        collection,
+        "u2",
+        "byEmail",
+        "sam@example.com",
+      ],
+    );
+
+    await engine.put(
+      collection,
+      "u3",
+      { id: "u3", email: "fresh@example.com" },
+      { primary: "u3" },
+      undefined,
+      undefined,
+      { byEmail: "fresh@example.com" },
+    );
+
+    const [bootstrapRows] = await requirePool().query(
+      `
+        SELECT index_name
+        FROM ${qualifiedTableName("nosql_odm_unique_index_bootstraps")}
+        WHERE collection = ? AND index_name = ?
+      `,
+      [collection, "byEmail"],
+    );
+    const [canonicalOwnerRows] = await requirePool().query(
+      `
+        SELECT doc_key
+        FROM ${qualifiedTableName("nosql_odm_unique_index_entries")}
+        WHERE collection = ? AND index_name = ? AND index_value = ?
+        ORDER BY doc_key ASC
+      `,
+      [collection, "byEmail", "sam@example.com"],
+    );
+
+    expect(await engine.get(collection, "u3")).toEqual({
+      id: "u3",
+      email: "fresh@example.com",
+    });
+    expect(Array.isArray(bootstrapRows)).toBe(true);
+    expect((bootstrapRows as unknown[]).length).toBe(1);
+    expect(Array.isArray(canonicalOwnerRows)).toBe(true);
+    expect((canonicalOwnerRows as unknown[]).length).toBe(1);
+    expect((canonicalOwnerRows as Array<{ doc_key: string }>)[0]?.doc_key).toBe("u1");
+
+    await expect(
+      engine.create(
+        collection,
+        "u4",
+        { id: "u4", email: "sam@example.com" },
+        { primary: "u4" },
+        undefined,
+        undefined,
+        { byEmail: "sam@example.com" },
+      ),
+    ).rejects.toBeInstanceOf(EngineUniqueConstraintError);
+  });
+
   test("put upserts and update replaces existing document", async () => {
     await engine.put(collection, "u1", { id: "u1", name: "Sam" }, { primary: "u1" });
     await engine.update(collection, "u1", { id: "u1", name: "Samuel" }, { primary: "u1" });

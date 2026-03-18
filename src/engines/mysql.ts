@@ -36,6 +36,7 @@ const DEFAULT_MIGRATION_CHECKPOINTS_TABLE = "nosql_odm_migration_checkpoints";
 const DEFAULT_BATCH_GET_CHUNK_SIZE = 1_000;
 const DEFAULT_BATCH_SET_CHUNK_SIZE = 250;
 const MYSQL_MAX_BATCH_GET_KEYS_PER_QUERY = 65_534;
+const UNIQUE_INDEX_INSERT_RETRY_LIMIT = 3;
 
 const OUTDATED_PAGE_LIMIT = 100;
 const OUTDATED_SCAN_CHUNK_SIZE = 256;
@@ -1667,62 +1668,77 @@ async function insertBootstrappedUniqueIndexOwnership(
   indexName: string,
   indexValue: string,
 ): Promise<void> {
-  try {
-    await client.execute(
-      `
-        INSERT INTO ${refs.uniqueIndexesTable} (
-          collection,
-          doc_key,
-          index_name,
-          index_value,
-          index_value_hash
-        )
-        VALUES (?, ?, ?, ?, ?)
-      `,
-      [collection, key, indexName, indexValue, hashIndexValue(indexValue)],
-    );
-  } catch (error) {
-    if (!isMySqlDuplicateKeyError(error)) {
-      throw error;
-    }
+  const indexValueHash = hashIndexValue(indexValue);
 
-    const ownerRow = await fetchOptionalRow(client, {
-      sql: `
-        SELECT doc_key, index_value
-        FROM ${refs.uniqueIndexesTable}
-        WHERE collection = ?
-          AND index_name = ?
-          AND index_value_hash = ?
-        LIMIT 1
-        LOCK IN SHARE MODE
-      `,
-      params: [collection, indexName, hashIndexValue(indexValue)],
-      errorMessage: "MySQL returned an invalid unique index ownership row",
-    });
-
-    if (!ownerRow) {
-      throw error;
-    }
-
-    const ownerKey = readStringField(
-      ownerRow,
-      "doc_key",
-      "MySQL returned an invalid unique index ownership row",
-    );
-    const ownerValue = readStringField(
-      ownerRow,
-      "index_value",
-      "MySQL returned an invalid unique index ownership row",
-    );
-
-    if (ownerValue !== indexValue) {
-      throw new Error(
-        `MySQL unique index hash collision detected in model "${collection}" for index "${indexName}"`,
+  for (let attempt = 0; attempt < UNIQUE_INDEX_INSERT_RETRY_LIMIT; attempt++) {
+    try {
+      await client.execute(
+        `
+          INSERT INTO ${refs.uniqueIndexesTable} (
+            collection,
+            doc_key,
+            index_name,
+            index_value,
+            index_value_hash
+          )
+          VALUES (?, ?, ?, ?, ?)
+        `,
+        [collection, key, indexName, indexValue, indexValueHash],
       );
-    }
+      return;
+    } catch (error) {
+      if (!isMySqlDuplicateKeyError(error)) {
+        throw error;
+      }
 
-    if (ownerKey !== key) {
-      throw new EngineUniqueConstraintError(collection, key, indexName, indexValue, ownerKey);
+      const ownerRow = await fetchOptionalRow(client, {
+        sql: `
+          SELECT doc_key, index_value
+          FROM ${refs.uniqueIndexesTable}
+          WHERE collection = ?
+            AND index_name = ?
+            AND index_value_hash = ?
+          LIMIT 1
+          LOCK IN SHARE MODE
+        `,
+        params: [collection, indexName, indexValueHash],
+        errorMessage: "MySQL returned an invalid unique index ownership row",
+      });
+
+      if (!ownerRow) {
+        if (attempt < UNIQUE_INDEX_INSERT_RETRY_LIMIT - 1) {
+          continue;
+        }
+
+        throw new Error(
+          `MySQL unique index ownership row disappeared after duplicate key error in model "${collection}" for index "${indexName}"`,
+        );
+      }
+
+      const ownerKey = readStringField(
+        ownerRow,
+        "doc_key",
+        "MySQL returned an invalid unique index ownership row",
+      );
+      const ownerValue = readStringField(
+        ownerRow,
+        "index_value",
+        "MySQL returned an invalid unique index ownership row",
+      );
+
+      if (ownerValue !== indexValue) {
+        throw new Error(
+          `MySQL unique index hash collision detected in model "${collection}" for index "${indexName}"`,
+        );
+      }
+
+      // Legacy duplicates can already exist before bootstrap. Keep the first
+      // canonical owner and finish bootstrapping so future writes are not wedged.
+      if (ownerKey !== key) {
+        return;
+      }
+
+      return;
     }
   }
 }
@@ -1737,62 +1753,73 @@ async function claimUniqueIndexOwnership(
 ): Promise<void> {
   const indexValueHash = hashIndexValue(indexValue);
 
-  try {
-    await client.execute(
-      `
-        INSERT INTO ${refs.uniqueIndexesTable} (
-          collection,
-          doc_key,
-          index_name,
-          index_value,
-          index_value_hash
-        )
-        VALUES (?, ?, ?, ?, ?)
-      `,
-      [collection, key, indexName, indexValue, indexValueHash],
-    );
-  } catch (error) {
-    if (!isMySqlDuplicateKeyError(error)) {
-      throw error;
-    }
-
-    const ownerRow = await fetchOptionalRow(client, {
-      sql: `
-        SELECT doc_key, index_value
-        FROM ${refs.uniqueIndexesTable}
-        WHERE collection = ?
-          AND index_name = ?
-          AND index_value_hash = ?
-        LIMIT 1
-        LOCK IN SHARE MODE
-      `,
-      params: [collection, indexName, indexValueHash],
-      errorMessage: "MySQL returned an invalid unique index ownership row",
-    });
-
-    if (!ownerRow) {
-      throw new EngineUniqueConstraintError(collection, key, indexName, indexValue, null);
-    }
-
-    const ownerKey = readStringField(
-      ownerRow,
-      "doc_key",
-      "MySQL returned an invalid unique index ownership row",
-    );
-    const ownerValue = readStringField(
-      ownerRow,
-      "index_value",
-      "MySQL returned an invalid unique index ownership row",
-    );
-
-    if (ownerValue !== indexValue) {
-      throw new Error(
-        `MySQL unique index hash collision detected in model "${collection}" for index "${indexName}"`,
+  for (let attempt = 0; attempt < UNIQUE_INDEX_INSERT_RETRY_LIMIT; attempt++) {
+    try {
+      await client.execute(
+        `
+          INSERT INTO ${refs.uniqueIndexesTable} (
+            collection,
+            doc_key,
+            index_name,
+            index_value,
+            index_value_hash
+          )
+          VALUES (?, ?, ?, ?, ?)
+        `,
+        [collection, key, indexName, indexValue, indexValueHash],
       );
-    }
+      return;
+    } catch (error) {
+      if (!isMySqlDuplicateKeyError(error)) {
+        throw error;
+      }
 
-    if (ownerKey !== key) {
-      throw new EngineUniqueConstraintError(collection, key, indexName, indexValue, ownerKey);
+      const ownerRow = await fetchOptionalRow(client, {
+        sql: `
+          SELECT doc_key, index_value
+          FROM ${refs.uniqueIndexesTable}
+          WHERE collection = ?
+            AND index_name = ?
+            AND index_value_hash = ?
+          LIMIT 1
+          LOCK IN SHARE MODE
+        `,
+        params: [collection, indexName, indexValueHash],
+        errorMessage: "MySQL returned an invalid unique index ownership row",
+      });
+
+      if (!ownerRow) {
+        if (attempt < UNIQUE_INDEX_INSERT_RETRY_LIMIT - 1) {
+          continue;
+        }
+
+        throw new Error(
+          `MySQL unique index ownership row disappeared after duplicate key error in model "${collection}" for index "${indexName}"`,
+        );
+      }
+
+      const ownerKey = readStringField(
+        ownerRow,
+        "doc_key",
+        "MySQL returned an invalid unique index ownership row",
+      );
+      const ownerValue = readStringField(
+        ownerRow,
+        "index_value",
+        "MySQL returned an invalid unique index ownership row",
+      );
+
+      if (ownerValue !== indexValue) {
+        throw new Error(
+          `MySQL unique index hash collision detected in model "${collection}" for index "${indexName}"`,
+        );
+      }
+
+      if (ownerKey !== key) {
+        throw new EngineUniqueConstraintError(collection, key, indexName, indexValue, ownerKey);
+      }
+
+      return;
     }
   }
 }
@@ -1851,7 +1878,7 @@ async function findUniqueIndexConflict(
         AND index_value = ?
         AND doc_key <> ?
       LIMIT 1
-      LOCK IN SHARE MODE
+      FOR UPDATE
     `,
     params: [collection, indexName, hashIndexValue(indexValue), indexValue, key],
     errorMessage: "MySQL returned an invalid unique index ownership row",
