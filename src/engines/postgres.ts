@@ -1420,7 +1420,10 @@ async function applyBatchSetChunk(
 async function ensureSchema(client: PostgresQueryableLike, refs: TableRefs): Promise<void> {
   const session = await acquireSession(client);
   const lockKey = toAdvisoryLockKey(
-    `${refs.schema}|${refs.documentsTable}|${refs.indexesTable}|${refs.uniqueIndexesTable}|${refs.migrationMetadataTable}|${refs.migrationLocksTable}|${refs.migrationCheckpointsTable}`,
+    // Keep the bootstrap lock key stable across engine versions so rolling
+    // upgrades still coordinate DDL with older instances that do not yet know
+    // about newly added internal tables.
+    `${refs.schema}|${refs.documentsTable}|${refs.indexesTable}|${refs.migrationMetadataTable}|${refs.migrationLocksTable}|${refs.migrationCheckpointsTable}`,
   );
 
   // A process-scoped advisory lock prevents concurrent instances from racing
