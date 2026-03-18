@@ -218,7 +218,7 @@ export function dynamoDbEngine(options: DynamoDbEngineOptions): DynamoDbQueryEng
 
   const engine: DynamoDbQueryEngine = {
     capabilities: {
-      uniqueConstraints: "atomic",
+      uniqueConstraints: "none",
     },
 
     prepareDocumentForWrite(doc, collection, key) {
