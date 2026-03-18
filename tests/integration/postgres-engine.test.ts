@@ -138,6 +138,7 @@ describe("postgresEngine integration", () => {
     engineName: "postgresEngine integration",
     getEngine: () => engine,
     nextCollection,
+    assertEngineUniqueConstraintConformance: true,
   });
 
   afterAll(async () => {
@@ -168,13 +169,22 @@ describe("postgresEngine integration", () => {
       schema: schemaName,
       documentsTable: "custom_documents",
       indexesTable: "custom_indexes",
+      uniqueIndexesTable: "custom_unique_indexes",
       migrationMetadataTable: "custom_migration_metadata",
       migrationLocksTable: "custom_locks",
       migrationCheckpointsTable: "custom_checkpoints",
     });
     const customCollection = nextCollection("custom");
 
-    await customEngine.put(customCollection, "u1", { id: "u1" }, { primary: "u1" });
+    await customEngine.put(
+      customCollection,
+      "u1",
+      { id: "u1", email: "sam@example.com" },
+      { primary: "u1", byEmail: "sam@example.com" },
+      undefined,
+      undefined,
+      { byEmail: "sam@example.com" },
+    );
 
     const rawDoc = await requirePool().query(
       `
@@ -184,9 +194,18 @@ describe("postgresEngine integration", () => {
       `,
       [customCollection, "u1"],
     );
+    const rawUniqueIndex = await requirePool().query(
+      `
+        SELECT doc_key
+        FROM ${quoteIdentifier(schemaName)}.${quoteIdentifier("custom_unique_indexes")}
+        WHERE collection = $1 AND index_name = $2 AND index_value = $3
+      `,
+      [customCollection, "byEmail", "sam@example.com"],
+    );
     const rawLock = await customEngine.migration.acquireLock(customCollection);
 
     expect(rawDoc.rows).toHaveLength(1);
+    expect(rawUniqueIndex.rows).toHaveLength(1);
     expect(rawLock).not.toBeNull();
   });
 
