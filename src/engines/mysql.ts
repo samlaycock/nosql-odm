@@ -1392,14 +1392,14 @@ async function replaceUniqueIndexes(
   key: string,
   uniqueIndexes: ResolvedIndexKeys,
 ): Promise<void> {
+  const currentUniqueEntries = await loadCurrentUniqueIndexEntries(client, refs, collection, key);
+
   for (const [indexName, indexValue] of Object.entries(uniqueIndexes)) {
     await claimUniqueIndexOwnership(client, refs, collection, key, indexName, indexValue);
   }
 
-  const currentUniqueIndexes = await loadCurrentUniqueIndexes(client, refs, collection, key);
-
-  for (const [indexName, indexValue] of Object.entries(currentUniqueIndexes)) {
-    if (uniqueIndexes[indexName] === indexValue) {
+  for (const entry of currentUniqueEntries) {
+    if (uniqueIndexes[entry.indexName] === entry.indexValue) {
       continue;
     }
 
@@ -1410,8 +1410,9 @@ async function replaceUniqueIndexes(
           AND doc_key = ?
           AND index_name = ?
           AND index_value_hash = ?
+          AND index_value = ?
       `,
-      [collection, key, indexName, hashIndexValue(indexValue)],
+      [collection, key, entry.indexName, hashIndexValue(entry.indexValue), entry.indexValue],
     );
   }
 }
@@ -1459,7 +1460,7 @@ async function claimUniqueIndexOwnership(
     });
 
     if (!ownerRow) {
-      throw error;
+      throw new EngineUniqueConstraintError(collection, key, indexName, indexValue, null);
     }
 
     const ownerKey = readStringField(
@@ -1485,12 +1486,17 @@ async function claimUniqueIndexOwnership(
   }
 }
 
-async function loadCurrentUniqueIndexes(
+interface UniqueIndexEntry {
+  indexName: string;
+  indexValue: string;
+}
+
+async function loadCurrentUniqueIndexEntries(
   client: MySqlQueryableLike,
   refs: TableRefs,
   collection: string,
   key: string,
-): Promise<ResolvedIndexKeys> {
+): Promise<UniqueIndexEntry[]> {
   const rows = await fetchRows(client, {
     sql: `
       SELECT index_name, index_value
@@ -1501,22 +1507,18 @@ async function loadCurrentUniqueIndexes(
     errorMessage: "MySQL returned an invalid owned unique index row",
   });
 
-  return parseResolvedIndexes(rows, "MySQL returned an invalid owned unique index row");
-}
-
-function parseResolvedIndexes(
-  rows: readonly Record<string, unknown>[],
-  errorMessage: string,
-): ResolvedIndexKeys {
-  const resolved: ResolvedIndexKeys = {};
-
-  for (const row of rows) {
-    const indexName = readStringField(row, "index_name", errorMessage);
-    const indexValue = readStringField(row, "index_value", errorMessage);
-    resolved[indexName] = indexValue;
-  }
-
-  return resolved;
+  return rows.map((row) => ({
+    indexName: readStringField(
+      row,
+      "index_name",
+      "MySQL returned an invalid owned unique index row",
+    ),
+    indexValue: readStringField(
+      row,
+      "index_value",
+      "MySQL returned an invalid owned unique index row",
+    ),
+  }));
 }
 
 async function findUniqueIndexConflict(
