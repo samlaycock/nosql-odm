@@ -13,6 +13,7 @@ import { mySqlEngine, type MySqlQueryEngine } from "../../src/engines/mysql";
 import {
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
+  EngineUniqueConstraintError,
   type ComparableVersion,
 } from "../../src/engines/types";
 import { runQueryEngineConformanceSuite } from "./conformance-suite";
@@ -255,6 +256,68 @@ describe("mySqlEngine integration", () => {
     } catch (error) {
       expect(error).toBeInstanceOf(EngineDocumentAlreadyExistsError);
     }
+  });
+
+  test("put preserves existing unique ownership when uniqueIndexes are omitted", async () => {
+    await engine.put(
+      collection,
+      "u1",
+      { id: "u1", email: "sam@example.com" },
+      { primary: "u1" },
+      undefined,
+      undefined,
+      { byEmail: "sam@example.com" },
+    );
+
+    await engine.put(
+      collection,
+      "u1",
+      { id: "u1", email: "updated@example.com" },
+      { primary: "u1" },
+    );
+
+    await expect(
+      engine.create(
+        collection,
+        "u2",
+        { id: "u2", email: "sam@example.com" },
+        { primary: "u2" },
+        undefined,
+        undefined,
+        { byEmail: "sam@example.com" },
+      ),
+    ).rejects.toBeInstanceOf(EngineUniqueConstraintError);
+  });
+
+  test("update preserves existing unique ownership when uniqueIndexes are omitted", async () => {
+    await engine.put(
+      collection,
+      "u1",
+      { id: "u1", email: "sam@example.com" },
+      { primary: "u1" },
+      undefined,
+      undefined,
+      { byEmail: "sam@example.com" },
+    );
+
+    await engine.update(
+      collection,
+      "u1",
+      { id: "u1", email: "updated@example.com" },
+      { primary: "u1" },
+    );
+
+    await expect(
+      engine.create(
+        collection,
+        "u2",
+        { id: "u2", email: "sam@example.com" },
+        { primary: "u2" },
+        undefined,
+        undefined,
+        { byEmail: "sam@example.com" },
+      ),
+    ).rejects.toBeInstanceOf(EngineUniqueConstraintError);
   });
 
   test("put upserts and update replaces existing document", async () => {

@@ -33,6 +33,11 @@ export interface BatchSetItem {
   key: string;
   doc: unknown;
   indexes: ResolvedIndexKeys;
+  /**
+   * Optional complete set of active unique index values for the document.
+   * When omitted, engines should preserve any existing unique ownerships
+   * rather than implicitly releasing them.
+   */
   uniqueIndexes?: ResolvedIndexKeys;
   migrationMetadata?: MigrationDocumentMetadata;
   /**
