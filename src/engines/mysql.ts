@@ -220,7 +220,6 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
               collection,
               normalizedUniqueIndexes,
             );
-            await assertUniqueIndexes(tx, refs, collection, key, normalizedUniqueIndexes);
           }
           await tx.execute(
             `
@@ -263,7 +262,6 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
             collection,
             normalizedUniqueIndexes,
           );
-          await assertUniqueIndexes(tx, refs, collection, key, normalizedUniqueIndexes);
         }
         await tx.execute(
           `
@@ -306,7 +304,6 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
             collection,
             normalizedUniqueIndexes,
           );
-          await assertUniqueIndexes(tx, refs, collection, key, normalizedUniqueIndexes);
         }
 
         const [result] = await tx.execute(
@@ -999,7 +996,6 @@ async function applyBatchSetChunk(
           collection,
           item.normalizedUniqueIndexes,
         );
-        await assertUniqueIndexes(tx, refs, collection, item.key, item.normalizedUniqueIndexes);
       }
       const [result] = await tx.execute(
         `
@@ -1039,7 +1035,6 @@ async function applyBatchSetChunk(
         collection,
         item.normalizedUniqueIndexes,
       );
-      await assertUniqueIndexes(tx, refs, collection, item.key, item.normalizedUniqueIndexes);
     }
     await tx.execute(
       `
@@ -1488,31 +1483,6 @@ async function lockDocumentWriteVersion(
   );
 }
 
-async function assertUniqueIndexes(
-  client: MySqlQueryableLike,
-  refs: TableRefs,
-  collection: string,
-  key: string,
-  uniqueIndexes: ResolvedIndexKeys,
-): Promise<void> {
-  for (const [indexName, indexValue] of Object.entries(uniqueIndexes)) {
-    const conflict = await findUniqueIndexConflict(
-      client,
-      refs,
-      collection,
-      key,
-      indexName,
-      indexValue,
-    );
-
-    if (!conflict) {
-      continue;
-    }
-
-    throw new EngineUniqueConstraintError(collection, key, indexName, indexValue, conflict);
-  }
-}
-
 async function replaceUniqueIndexes(
   client: MySqlQueryableLike,
   refs: TableRefs,
@@ -1585,6 +1555,9 @@ async function ensureLegacyUniqueIndexBootstrapped(
   collection: string,
   indexName: string,
 ): Promise<void> {
+  // This plain read is a steady-state fast path. Under REPEATABLE READ it can miss
+  // a bootstrap row committed after this transaction started, so the locking read
+  // below remains necessary for correctness.
   const bootstrapQuickCheck = await fetchOptionalRow(client, {
     sql: `
       SELECT index_name
@@ -1858,40 +1831,6 @@ async function loadCurrentUniqueIndexEntries(
       "MySQL returned an invalid owned unique index row",
     ),
   }));
-}
-
-async function findUniqueIndexConflict(
-  client: MySqlQueryableLike,
-  refs: TableRefs,
-  collection: string,
-  key: string,
-  indexName: string,
-  indexValue: string,
-): Promise<string | null> {
-  const ownershipConflict = await fetchOptionalRow(client, {
-    sql: `
-      SELECT doc_key
-      FROM ${refs.uniqueIndexesTable}
-      WHERE collection = ?
-        AND index_name = ?
-        AND index_value_hash = ?
-        AND index_value = ?
-        AND doc_key <> ?
-      LIMIT 1
-      FOR UPDATE
-    `,
-    params: [collection, indexName, hashIndexValue(indexValue), indexValue, key],
-    errorMessage: "MySQL returned an invalid unique index ownership row",
-  });
-
-  if (ownershipConflict) {
-    return readStringField(
-      ownershipConflict,
-      "doc_key",
-      "MySQL returned an invalid unique index ownership row",
-    );
-  }
-  return null;
 }
 
 function readSqlCursorRowId(cursorPosition: Exclude<QueryCursorPosition, { kind: "key" }>): number {
