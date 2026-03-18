@@ -203,6 +203,7 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
 
       try {
         await withTransaction(client, async (tx) => {
+          await assertUniqueIndexes(tx, refs, collection, key, normalizedUniqueIndexes);
           await tx.execute(
             `
               INSERT INTO ${refs.documentsTable} (collection, doc_key, doc_json)
@@ -211,7 +212,6 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
             [collection, key, docJson],
           );
 
-          await assertUniqueIndexes(tx, refs, collection, key, normalizedUniqueIndexes);
           await replaceUniqueIndexes(tx, refs, collection, key, normalizedUniqueIndexes);
           await replaceIndexes(tx, refs, collection, key, normalizedIndexes, false);
           await upsertMigrationMetadata(tx, refs, collection, key, metadata);
@@ -234,6 +234,7 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
       const metadata = normalizeMigrationMetadata(migrationMetadata) ?? deriveLegacyMetadata(doc);
 
       await withTransaction(client, async (tx) => {
+        await assertUniqueIndexes(tx, refs, collection, key, normalizedUniqueIndexes);
         await tx.execute(
           `
             INSERT INTO ${refs.documentsTable} (collection, doc_key, doc_json)
@@ -245,7 +246,6 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
           [collection, key, docJson],
         );
 
-        await assertUniqueIndexes(tx, refs, collection, key, normalizedUniqueIndexes);
         await replaceUniqueIndexes(tx, refs, collection, key, normalizedUniqueIndexes);
         await replaceIndexes(tx, refs, collection, key, normalizedIndexes, true);
         await upsertMigrationMetadata(tx, refs, collection, key, metadata);
@@ -964,6 +964,7 @@ async function applyBatchSetChunk(
       continue;
     }
 
+    await assertUniqueIndexes(tx, refs, collection, item.key, item.normalizedUniqueIndexes);
     await tx.execute(
       `
         INSERT INTO ${refs.documentsTable} (collection, doc_key, doc_json)
@@ -975,7 +976,6 @@ async function applyBatchSetChunk(
       [collection, item.key, item.docJson],
     );
 
-    await assertUniqueIndexes(tx, refs, collection, item.key, item.normalizedUniqueIndexes);
     await replaceUniqueIndexes(tx, refs, collection, item.key, item.normalizedUniqueIndexes);
     await replaceIndexes(tx, refs, collection, item.key, item.normalizedIndexes, true);
     await upsertMigrationMetadata(tx, refs, collection, item.key, item.metadata);
@@ -1454,6 +1454,7 @@ async function claimUniqueIndexOwnership(
           AND index_name = ?
           AND index_value_hash = ?
         LIMIT 1
+        FOR SHARE
       `,
       params: [collection, indexName, indexValueHash],
       errorMessage: "MySQL returned an invalid unique index ownership row",
