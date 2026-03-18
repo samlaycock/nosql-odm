@@ -239,6 +239,7 @@ export function postgresEngine(options: PostgresEngineOptions): PostgresQueryEng
             [collection, key, docJson],
           );
 
+          await synchronizeUniqueIndexWrites(tx, refs, collection, key, normalizedUniqueIndexes);
           await assertUniqueIndexes(tx, refs, collection, key, normalizedUniqueIndexes);
           await replaceUniqueIndexes(tx, refs, collection, key, normalizedUniqueIndexes);
           await replaceIndexes(tx, refs, collection, key, normalizedIndexes, false);
@@ -274,6 +275,7 @@ export function postgresEngine(options: PostgresEngineOptions): PostgresQueryEng
 
       try {
         await withTransaction(client, async (tx) => {
+          await synchronizeUniqueIndexWrites(tx, refs, collection, key, normalizedUniqueIndexes);
           await assertUniqueIndexes(tx, refs, collection, key, normalizedUniqueIndexes);
           await tx.query(
             `
@@ -312,6 +314,7 @@ export function postgresEngine(options: PostgresEngineOptions): PostgresQueryEng
 
       try {
         await withTransaction(client, async (tx) => {
+          await synchronizeUniqueIndexWrites(tx, refs, collection, key, normalizedUniqueIndexes);
           const updateResult = await tx.query(
             `
               UPDATE ${refs.documentsTable}
@@ -899,6 +902,31 @@ async function assertUniqueIndexes(
   }
 }
 
+async function synchronizeUniqueIndexWrites(
+  client: PostgresQueryableLike,
+  refs: TableRefs,
+  collection: string,
+  key: string,
+  uniqueIndexes: ResolvedIndexKeys,
+): Promise<void> {
+  // Serialize ownership transfers on both current and target values so
+  // concurrent writers cannot observe a stale owner mid-transaction.
+  const currentUniqueIndexes = await loadCurrentUniqueIndexes(client, refs, collection, key);
+  const lockTokens = new Set<string>();
+
+  for (const [indexName, indexValue] of Object.entries(currentUniqueIndexes)) {
+    lockTokens.add(createUniqueLockToken(collection, indexName, indexValue));
+  }
+
+  for (const [indexName, indexValue] of Object.entries(uniqueIndexes)) {
+    lockTokens.add(createUniqueLockToken(collection, indexName, indexValue));
+  }
+
+  for (const token of [...lockTokens].sort()) {
+    await client.query(`SELECT pg_advisory_xact_lock($1)`, [toAdvisoryLockKey(token)]);
+  }
+}
+
 async function replaceUniqueIndexes(
   client: PostgresQueryableLike,
   refs: TableRefs,
@@ -911,15 +939,78 @@ async function replaceUniqueIndexes(
     [collection, key],
   );
 
-  for (const [indexName, indexValue] of Object.entries(uniqueIndexes)) {
-    await client.query(
-      `
-        INSERT INTO ${refs.uniqueIndexesTable} (collection, doc_key, index_name, index_value)
-        VALUES ($1, $2, $3, $4)
-      `,
-      [collection, key, indexName, indexValue],
+  const entries = Object.entries(uniqueIndexes);
+
+  if (entries.length === 0) {
+    return;
+  }
+
+  const builder = createSqlBuilder();
+  const valuesSql = entries
+    .map(
+      ([indexName, indexValue]) =>
+        `(${builder.push(collection)}, ${builder.push(key)}, ${builder.push(indexName)}, ${builder.push(indexValue)})`,
+    )
+    .join(", ");
+
+  await client.query(
+    `
+      INSERT INTO ${refs.uniqueIndexesTable} (collection, doc_key, index_name, index_value)
+      VALUES ${valuesSql}
+    `,
+    builder.values,
+  );
+}
+
+async function loadCurrentUniqueIndexes(
+  client: PostgresQueryableLike,
+  refs: TableRefs,
+  collection: string,
+  key: string,
+): Promise<ResolvedIndexKeys> {
+  const ownershipRows = await fetchRows(client, {
+    sql: `
+      SELECT index_name, index_value
+      FROM ${refs.uniqueIndexesTable}
+      WHERE collection = $1 AND doc_key = $2
+    `,
+    params: [collection, key],
+    errorMessage: "Postgres returned an invalid owned unique index row",
+  });
+
+  if (ownershipRows.length > 0) {
+    return parseResolvedIndexes(
+      ownershipRows,
+      "Postgres returned an invalid owned unique index row",
     );
   }
+
+  const legacyRows = await fetchRows(client, {
+    sql: `
+      SELECT index_name, index_value
+      FROM ${refs.indexesTable}
+      WHERE collection = $1 AND doc_key = $2
+    `,
+    params: [collection, key],
+    errorMessage: "Postgres returned an invalid legacy index row",
+  });
+
+  return parseResolvedIndexes(legacyRows, "Postgres returned an invalid legacy index row");
+}
+
+function parseResolvedIndexes(
+  rows: readonly Record<string, unknown>[],
+  errorMessage: string,
+): ResolvedIndexKeys {
+  const resolved: ResolvedIndexKeys = {};
+
+  for (const row of rows) {
+    const indexName = readStringField(row, "index_name", errorMessage);
+    const indexValue = readStringField(row, "index_value", errorMessage);
+    resolved[indexName] = indexValue;
+  }
+
+  return resolved;
 }
 
 async function findUniqueIndexConflict(
@@ -986,6 +1077,12 @@ async function resolveUniqueConstraintError(
     uniqueIndexes: ResolvedIndexKeys;
   }[],
 ): Promise<EngineUniqueConstraintError> {
+  const fallbackCandidate = candidates[0];
+  const fallbackEntry =
+    fallbackCandidate === undefined
+      ? undefined
+      : Object.entries(fallbackCandidate.uniqueIndexes)[0];
+
   for (const candidate of candidates) {
     for (const [indexName, indexValue] of Object.entries(candidate.uniqueIndexes)) {
       const conflict = await findUniqueIndexConflict(
@@ -1011,7 +1108,17 @@ async function resolveUniqueConstraintError(
     }
   }
 
-  throw new Error(`Postgres unique constraint violation could not be resolved for "${collection}"`);
+  return new EngineUniqueConstraintError(
+    collection,
+    fallbackCandidate?.key ?? "",
+    fallbackEntry?.[0] ?? "unknown",
+    fallbackEntry?.[1] ?? "unknown",
+    null,
+  );
+}
+
+function createUniqueLockToken(collection: string, indexName: string, indexValue: string): string {
+  return `${collection}\u0000${indexName}\u0000${indexValue}`;
 }
 
 function normalizeBatchItems(items: readonly BatchSetItem[]): {
@@ -1185,6 +1292,7 @@ async function applyBatchSetChunk(
 
     if (item.expectedWriteToken !== undefined) {
       const expectedWriteVersion = parseWriteToken(item.expectedWriteToken);
+      await synchronizeUniqueIndexWrites(tx, refs, collection, item.key, normalizedUniqueIndexes);
       const updateResult = await tx.query(
         `
           UPDATE ${refs.documentsTable}
@@ -1214,6 +1322,7 @@ async function applyBatchSetChunk(
       continue;
     }
 
+    await synchronizeUniqueIndexWrites(tx, refs, collection, item.key, normalizedUniqueIndexes);
     await assertUniqueIndexes(tx, refs, collection, item.key, normalizedUniqueIndexes);
     await tx.query(
       `
