@@ -155,6 +155,7 @@ describe("mySqlEngine integration", () => {
     engineName: "mySqlEngine integration",
     getEngine: () => engine,
     nextCollection,
+    assertEngineUniqueConstraintConformance: true,
   });
 
   afterAll(async () => {
@@ -188,15 +189,24 @@ describe("mySqlEngine integration", () => {
       database: databaseName,
       documentsTable: "custom_documents",
       indexesTable: "custom_indexes",
+      uniqueIndexesTable: "custom_unique_indexes",
       migrationMetadataTable: "custom_migration_metadata",
       migrationLocksTable: "custom_locks",
       migrationCheckpointsTable: "custom_checkpoints",
     });
     const customCollection = nextCollection("custom");
 
-    await customEngine.put(customCollection, "u1", { id: "u1" }, { primary: "u1" });
+    await customEngine.put(
+      customCollection,
+      "u1",
+      { id: "u1", email: "sam@example.com" },
+      { primary: "u1" },
+      undefined,
+      undefined,
+      { byEmail: "sam@example.com" },
+    );
 
-    const [rows] = await requirePool().query(
+    const [documentRows] = await requirePool().query(
       `
         SELECT doc_key
         FROM ${qualifiedTableName("custom_documents")}
@@ -204,10 +214,20 @@ describe("mySqlEngine integration", () => {
       `,
       [customCollection, "u1"],
     );
+    const [uniqueIndexRows] = await requirePool().query(
+      `
+        SELECT doc_key
+        FROM ${qualifiedTableName("custom_unique_indexes")}
+        WHERE collection = ? AND doc_key = ?
+      `,
+      [customCollection, "u1"],
+    );
     const lock = await customEngine.migration.acquireLock(customCollection);
 
-    expect(Array.isArray(rows)).toBe(true);
-    expect((rows as unknown[]).length).toBe(1);
+    expect(Array.isArray(documentRows)).toBe(true);
+    expect((documentRows as unknown[]).length).toBe(1);
+    expect(Array.isArray(uniqueIndexRows)).toBe(true);
+    expect((uniqueIndexRows as unknown[]).length).toBe(1);
     expect(lock).not.toBeNull();
   });
 

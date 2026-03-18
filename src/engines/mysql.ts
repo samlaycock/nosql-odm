@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import { DefaultMigrator } from "../migrator";
 import { chunkArray, normalizeBatchChunkSize } from "./batch-chunking";
 import { getPreparedSerializedDocument, prepareDocumentForStorage } from "./document-preparation";
@@ -11,6 +13,7 @@ import {
   type BatchSetResult,
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
+  EngineUniqueConstraintError,
   type ComparableVersion,
   type EngineQueryResult,
   type FieldCondition,
@@ -25,6 +28,7 @@ import {
 
 const DEFAULT_DOCUMENTS_TABLE = "nosql_odm_documents";
 const DEFAULT_INDEXES_TABLE = "nosql_odm_index_entries";
+const DEFAULT_UNIQUE_INDEXES_TABLE = "nosql_odm_unique_index_entries";
 const DEFAULT_MIGRATION_METADATA_TABLE = "nosql_odm_migration_metadata";
 const DEFAULT_MIGRATION_LOCKS_TABLE = "nosql_odm_migration_locks";
 const DEFAULT_MIGRATION_CHECKPOINTS_TABLE = "nosql_odm_migration_checkpoints";
@@ -56,6 +60,7 @@ export interface MySqlEngineOptions {
   database?: string;
   documentsTable?: string;
   indexesTable?: string;
+  uniqueIndexesTable?: string;
   migrationMetadataTable?: string;
   migrationLocksTable?: string;
   migrationCheckpointsTable?: string;
@@ -79,6 +84,7 @@ interface LockRow {
 interface TableRefs {
   documentsTable: string;
   indexesTable: string;
+  uniqueIndexesTable: string;
   migrationMetadataTable: string;
   migrationLocksTable: string;
   migrationCheckpointsTable: string;
@@ -187,11 +193,12 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
       };
     },
 
-    async create(collection, key, doc, indexes, _options, migrationMetadata) {
+    async create(collection, key, doc, indexes, _options, migrationMetadata, uniqueIndexes) {
       await ready;
 
       const docJson = serializeDocument(doc);
       const normalizedIndexes = normalizeIndexes(indexes);
+      const normalizedUniqueIndexes = normalizeIndexes(uniqueIndexes ?? {});
       const metadata = normalizeMigrationMetadata(migrationMetadata) ?? deriveLegacyMetadata(doc);
 
       try {
@@ -204,6 +211,8 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
             [collection, key, docJson],
           );
 
+          await assertUniqueIndexes(tx, refs, collection, key, normalizedUniqueIndexes);
+          await replaceUniqueIndexes(tx, refs, collection, key, normalizedUniqueIndexes);
           await replaceIndexes(tx, refs, collection, key, normalizedIndexes, false);
           await upsertMigrationMetadata(tx, refs, collection, key, metadata);
         });
@@ -216,11 +225,12 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
       }
     },
 
-    async put(collection, key, doc, indexes, _options, migrationMetadata) {
+    async put(collection, key, doc, indexes, _options, migrationMetadata, uniqueIndexes) {
       await ready;
 
       const docJson = serializeDocument(doc);
       const normalizedIndexes = normalizeIndexes(indexes);
+      const normalizedUniqueIndexes = normalizeIndexes(uniqueIndexes ?? {});
       const metadata = normalizeMigrationMetadata(migrationMetadata) ?? deriveLegacyMetadata(doc);
 
       await withTransaction(client, async (tx) => {
@@ -235,16 +245,19 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
           [collection, key, docJson],
         );
 
+        await assertUniqueIndexes(tx, refs, collection, key, normalizedUniqueIndexes);
+        await replaceUniqueIndexes(tx, refs, collection, key, normalizedUniqueIndexes);
         await replaceIndexes(tx, refs, collection, key, normalizedIndexes, true);
         await upsertMigrationMetadata(tx, refs, collection, key, metadata);
       });
     },
 
-    async update(collection, key, doc, indexes, _options, migrationMetadata) {
+    async update(collection, key, doc, indexes, _options, migrationMetadata, uniqueIndexes) {
       await ready;
 
       const docJson = serializeDocument(doc);
       const normalizedIndexes = normalizeIndexes(indexes);
+      const normalizedUniqueIndexes = normalizeIndexes(uniqueIndexes ?? {});
       const metadata = normalizeMigrationMetadata(migrationMetadata) ?? deriveLegacyMetadata(doc);
 
       await withTransaction(client, async (tx) => {
@@ -263,6 +276,8 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
           throw new EngineDocumentNotFoundError(collection, key);
         }
 
+        await assertUniqueIndexes(tx, refs, collection, key, normalizedUniqueIndexes);
+        await replaceUniqueIndexes(tx, refs, collection, key, normalizedUniqueIndexes);
         await replaceIndexes(tx, refs, collection, key, normalizedIndexes, true);
         await upsertMigrationMetadata(tx, refs, collection, key, metadata);
       });
@@ -909,13 +924,16 @@ async function applyBatchSetChunk(
 ): Promise<BatchSetResult> {
   const persistedKeys: string[] = [];
   const conflictedKeys: string[] = [];
+  const preparedItems = items.map((item) => ({
+    key: item.key,
+    docJson: serializeDocument(item.doc),
+    normalizedIndexes: normalizeIndexes(item.indexes),
+    normalizedUniqueIndexes: normalizeIndexes(item.uniqueIndexes ?? {}),
+    metadata: normalizeMigrationMetadata(item.migrationMetadata) ?? deriveLegacyMetadata(item.doc),
+    expectedWriteToken: item.expectedWriteToken,
+  }));
 
-  for (const item of items) {
-    const docJson = serializeDocument(item.doc);
-    const normalizedIndexes = normalizeIndexes(item.indexes);
-    const metadata =
-      normalizeMigrationMetadata(item.migrationMetadata) ?? deriveLegacyMetadata(item.doc);
-
+  for (const item of preparedItems) {
     if (item.expectedWriteToken !== undefined) {
       const expectedWriteVersion = parseWriteToken(item.expectedWriteToken);
       const [result] = await tx.execute(
@@ -928,7 +946,7 @@ async function applyBatchSetChunk(
             AND doc_key = ?
             AND write_version = ?
         `,
-        [docJson, collection, item.key, expectedWriteVersion],
+        [item.docJson, collection, item.key, expectedWriteVersion],
       );
 
       if (
@@ -938,8 +956,10 @@ async function applyBatchSetChunk(
         continue;
       }
 
-      await replaceIndexes(tx, refs, collection, item.key, normalizedIndexes, true);
-      await upsertMigrationMetadata(tx, refs, collection, item.key, metadata);
+      await assertUniqueIndexes(tx, refs, collection, item.key, item.normalizedUniqueIndexes);
+      await replaceUniqueIndexes(tx, refs, collection, item.key, item.normalizedUniqueIndexes);
+      await replaceIndexes(tx, refs, collection, item.key, item.normalizedIndexes, true);
+      await upsertMigrationMetadata(tx, refs, collection, item.key, item.metadata);
       persistedKeys.push(item.key);
       continue;
     }
@@ -952,11 +972,13 @@ async function applyBatchSetChunk(
           doc_json = VALUES(doc_json),
           write_version = write_version + 1
       `,
-      [collection, item.key, docJson],
+      [collection, item.key, item.docJson],
     );
 
-    await replaceIndexes(tx, refs, collection, item.key, normalizedIndexes, true);
-    await upsertMigrationMetadata(tx, refs, collection, item.key, metadata);
+    await assertUniqueIndexes(tx, refs, collection, item.key, item.normalizedUniqueIndexes);
+    await replaceUniqueIndexes(tx, refs, collection, item.key, item.normalizedUniqueIndexes);
+    await replaceIndexes(tx, refs, collection, item.key, item.normalizedIndexes, true);
+    await upsertMigrationMetadata(tx, refs, collection, item.key, item.metadata);
     persistedKeys.push(item.key);
   }
 
@@ -1001,6 +1023,24 @@ async function ensureSchema(client: MySqlQueryableLike, refs: TableRefs): Promis
       KEY idx_scan (collection, index_name, doc_key)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
   `);
+
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS ${refs.uniqueIndexesTable} (
+      collection VARCHAR(191) NOT NULL,
+      doc_key VARCHAR(191) NOT NULL,
+      index_name VARCHAR(191) NOT NULL,
+      index_value TEXT NOT NULL,
+      index_value_hash CHAR(64) NOT NULL,
+      PRIMARY KEY (collection, index_name, index_value_hash),
+      FOREIGN KEY (collection, doc_key)
+        REFERENCES ${refs.documentsTable} (collection, doc_key)
+        ON DELETE CASCADE,
+      KEY idx_owner_lookup (collection, doc_key)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
+  `);
+
+  await ensureColumn(client, refs.uniqueIndexesTable, "index_value_hash", "CHAR(64) NOT NULL");
+  await ensureIndex(client, refs.uniqueIndexesTable, "idx_owner_lookup", "(collection, doc_key)");
 
   await client.query(`
     CREATE TABLE IF NOT EXISTS ${refs.migrationMetadataTable} (
@@ -1318,6 +1358,221 @@ function normalizeIndexes(indexes: ResolvedIndexKeys): ResolvedIndexKeys {
   }
 
   return normalized;
+}
+
+async function assertUniqueIndexes(
+  client: MySqlQueryableLike,
+  refs: TableRefs,
+  collection: string,
+  key: string,
+  uniqueIndexes: ResolvedIndexKeys,
+): Promise<void> {
+  for (const [indexName, indexValue] of Object.entries(uniqueIndexes)) {
+    const conflict = await findUniqueIndexConflict(
+      client,
+      refs,
+      collection,
+      key,
+      indexName,
+      indexValue,
+    );
+
+    if (!conflict) {
+      continue;
+    }
+
+    throw new EngineUniqueConstraintError(collection, key, indexName, indexValue, conflict);
+  }
+}
+
+async function replaceUniqueIndexes(
+  client: MySqlQueryableLike,
+  refs: TableRefs,
+  collection: string,
+  key: string,
+  uniqueIndexes: ResolvedIndexKeys,
+): Promise<void> {
+  for (const [indexName, indexValue] of Object.entries(uniqueIndexes)) {
+    await claimUniqueIndexOwnership(client, refs, collection, key, indexName, indexValue);
+  }
+
+  const currentUniqueIndexes = await loadCurrentUniqueIndexes(client, refs, collection, key);
+
+  for (const [indexName, indexValue] of Object.entries(currentUniqueIndexes)) {
+    if (uniqueIndexes[indexName] === indexValue) {
+      continue;
+    }
+
+    await client.execute(
+      `
+        DELETE FROM ${refs.uniqueIndexesTable}
+        WHERE collection = ?
+          AND doc_key = ?
+          AND index_name = ?
+          AND index_value_hash = ?
+      `,
+      [collection, key, indexName, hashIndexValue(indexValue)],
+    );
+  }
+}
+
+async function claimUniqueIndexOwnership(
+  client: MySqlQueryableLike,
+  refs: TableRefs,
+  collection: string,
+  key: string,
+  indexName: string,
+  indexValue: string,
+): Promise<void> {
+  const indexValueHash = hashIndexValue(indexValue);
+
+  try {
+    await client.execute(
+      `
+        INSERT INTO ${refs.uniqueIndexesTable} (
+          collection,
+          doc_key,
+          index_name,
+          index_value,
+          index_value_hash
+        )
+        VALUES (?, ?, ?, ?, ?)
+      `,
+      [collection, key, indexName, indexValue, indexValueHash],
+    );
+  } catch (error) {
+    if (!isMySqlDuplicateKeyError(error)) {
+      throw error;
+    }
+
+    const ownerRow = await fetchOptionalRow(client, {
+      sql: `
+        SELECT doc_key, index_value
+        FROM ${refs.uniqueIndexesTable}
+        WHERE collection = ?
+          AND index_name = ?
+          AND index_value_hash = ?
+        LIMIT 1
+      `,
+      params: [collection, indexName, indexValueHash],
+      errorMessage: "MySQL returned an invalid unique index ownership row",
+    });
+
+    if (!ownerRow) {
+      throw error;
+    }
+
+    const ownerKey = readStringField(
+      ownerRow,
+      "doc_key",
+      "MySQL returned an invalid unique index ownership row",
+    );
+    const ownerValue = readStringField(
+      ownerRow,
+      "index_value",
+      "MySQL returned an invalid unique index ownership row",
+    );
+
+    if (ownerValue !== indexValue) {
+      throw new Error(
+        `MySQL unique index hash collision detected in model "${collection}" for index "${indexName}"`,
+      );
+    }
+
+    if (ownerKey !== key) {
+      throw new EngineUniqueConstraintError(collection, key, indexName, indexValue, ownerKey);
+    }
+  }
+}
+
+async function loadCurrentUniqueIndexes(
+  client: MySqlQueryableLike,
+  refs: TableRefs,
+  collection: string,
+  key: string,
+): Promise<ResolvedIndexKeys> {
+  const rows = await fetchRows(client, {
+    sql: `
+      SELECT index_name, index_value
+      FROM ${refs.uniqueIndexesTable}
+      WHERE collection = ? AND doc_key = ?
+    `,
+    params: [collection, key],
+    errorMessage: "MySQL returned an invalid owned unique index row",
+  });
+
+  return parseResolvedIndexes(rows, "MySQL returned an invalid owned unique index row");
+}
+
+function parseResolvedIndexes(
+  rows: readonly Record<string, unknown>[],
+  errorMessage: string,
+): ResolvedIndexKeys {
+  const resolved: ResolvedIndexKeys = {};
+
+  for (const row of rows) {
+    const indexName = readStringField(row, "index_name", errorMessage);
+    const indexValue = readStringField(row, "index_value", errorMessage);
+    resolved[indexName] = indexValue;
+  }
+
+  return resolved;
+}
+
+async function findUniqueIndexConflict(
+  client: MySqlQueryableLike,
+  refs: TableRefs,
+  collection: string,
+  key: string,
+  indexName: string,
+  indexValue: string,
+): Promise<string | null> {
+  const ownershipConflict = await fetchOptionalRow(client, {
+    sql: `
+      SELECT doc_key
+      FROM ${refs.uniqueIndexesTable}
+      WHERE collection = ?
+        AND index_name = ?
+        AND index_value_hash = ?
+        AND index_value = ?
+        AND doc_key <> ?
+      LIMIT 1
+    `,
+    params: [collection, indexName, hashIndexValue(indexValue), indexValue, key],
+    errorMessage: "MySQL returned an invalid unique index ownership row",
+  });
+
+  if (ownershipConflict) {
+    return readStringField(
+      ownershipConflict,
+      "doc_key",
+      "MySQL returned an invalid unique index ownership row",
+    );
+  }
+
+  const legacyConflict = await fetchOptionalRow(client, {
+    sql: `
+      SELECT doc_key
+      FROM ${refs.indexesTable}
+      WHERE collection = ?
+        AND index_name = ?
+        AND index_value = ?
+        AND doc_key <> ?
+      LIMIT 1
+    `,
+    params: [collection, indexName, indexValue, key],
+    errorMessage: "MySQL returned an invalid legacy unique index row",
+  });
+
+  if (!legacyConflict) {
+    return null;
+  }
+
+  return readStringField(
+    legacyConflict,
+    "doc_key",
+    "MySQL returned an invalid legacy unique index row",
+  );
 }
 
 function readSqlCursorRowId(cursorPosition: Exclude<QueryCursorPosition, { kind: "key" }>): number {
@@ -1752,6 +2007,10 @@ function createPlaceholders(count: number): string {
   return Array.from({ length: count }, () => "?").join(", ");
 }
 
+function hashIndexValue(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
 function normalizeIdentifier(value: string, field: string): string {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) {
     throw new Error(
@@ -1782,6 +2041,10 @@ function buildTableRefs(options: MySqlEngineOptions): TableRefs {
   return {
     documentsTable: qualifyTableName(database, options.documentsTable ?? DEFAULT_DOCUMENTS_TABLE),
     indexesTable: qualifyTableName(database, options.indexesTable ?? DEFAULT_INDEXES_TABLE),
+    uniqueIndexesTable: qualifyTableName(
+      database,
+      options.uniqueIndexesTable ?? DEFAULT_UNIQUE_INDEXES_TABLE,
+    ),
     migrationMetadataTable: qualifyTableName(
       database,
       options.migrationMetadataTable ?? DEFAULT_MIGRATION_METADATA_TABLE,
