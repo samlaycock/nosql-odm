@@ -206,6 +206,12 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
 
       try {
         await withTransaction(client, async (tx) => {
+          const existingWriteVersion = await lockDocumentWriteVersion(tx, refs, collection, key);
+
+          if (existingWriteVersion !== null) {
+            throw new EngineDocumentAlreadyExistsError(collection, key);
+          }
+
           if (normalizedUniqueIndexes) {
             await ensureLegacyUniqueIndexesBootstrapped(
               tx,
@@ -247,6 +253,8 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
       const metadata = normalizeMigrationMetadata(migrationMetadata) ?? deriveLegacyMetadata(doc);
 
       await withTransaction(client, async (tx) => {
+        await lockDocumentWriteVersion(tx, refs, collection, key);
+
         if (normalizedUniqueIndexes) {
           await ensureLegacyUniqueIndexesBootstrapped(
             tx,
@@ -284,19 +292,9 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
       const metadata = normalizeMigrationMetadata(migrationMetadata) ?? deriveLegacyMetadata(doc);
 
       await withTransaction(client, async (tx) => {
-        const existing = await fetchOptionalRow(tx, {
-          sql: `
-            SELECT doc_key
-            FROM ${refs.documentsTable}
-            WHERE collection = ? AND doc_key = ?
-            LIMIT 1
-            FOR UPDATE
-          `,
-          params: [collection, key],
-          errorMessage: "MySQL returned an invalid update result",
-        });
+        const existingWriteVersion = await lockDocumentWriteVersion(tx, refs, collection, key);
 
-        if (!existing) {
+        if (existingWriteVersion === null) {
           throw new EngineDocumentNotFoundError(collection, key);
         }
 
@@ -982,27 +980,26 @@ async function applyBatchSetChunk(
     metadata: normalizeMigrationMetadata(item.migrationMetadata) ?? deriveLegacyMetadata(item.doc),
     expectedWriteToken: item.expectedWriteToken,
   }));
-  const unconditionalUniqueIndexNames = new Set<string>();
-
-  for (const item of preparedItems) {
-    if (!item.normalizedUniqueIndexes || item.expectedWriteToken !== undefined) {
-      continue;
-    }
-
-    for (const indexName of Object.keys(item.normalizedUniqueIndexes)) {
-      unconditionalUniqueIndexNames.add(indexName);
-    }
-  }
-
-  if (unconditionalUniqueIndexNames.size > 0) {
-    await ensureLegacyUniqueIndexNamesBootstrapped(tx, refs, collection, [
-      ...unconditionalUniqueIndexNames,
-    ]);
-  }
 
   for (const item of preparedItems) {
     if (item.expectedWriteToken !== undefined) {
       const expectedWriteVersion = parseWriteToken(item.expectedWriteToken);
+      const currentWriteVersion = await lockDocumentWriteVersion(tx, refs, collection, item.key);
+
+      if (currentWriteVersion === null || currentWriteVersion !== expectedWriteVersion) {
+        conflictedKeys.push(item.key);
+        continue;
+      }
+
+      if (item.normalizedUniqueIndexes) {
+        await ensureLegacyUniqueIndexesBootstrapped(
+          tx,
+          refs,
+          collection,
+          item.normalizedUniqueIndexes,
+        );
+        await assertUniqueIndexes(tx, refs, collection, item.key, item.normalizedUniqueIndexes);
+      }
       const [result] = await tx.execute(
         `
           UPDATE ${refs.documentsTable}
@@ -1024,13 +1021,6 @@ async function applyBatchSetChunk(
       }
 
       if (item.normalizedUniqueIndexes) {
-        await ensureLegacyUniqueIndexesBootstrapped(
-          tx,
-          refs,
-          collection,
-          item.normalizedUniqueIndexes,
-        );
-        await assertUniqueIndexes(tx, refs, collection, item.key, item.normalizedUniqueIndexes);
         await replaceUniqueIndexes(tx, refs, collection, item.key, item.normalizedUniqueIndexes);
       }
       await replaceIndexes(tx, refs, collection, item.key, item.normalizedIndexes, true);
@@ -1039,7 +1029,15 @@ async function applyBatchSetChunk(
       continue;
     }
 
+    await lockDocumentWriteVersion(tx, refs, collection, item.key);
+
     if (item.normalizedUniqueIndexes) {
+      await ensureLegacyUniqueIndexesBootstrapped(
+        tx,
+        refs,
+        collection,
+        item.normalizedUniqueIndexes,
+      );
       await assertUniqueIndexes(tx, refs, collection, item.key, item.normalizedUniqueIndexes);
     }
     await tx.execute(
@@ -1458,6 +1456,35 @@ function normalizeOptionalUniqueIndexes(
   }
 
   return normalizeIndexes(uniqueIndexes);
+}
+
+async function lockDocumentWriteVersion(
+  client: MySqlQueryableLike,
+  refs: TableRefs,
+  collection: string,
+  key: string,
+): Promise<number | null> {
+  const row = await fetchOptionalRow(client, {
+    sql: `
+      SELECT write_version
+      FROM ${refs.documentsTable}
+      WHERE collection = ? AND doc_key = ?
+      LIMIT 1
+      FOR UPDATE
+    `,
+    params: [collection, key],
+    errorMessage: "MySQL returned an invalid document write lock row",
+  });
+
+  if (!row) {
+    return null;
+  }
+
+  return readFiniteInteger(
+    row,
+    "write_version",
+    "MySQL returned an invalid document write lock row",
+  );
 }
 
 async function assertUniqueIndexes(
