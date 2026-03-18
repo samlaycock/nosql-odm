@@ -39,7 +39,7 @@ local function currentSignatureSet(prefix, collection, targetVersion, signatureT
 end
 
 local function uniqueOwnerKey(prefix, collection, indexName, indexValue)
-  return prefix .. ":unique:" .. collection .. ":" .. indexName .. ":" .. indexValue
+  return prefix .. ":unique:" .. collection .. ":" .. cjson.encode({indexName, indexValue})
 end
 
 local function decodeIndexRecord(raw)
@@ -225,7 +225,7 @@ local function currentSignatureSet(prefix, collection, targetVersion, signatureT
 end
 
 local function uniqueOwnerKey(prefix, collection, indexName, indexValue)
-  return prefix .. ":unique:" .. collection .. ":" .. indexName .. ":" .. indexValue
+  return prefix .. ":unique:" .. collection .. ":" .. cjson.encode({indexName, indexValue})
 end
 
 local function decodeIndexRecord(raw)
@@ -709,6 +709,8 @@ export function redisEngine(options: RedisEngineOptions): RedisQueryEngine {
     },
 
     async batchSet(collection, items) {
+      // Redis applies each batch item via its own Lua write. Unique violations
+      // abort the remaining items but do not roll back writes already persisted.
       for (const item of items) {
         const result = await upsertDocument(
           client,
@@ -739,6 +741,8 @@ export function redisEngine(options: RedisEngineOptions): RedisQueryEngine {
       const persistedKeys: string[] = [];
       const conflictedKeys: string[] = [];
 
+      // As with batchSet(), unique violations remain hard failures per the
+      // QueryEngine contract; only stale write-token mismatches become conflicts.
       for (const item of items) {
         const expectedWriteVersion =
           item.expectedWriteToken === undefined

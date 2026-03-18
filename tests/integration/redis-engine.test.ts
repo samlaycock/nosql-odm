@@ -198,6 +198,30 @@ describe("redisEngine integration", () => {
     expect(await engine.get(collection, "u1")).toEqual({ id: "u1", name: "Samuel" });
   });
 
+  test("unique owner keys distinguish colons in index names and values", async () => {
+    await engine.create(
+      collection,
+      "u1",
+      { id: "u1", email: "a:b" },
+      { primary: "u1" },
+      undefined,
+      undefined,
+      { email: "a:b" },
+    );
+    await engine.create(
+      collection,
+      "u2",
+      { id: "u2", email: "b" },
+      { primary: "u2" },
+      undefined,
+      undefined,
+      { "email:a": "b" },
+    );
+
+    expect(await engine.get(collection, "u1")).toEqual({ id: "u1", email: "a:b" });
+    expect(await engine.get(collection, "u2")).toEqual({ id: "u2", email: "b" });
+  });
+
   test("update throws not-found error when key does not exist", async () => {
     try {
       await engine.update(collection, "missing", { id: "missing" }, { primary: "missing" });
