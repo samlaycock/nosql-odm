@@ -29,6 +29,7 @@ import {
 const DEFAULT_DOCUMENTS_TABLE = "nosql_odm_documents";
 const DEFAULT_INDEXES_TABLE = "nosql_odm_index_entries";
 const DEFAULT_UNIQUE_INDEXES_TABLE = "nosql_odm_unique_index_entries";
+const DEFAULT_UNIQUE_INDEX_BOOTSTRAPS_TABLE = "nosql_odm_unique_index_bootstraps";
 const DEFAULT_MIGRATION_METADATA_TABLE = "nosql_odm_migration_metadata";
 const DEFAULT_MIGRATION_LOCKS_TABLE = "nosql_odm_migration_locks";
 const DEFAULT_MIGRATION_CHECKPOINTS_TABLE = "nosql_odm_migration_checkpoints";
@@ -61,6 +62,7 @@ export interface MySqlEngineOptions {
   documentsTable?: string;
   indexesTable?: string;
   uniqueIndexesTable?: string;
+  uniqueIndexBootstrapsTable?: string;
   migrationMetadataTable?: string;
   migrationLocksTable?: string;
   migrationCheckpointsTable?: string;
@@ -85,6 +87,7 @@ interface TableRefs {
   documentsTable: string;
   indexesTable: string;
   uniqueIndexesTable: string;
+  uniqueIndexBootstrapsTable: string;
   migrationMetadataTable: string;
   migrationLocksTable: string;
   migrationCheckpointsTable: string;
@@ -204,6 +207,12 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
       try {
         await withTransaction(client, async (tx) => {
           if (normalizedUniqueIndexes) {
+            await ensureLegacyUniqueIndexesBootstrapped(
+              tx,
+              refs,
+              collection,
+              normalizedUniqueIndexes,
+            );
             await assertUniqueIndexes(tx, refs, collection, key, normalizedUniqueIndexes);
           }
           await tx.execute(
@@ -239,6 +248,12 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
 
       await withTransaction(client, async (tx) => {
         if (normalizedUniqueIndexes) {
+          await ensureLegacyUniqueIndexesBootstrapped(
+            tx,
+            refs,
+            collection,
+            normalizedUniqueIndexes,
+          );
           await assertUniqueIndexes(tx, refs, collection, key, normalizedUniqueIndexes);
         }
         await tx.execute(
@@ -286,6 +301,12 @@ export function mySqlEngine(options: MySqlEngineOptions): MySqlQueryEngine {
         }
 
         if (normalizedUniqueIndexes) {
+          await ensureLegacyUniqueIndexesBootstrapped(
+            tx,
+            refs,
+            collection,
+            normalizedUniqueIndexes,
+          );
           await assertUniqueIndexes(tx, refs, collection, key, normalizedUniqueIndexes);
         }
 
@@ -961,13 +982,26 @@ async function applyBatchSetChunk(
     metadata: normalizeMigrationMetadata(item.migrationMetadata) ?? deriveLegacyMetadata(item.doc),
     expectedWriteToken: item.expectedWriteToken,
   }));
+  const unconditionalUniqueIndexNames = new Set<string>();
+
+  for (const item of preparedItems) {
+    if (!item.normalizedUniqueIndexes || item.expectedWriteToken !== undefined) {
+      continue;
+    }
+
+    for (const indexName of Object.keys(item.normalizedUniqueIndexes)) {
+      unconditionalUniqueIndexNames.add(indexName);
+    }
+  }
+
+  if (unconditionalUniqueIndexNames.size > 0) {
+    await ensureLegacyUniqueIndexNamesBootstrapped(tx, refs, collection, [
+      ...unconditionalUniqueIndexNames,
+    ]);
+  }
 
   for (const item of preparedItems) {
     if (item.expectedWriteToken !== undefined) {
-      if (item.normalizedUniqueIndexes) {
-        await assertUniqueIndexes(tx, refs, collection, item.key, item.normalizedUniqueIndexes);
-      }
-
       const expectedWriteVersion = parseWriteToken(item.expectedWriteToken);
       const [result] = await tx.execute(
         `
@@ -990,6 +1024,13 @@ async function applyBatchSetChunk(
       }
 
       if (item.normalizedUniqueIndexes) {
+        await ensureLegacyUniqueIndexesBootstrapped(
+          tx,
+          refs,
+          collection,
+          item.normalizedUniqueIndexes,
+        );
+        await assertUniqueIndexes(tx, refs, collection, item.key, item.normalizedUniqueIndexes);
         await replaceUniqueIndexes(tx, refs, collection, item.key, item.normalizedUniqueIndexes);
       }
       await replaceIndexes(tx, refs, collection, item.key, item.normalizedIndexes, true);
@@ -1079,6 +1120,17 @@ async function ensureSchema(client: MySqlQueryableLike, refs: TableRefs): Promis
 
   await ensureColumn(client, refs.uniqueIndexesTable, "index_value_hash", "CHAR(64) NOT NULL");
   await ensureIndex(client, refs.uniqueIndexesTable, "idx_owner_lookup", "(collection, doc_key)");
+
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS ${refs.uniqueIndexBootstrapsTable} (
+      collection VARCHAR(191) NOT NULL,
+      index_name VARCHAR(191) NOT NULL,
+      bootstrapped_at BIGINT NOT NULL,
+      PRIMARY KEY (collection, index_name)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
+  `);
+
+  await ensureColumn(client, refs.uniqueIndexBootstrapsTable, "bootstrapped_at", "BIGINT NOT NULL");
 
   await client.query(`
     CREATE TABLE IF NOT EXISTS ${refs.migrationMetadataTable} (
@@ -1465,6 +1517,167 @@ async function replaceUniqueIndexes(
   }
 }
 
+async function ensureLegacyUniqueIndexesBootstrapped(
+  client: MySqlQueryableLike,
+  refs: TableRefs,
+  collection: string,
+  uniqueIndexes: ResolvedIndexKeys,
+): Promise<void> {
+  await ensureLegacyUniqueIndexNamesBootstrapped(
+    client,
+    refs,
+    collection,
+    Object.keys(uniqueIndexes),
+  );
+}
+
+async function ensureLegacyUniqueIndexNamesBootstrapped(
+  client: MySqlQueryableLike,
+  refs: TableRefs,
+  collection: string,
+  indexNames: readonly string[],
+): Promise<void> {
+  const uniqueIndexNames = uniqueStrings([...indexNames]).sort((a, b) => a.localeCompare(b));
+
+  for (const indexName of uniqueIndexNames) {
+    await ensureLegacyUniqueIndexBootstrapped(client, refs, collection, indexName);
+  }
+}
+
+async function ensureLegacyUniqueIndexBootstrapped(
+  client: MySqlQueryableLike,
+  refs: TableRefs,
+  collection: string,
+  indexName: string,
+): Promise<void> {
+  const existingBootstrap = await fetchOptionalRow(client, {
+    sql: `
+      SELECT index_name
+      FROM ${refs.uniqueIndexBootstrapsTable}
+      WHERE collection = ? AND index_name = ?
+      LIMIT 1
+      FOR UPDATE
+    `,
+    params: [collection, indexName],
+    errorMessage: "MySQL returned an invalid unique index bootstrap row",
+  });
+
+  if (existingBootstrap) {
+    return;
+  }
+
+  const legacyRows = await fetchRows(client, {
+    sql: `
+      SELECT doc_key, index_value
+      FROM ${refs.indexesTable}
+      WHERE collection = ? AND index_name = ?
+      ORDER BY index_value ASC, doc_key ASC
+      LOCK IN SHARE MODE
+    `,
+    params: [collection, indexName],
+    errorMessage: "MySQL returned an invalid legacy unique index row",
+  });
+
+  for (const row of legacyRows) {
+    const legacyKey = readStringField(
+      row,
+      "doc_key",
+      "MySQL returned an invalid legacy unique index row",
+    );
+    const legacyValue = readStringField(
+      row,
+      "index_value",
+      "MySQL returned an invalid legacy unique index row",
+    );
+
+    await insertBootstrappedUniqueIndexOwnership(
+      client,
+      refs,
+      collection,
+      legacyKey,
+      indexName,
+      legacyValue,
+    );
+  }
+
+  await client.execute(
+    `
+      INSERT INTO ${refs.uniqueIndexBootstrapsTable} (collection, index_name, bootstrapped_at)
+      VALUES (?, ?, ?)
+      ON DUPLICATE KEY UPDATE bootstrapped_at = bootstrapped_at
+    `,
+    [collection, indexName, Date.now()],
+  );
+}
+
+async function insertBootstrappedUniqueIndexOwnership(
+  client: MySqlQueryableLike,
+  refs: TableRefs,
+  collection: string,
+  key: string,
+  indexName: string,
+  indexValue: string,
+): Promise<void> {
+  try {
+    await client.execute(
+      `
+        INSERT INTO ${refs.uniqueIndexesTable} (
+          collection,
+          doc_key,
+          index_name,
+          index_value,
+          index_value_hash
+        )
+        VALUES (?, ?, ?, ?, ?)
+      `,
+      [collection, key, indexName, indexValue, hashIndexValue(indexValue)],
+    );
+  } catch (error) {
+    if (!isMySqlDuplicateKeyError(error)) {
+      throw error;
+    }
+
+    const ownerRow = await fetchOptionalRow(client, {
+      sql: `
+        SELECT doc_key, index_value
+        FROM ${refs.uniqueIndexesTable}
+        WHERE collection = ?
+          AND index_name = ?
+          AND index_value_hash = ?
+        LIMIT 1
+        LOCK IN SHARE MODE
+      `,
+      params: [collection, indexName, hashIndexValue(indexValue)],
+      errorMessage: "MySQL returned an invalid unique index ownership row",
+    });
+
+    if (!ownerRow) {
+      throw error;
+    }
+
+    const ownerKey = readStringField(
+      ownerRow,
+      "doc_key",
+      "MySQL returned an invalid unique index ownership row",
+    );
+    const ownerValue = readStringField(
+      ownerRow,
+      "index_value",
+      "MySQL returned an invalid unique index ownership row",
+    );
+
+    if (ownerValue !== indexValue) {
+      throw new Error(
+        `MySQL unique index hash collision detected in model "${collection}" for index "${indexName}"`,
+      );
+    }
+
+    if (ownerKey !== key) {
+      throw new EngineUniqueConstraintError(collection, key, indexName, indexValue, ownerKey);
+    }
+  }
+}
+
 async function claimUniqueIndexOwnership(
   client: MySqlQueryableLike,
   refs: TableRefs,
@@ -1551,6 +1764,7 @@ async function loadCurrentUniqueIndexEntries(
       SELECT index_name, index_value
       FROM ${refs.uniqueIndexesTable}
       WHERE collection = ? AND doc_key = ?
+      FOR UPDATE
     `,
     params: [collection, key],
     errorMessage: "MySQL returned an invalid owned unique index row",
@@ -1601,31 +1815,7 @@ async function findUniqueIndexConflict(
       "MySQL returned an invalid unique index ownership row",
     );
   }
-
-  const legacyConflict = await fetchOptionalRow(client, {
-    sql: `
-      SELECT doc_key
-      FROM ${refs.indexesTable}
-      WHERE collection = ?
-        AND index_name = ?
-        AND index_value = ?
-        AND doc_key <> ?
-      LIMIT 1
-      LOCK IN SHARE MODE
-    `,
-    params: [collection, indexName, indexValue, key],
-    errorMessage: "MySQL returned an invalid legacy unique index row",
-  });
-
-  if (!legacyConflict) {
-    return null;
-  }
-
-  return readStringField(
-    legacyConflict,
-    "doc_key",
-    "MySQL returned an invalid legacy unique index row",
-  );
+  return null;
 }
 
 function readSqlCursorRowId(cursorPosition: Exclude<QueryCursorPosition, { kind: "key" }>): number {
@@ -2097,6 +2287,10 @@ function buildTableRefs(options: MySqlEngineOptions): TableRefs {
     uniqueIndexesTable: qualifyTableName(
       database,
       options.uniqueIndexesTable ?? DEFAULT_UNIQUE_INDEXES_TABLE,
+    ),
+    uniqueIndexBootstrapsTable: qualifyTableName(
+      database,
+      options.uniqueIndexBootstrapsTable ?? DEFAULT_UNIQUE_INDEX_BOOTSTRAPS_TABLE,
     ),
     migrationMetadataTable: qualifyTableName(
       database,
