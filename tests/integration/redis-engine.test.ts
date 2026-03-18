@@ -131,6 +131,7 @@ describe("redisEngine integration", () => {
     engineName: "redisEngine integration",
     getEngine: () => engine,
     nextCollection,
+    assertEngineUniqueConstraintConformance: true,
   });
 
   afterAll(async () => {

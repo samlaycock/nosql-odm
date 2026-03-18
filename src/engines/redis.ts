@@ -5,6 +5,7 @@ import {
   type BatchSetResult,
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
+  EngineUniqueConstraintError,
   type ComparableVersion,
   type EngineQueryResult,
   type FieldCondition,
@@ -35,6 +36,53 @@ end
 
 local function currentSignatureSet(prefix, collection, targetVersion, signatureToken)
   return prefix .. ":migration:current:sig:" .. collection .. ":" .. targetVersion .. ":" .. signatureToken
+end
+
+local function uniqueOwnerKey(prefix, collection, indexName, indexValue)
+  return prefix .. ":unique:" .. collection .. ":" .. indexName .. ":" .. indexValue
+end
+
+local function decodeIndexRecord(raw)
+  if raw == false or raw == nil or raw == "" then
+    return {}
+  end
+
+  local ok, parsed = pcall(cjson.decode, raw)
+  if not ok or type(parsed) ~= "table" then
+    return {}
+  end
+
+  return parsed
+end
+
+local function releaseUniqueIndexes(prefix, collection, key, uniqueIndexes)
+  for indexName, indexValue in pairs(uniqueIndexes) do
+    local ownerKey = uniqueOwnerKey(prefix, collection, indexName, indexValue)
+    local currentOwner = redis.call("GET", ownerKey)
+
+    if currentOwner == key then
+      redis.call("DEL", ownerKey)
+    end
+  end
+end
+
+local function assertUniqueIndexes(prefix, collection, key, uniqueIndexes)
+  for indexName, indexValue in pairs(uniqueIndexes) do
+    local ownerKey = uniqueOwnerKey(prefix, collection, indexName, indexValue)
+    local existingOwner = redis.call("GET", ownerKey)
+
+    if existingOwner and existingOwner ~= key then
+      return {indexName, indexValue, existingOwner}
+    end
+  end
+
+  return nil
+end
+
+local function assignUniqueIndexes(prefix, collection, key, uniqueIndexes)
+  for indexName, indexValue in pairs(uniqueIndexes) do
+    redis.call("SET", uniqueOwnerKey(prefix, collection, indexName, indexValue), key)
+  end
 end
 
 local function removePreviousIndexes(prefix, collection, key, targetSetKey)
@@ -81,6 +129,8 @@ local versionState = ARGV[9]
 local indexSignature = ARGV[10]
 local indexSignatureToken = ARGV[11]
 local expectedWriteVersionRaw = ARGV[12]
+local uniqueIndexesProvided = ARGV[13]
+local nextUniqueIndexesJson = ARGV[14]
 
 local exists = redis.call("EXISTS", KEYS[1]) == 1
 
@@ -101,12 +151,33 @@ if mode == "conditional" then
   end
 end
 
+local storedUniqueIndexesJson = redis.call("HGET", KEYS[1], "uniqueIndexes")
+local previousUniqueIndexes = decodeIndexRecord(storedUniqueIndexesJson)
+local nextUniqueIndexes = previousUniqueIndexes
+local uniqueIndexesJson = storedUniqueIndexesJson
+
+if uniqueIndexesProvided == "1" then
+  nextUniqueIndexes = decodeIndexRecord(nextUniqueIndexesJson)
+  uniqueIndexesJson = nextUniqueIndexesJson
+elseif uniqueIndexesJson == false or uniqueIndexesJson == nil or uniqueIndexesJson == "" then
+  nextUniqueIndexes = {}
+  uniqueIndexesJson = "{}"
+end
+
+local uniqueViolation = assertUniqueIndexes(prefix, collection, key, nextUniqueIndexes)
+
+if uniqueViolation ~= nil then
+  return {3, uniqueViolation[1], uniqueViolation[2], uniqueViolation[3]}
+end
+
 local createdAt = redis.call("HGET", KEYS[1], "createdAt")
 if not createdAt then
   createdAt = createdAtArg
 end
 
 removePreviousIndexes(prefix, collection, key, KEYS[3])
+releaseUniqueIndexes(prefix, collection, key, previousUniqueIndexes)
+assignUniqueIndexes(prefix, collection, key, nextUniqueIndexes)
 
 local nextWriteVersion = 1
 if exists then
@@ -124,6 +195,8 @@ redis.call(
   docJson,
   "indexes",
   indexesJson,
+  "uniqueIndexes",
+  uniqueIndexesJson,
   "migrationTargetVersion",
   targetVersion,
   "migrationVersionState",
@@ -151,6 +224,34 @@ local function currentSignatureSet(prefix, collection, targetVersion, signatureT
   return prefix .. ":migration:current:sig:" .. collection .. ":" .. targetVersion .. ":" .. signatureToken
 end
 
+local function uniqueOwnerKey(prefix, collection, indexName, indexValue)
+  return prefix .. ":unique:" .. collection .. ":" .. indexName .. ":" .. indexValue
+end
+
+local function decodeIndexRecord(raw)
+  if raw == false or raw == nil or raw == "" then
+    return {}
+  end
+
+  local ok, parsed = pcall(cjson.decode, raw)
+  if not ok or type(parsed) ~= "table" then
+    return {}
+  end
+
+  return parsed
+end
+
+local function releaseUniqueIndexes(prefix, collection, key, uniqueIndexes)
+  for indexName, indexValue in pairs(uniqueIndexes) do
+    local ownerKey = uniqueOwnerKey(prefix, collection, indexName, indexValue)
+    local currentOwner = redis.call("GET", ownerKey)
+
+    if currentOwner == key then
+      redis.call("DEL", ownerKey)
+    end
+  end
+end
+
 local prefix = ARGV[1]
 local collection = ARGV[2]
 local key = ARGV[3]
@@ -162,6 +263,13 @@ local oldToken = redis.call("HGET", KEYS[1], "migrationIndexSignatureToken")
 if oldToken == false or oldToken == nil or oldToken == "" then
   oldToken = "__null__"
 end
+
+releaseUniqueIndexes(
+  prefix,
+  collection,
+  key,
+  decodeIndexRecord(redis.call("HGET", KEYS[1], "uniqueIndexes"))
+)
 
 redis.call("DEL", KEYS[1])
 redis.call("ZREM", KEYS[2], key)
@@ -373,6 +481,16 @@ interface MigrationMetadata {
 
 type UpsertMode = "create" | "put" | "update" | "conditional";
 
+type UpsertDocumentResult =
+  | { status: "applied"; writeVersion: number | null }
+  | { status: "missing" | "conflict"; writeVersion: null }
+  | {
+      status: "unique_violation";
+      indexName: string;
+      indexValue: string;
+      existingKey: string | null;
+    };
+
 interface OutdatedCursorState {
   phase: "stale" | "mismatch";
   staleScore: number | null;
@@ -417,7 +535,7 @@ export function redisEngine(options: RedisEngineOptions): RedisQueryEngine {
       };
     },
 
-    async create(collection, key, doc, indexes, _options, migrationMetadata) {
+    async create(collection, key, doc, indexes, _options, migrationMetadata, uniqueIndexes) {
       const result = await upsertDocument(
         client,
         keyPrefix,
@@ -428,15 +546,26 @@ export function redisEngine(options: RedisEngineOptions): RedisQueryEngine {
         "create",
         undefined,
         migrationMetadata,
+        uniqueIndexes,
       );
+
+      if (result.status === "unique_violation") {
+        throw new EngineUniqueConstraintError(
+          collection,
+          key,
+          result.indexName,
+          result.indexValue,
+          result.existingKey,
+        );
+      }
 
       if (result.status !== "applied") {
         throw new EngineDocumentAlreadyExistsError(collection, key);
       }
     },
 
-    async put(collection, key, doc, indexes, _options, migrationMetadata) {
-      await upsertDocument(
+    async put(collection, key, doc, indexes, _options, migrationMetadata, uniqueIndexes) {
+      const result = await upsertDocument(
         client,
         keyPrefix,
         collection,
@@ -446,10 +575,21 @@ export function redisEngine(options: RedisEngineOptions): RedisQueryEngine {
         "put",
         undefined,
         migrationMetadata,
+        uniqueIndexes,
       );
+
+      if (result.status === "unique_violation") {
+        throw new EngineUniqueConstraintError(
+          collection,
+          key,
+          result.indexName,
+          result.indexValue,
+          result.existingKey,
+        );
+      }
     },
 
-    async update(collection, key, doc, indexes, _options, migrationMetadata) {
+    async update(collection, key, doc, indexes, _options, migrationMetadata, uniqueIndexes) {
       const result = await upsertDocument(
         client,
         keyPrefix,
@@ -460,7 +600,18 @@ export function redisEngine(options: RedisEngineOptions): RedisQueryEngine {
         "update",
         undefined,
         migrationMetadata,
+        uniqueIndexes,
       );
+
+      if (result.status === "unique_violation") {
+        throw new EngineUniqueConstraintError(
+          collection,
+          key,
+          result.indexName,
+          result.indexValue,
+          result.existingKey,
+        );
+      }
 
       if (result.status !== "applied") {
         throw new EngineDocumentNotFoundError(collection, key);
@@ -559,7 +710,7 @@ export function redisEngine(options: RedisEngineOptions): RedisQueryEngine {
 
     async batchSet(collection, items) {
       for (const item of items) {
-        await upsertDocument(
+        const result = await upsertDocument(
           client,
           keyPrefix,
           collection,
@@ -569,7 +720,18 @@ export function redisEngine(options: RedisEngineOptions): RedisQueryEngine {
           "put",
           undefined,
           item.migrationMetadata,
+          item.uniqueIndexes,
         );
+
+        if (result.status === "unique_violation") {
+          throw new EngineUniqueConstraintError(
+            collection,
+            item.key,
+            result.indexName,
+            result.indexValue,
+            result.existingKey,
+          );
+        }
       }
     },
 
@@ -593,6 +755,7 @@ export function redisEngine(options: RedisEngineOptions): RedisQueryEngine {
           mode,
           expectedWriteVersion,
           item.migrationMetadata,
+          item.uniqueIndexes,
         );
 
         if (result.status === "conflict") {
@@ -603,6 +766,16 @@ export function redisEngine(options: RedisEngineOptions): RedisQueryEngine {
         if (result.status === "missing") {
           conflictedKeys.push(item.key);
           continue;
+        }
+
+        if (result.status === "unique_violation") {
+          throw new EngineUniqueConstraintError(
+            collection,
+            item.key,
+            result.indexName,
+            result.indexValue,
+            result.existingKey,
+          );
         }
 
         persistedKeys.push(item.key);
@@ -779,10 +952,13 @@ async function upsertDocument(
   mode: UpsertMode,
   expectedWriteVersion: number | undefined,
   migrationMetadata: MigrationDocumentMetadata | undefined,
-): Promise<{ status: "applied" | "missing" | "conflict"; writeVersion: number | null }> {
+  uniqueIndexes: ResolvedIndexKeys | undefined,
+): Promise<UpsertDocumentResult> {
   const createdAt = await nextCreatedAt(client, keyPrefix, collection);
   const metadata =
     normalizeMigrationMetadata(migrationMetadata) ?? deriveLegacyMetadataFromDocument(doc);
+  const serializedUniqueIndexes =
+    uniqueIndexes === undefined ? null : serializeIndexes(uniqueIndexes);
   const result = await evalScript(
     client,
     CREATE_DOCUMENT_SCRIPT,
@@ -804,32 +980,39 @@ async function upsertDocument(
       metadata.indexSignature ?? NULL_INDEX_SIGNATURE,
       migrationSignatureToken(metadata.indexSignature),
       expectedWriteVersion === undefined ? "" : String(expectedWriteVersion),
+      uniqueIndexes === undefined ? "0" : "1",
+      serializedUniqueIndexes ?? "",
     ],
   );
-  const [statusCode, writeVersionRaw] = parseIntegerTuple(
-    result,
-    2,
-    "Redis returned an invalid upsert result",
-  );
+  const upsertResult = parseUpsertResult(result);
 
-  if (statusCode === 1) {
+  if (upsertResult.statusCode === 1) {
     return {
       status: "applied",
-      writeVersion: writeVersionRaw ?? null,
+      writeVersion: upsertResult.writeVersion,
     };
   }
 
-  if (statusCode === 0) {
+  if (upsertResult.statusCode === 0) {
     return {
       status: mode === "update" ? "missing" : "conflict",
       writeVersion: null,
     };
   }
 
-  if (statusCode === 2) {
+  if (upsertResult.statusCode === 2) {
     return {
       status: "conflict",
       writeVersion: null,
+    };
+  }
+
+  if (upsertResult.statusCode === 3) {
+    return {
+      status: "unique_violation",
+      indexName: upsertResult.indexName,
+      indexValue: upsertResult.indexValue,
+      existingKey: upsertResult.existingKey,
     };
   }
 
@@ -1464,6 +1647,14 @@ function parseStringArray(value: unknown, context: string): string[] {
   return values;
 }
 
+function parseStringValue(value: unknown, message: string): string {
+  if (typeof value !== "string") {
+    throw new Error(message);
+  }
+
+  return value;
+}
+
 function parseInteger(value: unknown, message: string): number {
   if (typeof value === "number") {
     if (!Number.isFinite(value)) {
@@ -1496,18 +1687,47 @@ function parseInteger(value: unknown, message: string): number {
   throw new Error(message);
 }
 
-function parseIntegerTuple(value: unknown, expectedLength: number, message: string): number[] {
-  if (!Array.isArray(value) || value.length < expectedLength) {
-    throw new Error(message);
+function parseUpsertResult(
+  value: unknown,
+):
+  | { statusCode: 0 | 1 | 2; writeVersion: number | null }
+  | { statusCode: 3; indexName: string; indexValue: string; existingKey: string | null } {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error("Redis returned an invalid upsert result");
   }
 
-  const parsed: number[] = [];
+  const statusCode = parseInteger(value[0], "Redis returned an invalid upsert result");
 
-  for (let i = 0; i < expectedLength; i++) {
-    parsed.push(parseInteger(value[i], message));
+  if (statusCode === 0 || statusCode === 1 || statusCode === 2) {
+    const writeVersionRaw = value[1];
+    const writeVersion =
+      writeVersionRaw === undefined || writeVersionRaw === null
+        ? null
+        : parseInteger(writeVersionRaw, "Redis returned an invalid upsert result");
+
+    return {
+      statusCode,
+      writeVersion,
+    };
   }
 
-  return parsed;
+  if (statusCode === 3) {
+    const indexName = parseStringValue(value[1], "Redis returned an invalid upsert result");
+    const indexValue = parseStringValue(value[2], "Redis returned an invalid upsert result");
+    const existingKeyRaw = value[3];
+
+    return {
+      statusCode,
+      indexName,
+      indexValue,
+      existingKey:
+        existingKeyRaw === undefined || existingKeyRaw === null
+          ? null
+          : parseStringValue(existingKeyRaw, "Redis returned an invalid upsert result"),
+    };
+  }
+
+  throw new Error("Redis returned an invalid upsert result");
 }
 
 function matchDocuments(
