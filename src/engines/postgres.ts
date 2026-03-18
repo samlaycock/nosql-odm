@@ -11,6 +11,7 @@ import {
   type BatchSetResult,
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
+  EngineUniqueConstraintError,
   type ComparableVersion,
   type EngineQueryResult,
   type FieldCondition,
@@ -26,6 +27,7 @@ import {
 const DEFAULT_SCHEMA = "public";
 const DEFAULT_DOCUMENTS_TABLE = "nosql_odm_documents";
 const DEFAULT_INDEXES_TABLE = "nosql_odm_index_entries";
+const DEFAULT_UNIQUE_INDEXES_TABLE = "nosql_odm_unique_index_entries";
 const DEFAULT_MIGRATION_METADATA_TABLE = "nosql_odm_migration_metadata";
 const DEFAULT_MIGRATION_LOCKS_TABLE = "nosql_odm_migration_locks";
 const DEFAULT_MIGRATION_CHECKPOINTS_TABLE = "nosql_odm_migration_checkpoints";
@@ -56,6 +58,7 @@ export interface PostgresEngineOptions {
   schema?: string;
   documentsTable?: string;
   indexesTable?: string;
+  uniqueIndexesTable?: string;
   migrationMetadataTable?: string;
   migrationLocksTable?: string;
   migrationCheckpointsTable?: string;
@@ -80,6 +83,7 @@ interface TableRefs {
   schema: string;
   documentsTable: string;
   indexesTable: string;
+  uniqueIndexesTable: string;
   migrationMetadataTable: string;
   migrationLocksTable: string;
   migrationCheckpointsTable: string;
@@ -106,6 +110,11 @@ export function postgresEngine(options: PostgresEngineOptions): PostgresQueryEng
       options.schema ?? DEFAULT_SCHEMA,
       options.indexesTable ?? DEFAULT_INDEXES_TABLE,
       "indexesTable",
+    ),
+    uniqueIndexesTable: qualifyTableName(
+      options.schema ?? DEFAULT_SCHEMA,
+      options.uniqueIndexesTable ?? DEFAULT_UNIQUE_INDEXES_TABLE,
+      "uniqueIndexesTable",
     ),
     migrationMetadataTable: qualifyTableName(
       options.schema ?? DEFAULT_SCHEMA,
@@ -215,11 +224,12 @@ export function postgresEngine(options: PostgresEngineOptions): PostgresQueryEng
       };
     },
 
-    async create(collection, key, doc, indexes, _options, migrationMetadata) {
+    async create(collection, key, doc, indexes, _options, migrationMetadata, uniqueIndexes) {
       await ready;
 
       const docJson = serializeDocument(doc);
       const normalizedIndexes = normalizeIndexes(indexes);
+      const normalizedUniqueIndexes = normalizeIndexes(uniqueIndexes ?? {});
       const metadata = normalizeMigrationMetadata(migrationMetadata) ?? deriveLegacyMetadata(doc);
 
       try {
@@ -229,69 +239,108 @@ export function postgresEngine(options: PostgresEngineOptions): PostgresQueryEng
             [collection, key, docJson],
           );
 
+          await assertUniqueIndexes(tx, refs, collection, key, normalizedUniqueIndexes);
+          await replaceUniqueIndexes(tx, refs, collection, key, normalizedUniqueIndexes);
           await replaceIndexes(tx, refs, collection, key, normalizedIndexes, false);
           await upsertMigrationMetadata(tx, refs, collection, key, metadata);
         });
       } catch (error) {
-        if (isPostgresUniqueViolation(error)) {
+        if (
+          isPostgresUniqueViolationForConstraint(
+            error,
+            primaryKeyConstraintName(refs.documentsTable),
+          )
+        ) {
           throw new EngineDocumentAlreadyExistsError(collection, key);
+        }
+
+        if (isPostgresUniqueViolation(error)) {
+          throw await resolveUniqueConstraintError(client, refs, collection, [
+            { key, uniqueIndexes: normalizedUniqueIndexes },
+          ]);
         }
 
         throw error;
       }
     },
 
-    async put(collection, key, doc, indexes, _options, migrationMetadata) {
+    async put(collection, key, doc, indexes, _options, migrationMetadata, uniqueIndexes) {
       await ready;
 
       const docJson = serializeDocument(doc);
       const normalizedIndexes = normalizeIndexes(indexes);
+      const normalizedUniqueIndexes = normalizeIndexes(uniqueIndexes ?? {});
       const metadata = normalizeMigrationMetadata(migrationMetadata) ?? deriveLegacyMetadata(doc);
 
-      await withTransaction(client, async (tx) => {
-        await tx.query(
-          `
-            INSERT INTO ${refs.documentsTable} (collection, doc_key, doc_json)
-            VALUES ($1, $2, $3::jsonb)
-            ON CONFLICT (collection, doc_key)
-            DO UPDATE SET
-              doc_json = EXCLUDED.doc_json,
-              write_version = ${refs.documentsTable}.write_version + 1
-          `,
-          [collection, key, docJson],
-        );
+      try {
+        await withTransaction(client, async (tx) => {
+          await assertUniqueIndexes(tx, refs, collection, key, normalizedUniqueIndexes);
+          await tx.query(
+            `
+              INSERT INTO ${refs.documentsTable} (collection, doc_key, doc_json)
+              VALUES ($1, $2, $3::jsonb)
+              ON CONFLICT (collection, doc_key)
+              DO UPDATE SET
+                doc_json = EXCLUDED.doc_json,
+                write_version = ${refs.documentsTable}.write_version + 1
+            `,
+            [collection, key, docJson],
+          );
 
-        await replaceIndexes(tx, refs, collection, key, normalizedIndexes, true);
-        await upsertMigrationMetadata(tx, refs, collection, key, metadata);
-      });
-    },
-
-    async update(collection, key, doc, indexes, _options, migrationMetadata) {
-      await ready;
-
-      const docJson = serializeDocument(doc);
-      const normalizedIndexes = normalizeIndexes(indexes);
-      const metadata = normalizeMigrationMetadata(migrationMetadata) ?? deriveLegacyMetadata(doc);
-
-      await withTransaction(client, async (tx) => {
-        const updateResult = await tx.query(
-          `
-            UPDATE ${refs.documentsTable}
-            SET
-              doc_json = $1::jsonb,
-              write_version = write_version + 1
-            WHERE collection = $2 AND doc_key = $3
-          `,
-          [docJson, collection, key],
-        );
-
-        if (readRowCount(updateResult, "Postgres returned an invalid update result") === 0) {
-          throw new EngineDocumentNotFoundError(collection, key);
+          await replaceUniqueIndexes(tx, refs, collection, key, normalizedUniqueIndexes);
+          await replaceIndexes(tx, refs, collection, key, normalizedIndexes, true);
+          await upsertMigrationMetadata(tx, refs, collection, key, metadata);
+        });
+      } catch (error) {
+        if (isPostgresUniqueViolation(error)) {
+          throw await resolveUniqueConstraintError(client, refs, collection, [
+            { key, uniqueIndexes: normalizedUniqueIndexes },
+          ]);
         }
 
-        await replaceIndexes(tx, refs, collection, key, normalizedIndexes, true);
-        await upsertMigrationMetadata(tx, refs, collection, key, metadata);
-      });
+        throw error;
+      }
+    },
+
+    async update(collection, key, doc, indexes, _options, migrationMetadata, uniqueIndexes) {
+      await ready;
+
+      const docJson = serializeDocument(doc);
+      const normalizedIndexes = normalizeIndexes(indexes);
+      const normalizedUniqueIndexes = normalizeIndexes(uniqueIndexes ?? {});
+      const metadata = normalizeMigrationMetadata(migrationMetadata) ?? deriveLegacyMetadata(doc);
+
+      try {
+        await withTransaction(client, async (tx) => {
+          const updateResult = await tx.query(
+            `
+              UPDATE ${refs.documentsTable}
+              SET
+                doc_json = $1::jsonb,
+                write_version = write_version + 1
+              WHERE collection = $2 AND doc_key = $3
+            `,
+            [docJson, collection, key],
+          );
+
+          if (readRowCount(updateResult, "Postgres returned an invalid update result") === 0) {
+            throw new EngineDocumentNotFoundError(collection, key);
+          }
+
+          await assertUniqueIndexes(tx, refs, collection, key, normalizedUniqueIndexes);
+          await replaceUniqueIndexes(tx, refs, collection, key, normalizedUniqueIndexes);
+          await replaceIndexes(tx, refs, collection, key, normalizedIndexes, true);
+          await upsertMigrationMetadata(tx, refs, collection, key, metadata);
+        });
+      } catch (error) {
+        if (isPostgresUniqueViolation(error)) {
+          throw await resolveUniqueConstraintError(client, refs, collection, [
+            { key, uniqueIndexes: normalizedUniqueIndexes },
+          ]);
+        }
+
+        throw error;
+      }
     },
 
     async delete(collection, key) {
@@ -381,17 +430,43 @@ export function postgresEngine(options: PostgresEngineOptions): PostgresQueryEng
     async batchSet(collection, items) {
       await ready;
 
-      await withTransaction(client, async (tx) => {
-        await applyBatchSet(tx, refs, collection, items, batchSetChunkSize);
-      });
+      try {
+        await withTransaction(client, async (tx) => {
+          await applyBatchSet(tx, refs, collection, items, batchSetChunkSize);
+        });
+      } catch (error) {
+        if (isPostgresUniqueViolation(error)) {
+          throw await resolveUniqueConstraintError(
+            client,
+            refs,
+            collection,
+            normalizeBatchItems(items),
+          );
+        }
+
+        throw error;
+      }
     },
 
     async batchSetWithResult(collection, items) {
       await ready;
 
-      return withTransaction(client, async (tx) =>
-        applyBatchSet(tx, refs, collection, items, batchSetChunkSize),
-      );
+      try {
+        return await withTransaction(client, async (tx) =>
+          applyBatchSet(tx, refs, collection, items, batchSetChunkSize),
+        );
+      } catch (error) {
+        if (isPostgresUniqueViolation(error)) {
+          throw await resolveUniqueConstraintError(
+            client,
+            refs,
+            collection,
+            normalizeBatchItems(items),
+          );
+        }
+
+        throw error;
+      }
     },
 
     async batchDelete(collection, keys) {
@@ -799,6 +874,156 @@ async function replaceIndexes(
   }
 }
 
+async function assertUniqueIndexes(
+  client: PostgresQueryableLike,
+  refs: TableRefs,
+  collection: string,
+  key: string,
+  uniqueIndexes: ResolvedIndexKeys,
+): Promise<void> {
+  for (const [indexName, indexValue] of Object.entries(uniqueIndexes)) {
+    const conflict = await findUniqueIndexConflict(
+      client,
+      refs,
+      collection,
+      key,
+      indexName,
+      indexValue,
+    );
+
+    if (!conflict) {
+      continue;
+    }
+
+    throw new EngineUniqueConstraintError(collection, key, indexName, indexValue, conflict);
+  }
+}
+
+async function replaceUniqueIndexes(
+  client: PostgresQueryableLike,
+  refs: TableRefs,
+  collection: string,
+  key: string,
+  uniqueIndexes: ResolvedIndexKeys,
+): Promise<void> {
+  await client.query(
+    `DELETE FROM ${refs.uniqueIndexesTable} WHERE collection = $1 AND doc_key = $2`,
+    [collection, key],
+  );
+
+  for (const [indexName, indexValue] of Object.entries(uniqueIndexes)) {
+    await client.query(
+      `
+        INSERT INTO ${refs.uniqueIndexesTable} (collection, doc_key, index_name, index_value)
+        VALUES ($1, $2, $3, $4)
+      `,
+      [collection, key, indexName, indexValue],
+    );
+  }
+}
+
+async function findUniqueIndexConflict(
+  client: PostgresQueryableLike,
+  refs: TableRefs,
+  collection: string,
+  key: string,
+  indexName: string,
+  indexValue: string,
+): Promise<string | null> {
+  const ownershipConflict = await fetchOptionalRow(client, {
+    sql: `
+      SELECT doc_key
+      FROM ${refs.uniqueIndexesTable}
+      WHERE collection = $1
+        AND index_name = $2
+        AND index_value = $3
+        AND doc_key <> $4
+      LIMIT 1
+    `,
+    params: [collection, indexName, indexValue, key],
+    errorMessage: "Postgres returned an invalid unique index ownership row",
+  });
+
+  if (ownershipConflict) {
+    return readStringField(
+      ownershipConflict,
+      "doc_key",
+      "Postgres returned an invalid unique index ownership row",
+    );
+  }
+
+  const legacyConflict = await fetchOptionalRow(client, {
+    sql: `
+      SELECT doc_key
+      FROM ${refs.indexesTable}
+      WHERE collection = $1
+        AND index_name = $2
+        AND index_value = $3
+        AND doc_key <> $4
+      LIMIT 1
+    `,
+    params: [collection, indexName, indexValue, key],
+    errorMessage: "Postgres returned an invalid legacy unique index row",
+  });
+
+  if (!legacyConflict) {
+    return null;
+  }
+
+  return readStringField(
+    legacyConflict,
+    "doc_key",
+    "Postgres returned an invalid legacy unique index row",
+  );
+}
+
+async function resolveUniqueConstraintError(
+  client: PostgresQueryableLike,
+  refs: TableRefs,
+  collection: string,
+  candidates: readonly {
+    key: string;
+    uniqueIndexes: ResolvedIndexKeys;
+  }[],
+): Promise<EngineUniqueConstraintError> {
+  for (const candidate of candidates) {
+    for (const [indexName, indexValue] of Object.entries(candidate.uniqueIndexes)) {
+      const conflict = await findUniqueIndexConflict(
+        client,
+        refs,
+        collection,
+        candidate.key,
+        indexName,
+        indexValue,
+      );
+
+      if (!conflict) {
+        continue;
+      }
+
+      return new EngineUniqueConstraintError(
+        collection,
+        candidate.key,
+        indexName,
+        indexValue,
+        conflict,
+      );
+    }
+  }
+
+  throw new Error(`Postgres unique constraint violation could not be resolved for "${collection}"`);
+}
+
+function normalizeBatchItems(items: readonly BatchSetItem[]): {
+  key: string;
+  uniqueIndexes: ResolvedIndexKeys;
+}[] {
+  return items.map((item) => ({
+    key: item.key,
+    uniqueIndexes: normalizeIndexes(item.uniqueIndexes ?? {}),
+  }));
+}
+
 function readSqlCursorRowId(cursorPosition: Exclude<QueryCursorPosition, { kind: "key" }>): number {
   if (cursorPosition.createdAt === undefined) {
     throw new Error("Query cursor is missing SQL row metadata");
@@ -954,6 +1179,7 @@ async function applyBatchSetChunk(
   for (const item of items) {
     const docJson = serializeDocument(item.doc);
     const normalizedIndexes = normalizeIndexes(item.indexes);
+    const normalizedUniqueIndexes = normalizeIndexes(item.uniqueIndexes ?? {});
     const metadata =
       normalizeMigrationMetadata(item.migrationMetadata) ?? deriveLegacyMetadata(item.doc);
 
@@ -980,12 +1206,15 @@ async function applyBatchSetChunk(
         continue;
       }
 
+      await assertUniqueIndexes(tx, refs, collection, item.key, normalizedUniqueIndexes);
+      await replaceUniqueIndexes(tx, refs, collection, item.key, normalizedUniqueIndexes);
       await replaceIndexes(tx, refs, collection, item.key, normalizedIndexes, true);
       await upsertMigrationMetadata(tx, refs, collection, item.key, metadata);
       persistedKeys.push(item.key);
       continue;
     }
 
+    await assertUniqueIndexes(tx, refs, collection, item.key, normalizedUniqueIndexes);
     await tx.query(
       `
         INSERT INTO ${refs.documentsTable} (collection, doc_key, doc_json)
@@ -998,6 +1227,7 @@ async function applyBatchSetChunk(
       [collection, item.key, docJson],
     );
 
+    await replaceUniqueIndexes(tx, refs, collection, item.key, normalizedUniqueIndexes);
     await replaceIndexes(tx, refs, collection, item.key, normalizedIndexes, true);
     await upsertMigrationMetadata(tx, refs, collection, item.key, metadata);
     persistedKeys.push(item.key);
@@ -1012,7 +1242,7 @@ async function applyBatchSetChunk(
 async function ensureSchema(client: PostgresQueryableLike, refs: TableRefs): Promise<void> {
   const session = await acquireSession(client);
   const lockKey = toAdvisoryLockKey(
-    `${refs.schema}|${refs.documentsTable}|${refs.indexesTable}|${refs.migrationMetadataTable}|${refs.migrationLocksTable}|${refs.migrationCheckpointsTable}`,
+    `${refs.schema}|${refs.documentsTable}|${refs.indexesTable}|${refs.uniqueIndexesTable}|${refs.migrationMetadataTable}|${refs.migrationLocksTable}|${refs.migrationCheckpointsTable}`,
   );
 
   // A process-scoped advisory lock prevents concurrent instances from racing
@@ -1025,6 +1255,9 @@ async function ensureSchema(client: PostgresQueryableLike, refs: TableRefs): Pro
     );
     const indexesLookupIndex = quoteIdentifier(createIndexName(refs.indexesTable, "lookup_idx"));
     const indexesScanIndex = quoteIdentifier(createIndexName(refs.indexesTable, "scan_idx"));
+    const uniqueIndexesOwnerLookupIndex = quoteIdentifier(
+      createIndexName(refs.uniqueIndexesTable, "doc_lookup_idx"),
+    );
     const migrationMetadataTargetStateDocIndex = quoteIdentifier(
       createIndexName(refs.migrationMetadataTable, "target_state_doc_idx"),
     );
@@ -1071,6 +1304,23 @@ async function ensureSchema(client: PostgresQueryableLike, refs: TableRefs): Pro
     );
     await session.query(
       `CREATE INDEX IF NOT EXISTS ${indexesScanIndex} ON ${refs.indexesTable} (collection, index_name, doc_key)`,
+    );
+
+    await session.query(`
+    CREATE TABLE IF NOT EXISTS ${refs.uniqueIndexesTable} (
+      collection TEXT NOT NULL,
+      doc_key TEXT NOT NULL,
+      index_name TEXT NOT NULL,
+      index_value TEXT NOT NULL,
+      PRIMARY KEY (collection, index_name, index_value),
+      FOREIGN KEY (collection, doc_key)
+        REFERENCES ${refs.documentsTable} (collection, doc_key)
+        ON DELETE CASCADE
+    )
+  `);
+
+    await session.query(
+      `CREATE INDEX IF NOT EXISTS ${uniqueIndexesOwnerLookupIndex} ON ${refs.uniqueIndexesTable} (collection, doc_key)`,
     );
 
     await session.query(`
@@ -1824,8 +2074,22 @@ function simpleHash(value: string): string {
   return (hash >>> 0).toString(16);
 }
 
+function primaryKeyConstraintName(qualifiedTable: string): string {
+  const tableName = qualifiedTable.split(".").at(-1)?.replace(/"/g, "");
+
+  if (!tableName) {
+    throw new Error("Postgres received an invalid qualified table name");
+  }
+
+  return `${tableName}_pkey`;
+}
+
 function isPostgresUniqueViolation(error: unknown): boolean {
   return isRecord(error) && error.code === "23505";
+}
+
+function isPostgresUniqueViolationForConstraint(error: unknown, constraintName: string): boolean {
+  return isPostgresUniqueViolation(error) && isRecord(error) && error.constraint === constraintName;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
