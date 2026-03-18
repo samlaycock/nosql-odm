@@ -1520,8 +1520,15 @@ async function replaceUniqueIndexes(
   uniqueIndexes: ResolvedIndexKeys,
 ): Promise<void> {
   const currentUniqueEntries = await loadCurrentUniqueIndexEntries(client, refs, collection, key);
+  const currentUniqueEntryKeys = new Set(
+    currentUniqueEntries.map((entry) => `${entry.indexName}\u0000${entry.indexValue}`),
+  );
 
   for (const [indexName, indexValue] of Object.entries(uniqueIndexes)) {
+    if (currentUniqueEntryKeys.has(`${indexName}\u0000${indexValue}`)) {
+      continue;
+    }
+
     await claimUniqueIndexOwnership(client, refs, collection, key, indexName, indexValue);
   }
 
@@ -1577,6 +1584,21 @@ async function ensureLegacyUniqueIndexBootstrapped(
   collection: string,
   indexName: string,
 ): Promise<void> {
+  const bootstrapQuickCheck = await fetchOptionalRow(client, {
+    sql: `
+      SELECT index_name
+      FROM ${refs.uniqueIndexBootstrapsTable}
+      WHERE collection = ? AND index_name = ?
+      LIMIT 1
+    `,
+    params: [collection, indexName],
+    errorMessage: "MySQL returned an invalid unique index bootstrap row",
+  });
+
+  if (bootstrapQuickCheck) {
+    return;
+  }
+
   const existingBootstrap = await fetchOptionalRow(client, {
     sql: `
       SELECT index_name
