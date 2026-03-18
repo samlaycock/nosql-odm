@@ -6,7 +6,6 @@ export async function expectReject(
 ): Promise<void> {
   try {
     await work;
-    throw new Error("expected operation to fail");
   } catch (error) {
     const message = String(error);
 
@@ -16,7 +15,10 @@ export async function expectReject(
     }
 
     expect(message).toContain(pattern);
+    return;
   }
+
+  throw new Error("expected operation to fail");
 }
 
 export async function expectRejectInstanceOf(
@@ -25,10 +27,12 @@ export async function expectRejectInstanceOf(
 ): Promise<void> {
   try {
     await work;
-    throw new Error(`expected operation to fail with ${errorType.name}`);
   } catch (error) {
     expect(error).toBeInstanceOf(errorType);
+    return;
   }
+
+  throw new Error(`expected operation to fail with ${errorType.name}`);
 }
 
 export function createCollectionNameFactory(): (prefix: string) => string {
