@@ -8,7 +8,9 @@ import {
   test,
 } from "bun:test";
 import { Client } from "cassandra-driver";
+import * as z from "zod";
 
+import { createStore, UniqueConstraintError, model } from "../../src";
 import { cassandraEngine, type CassandraQueryEngine } from "../../src/engines/cassandra";
 import {
   EngineDocumentAlreadyExistsError,
@@ -16,7 +18,12 @@ import {
   type ComparableVersion,
 } from "../../src/engines/types";
 import { runQueryEngineConformanceSuite } from "./conformance-suite";
-import { createCollectionNameFactory, createTestResourceName, expectReject } from "./helpers";
+import {
+  createCollectionNameFactory,
+  createTestResourceName,
+  expectReject,
+  expectRejectInstanceOf,
+} from "./helpers";
 import { runMigrationIntegrationSuite } from "./migration-suite";
 
 const contactPoints = (process.env.CASSANDRA_CONTACT_POINTS ?? "127.0.0.1")
@@ -133,6 +140,10 @@ describe("cassandraEngine integration", () => {
     expect(await engine.get(collection, "missing")).toBeNull();
   });
 
+  test('reports uniqueConstraints capability as "none"', () => {
+    expect(engine.capabilities?.uniqueConstraints).toBe("none");
+  });
+
   test("create stores and get returns document", async () => {
     await engine.create(collection, "u1", { id: "u1", name: "Sam" }, { primary: "u1" });
 
@@ -221,6 +232,74 @@ describe("cassandraEngine integration", () => {
       ]),
       /non-object document/,
     );
+  });
+
+  test("store-managed unique guards reject duplicate Cassandra writes when enabled", async () => {
+    const modelName = nextCollection("user");
+    const userModel = model(modelName)
+      .schema(
+        1,
+        z.object({
+          id: z.string(),
+          email: z.email(),
+        }),
+      )
+      .index({ name: "primary", value: "id" })
+      .index({ name: "byEmail", value: "email", unique: true })
+      .build();
+    const store = createStore(engine, [userModel], {
+      allowStoreManagedUniqueConstraints: true,
+    });
+    const users = store[modelName]!;
+
+    await users.create("u1", {
+      id: "u1",
+      email: "sam@example.com",
+    });
+    await users.create("u2", {
+      id: "u2",
+      email: "jamie@example.com",
+    });
+
+    await expectRejectInstanceOf(
+      users.create("u3", {
+        id: "u3",
+        email: "sam@example.com",
+      }),
+      UniqueConstraintError,
+    );
+    await expectRejectInstanceOf(
+      users.update("u2", {
+        email: "sam@example.com",
+      }),
+      UniqueConstraintError,
+    );
+    await expectRejectInstanceOf(
+      users.batchSet([
+        {
+          key: "u4",
+          data: {
+            id: "u4",
+            email: "fresh@example.com",
+          },
+        },
+        {
+          key: "u5",
+          data: {
+            id: "u5",
+            email: "fresh@example.com",
+          },
+        },
+      ]),
+      UniqueConstraintError,
+    );
+
+    expect(await users.findByKey("u2")).toEqual({
+      id: "u2",
+      email: "jamie@example.com",
+    });
+    expect(await users.findByKey("u4")).toBeNull();
+    expect(await users.findByKey("u5")).toBeNull();
   });
 
   test("delete removes documents and ignores missing keys", async () => {
