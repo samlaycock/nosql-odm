@@ -135,7 +135,7 @@ export function cassandraEngine(options: CassandraEngineOptions): CassandraQuery
 
   const engine: CassandraQueryEngine = {
     capabilities: {
-      uniqueConstraints: "atomic",
+      uniqueConstraints: "none",
     },
 
     prepareDocumentForWrite(doc, collection, key) {
