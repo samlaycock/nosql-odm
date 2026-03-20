@@ -343,6 +343,42 @@ describe("firestoreEngine unique constraints", () => {
     ).rejects.toBeInstanceOf(EngineUniqueConstraintError);
   });
 
+  test("update releases previous ownership when unique pairs contain null bytes", async () => {
+    const engine = createEngine();
+
+    await engine.create(
+      "users",
+      "u1",
+      { id: "u1", marker: "initial" },
+      { primary: "u1" },
+      undefined,
+      undefined,
+      { "foo\u0000": "bar" },
+    );
+
+    await engine.update(
+      "users",
+      "u1",
+      { id: "u1", marker: "updated" },
+      { primary: "u1" },
+      undefined,
+      undefined,
+      { foo: "\u0000bar" },
+    );
+
+    return expect(
+      engine.create(
+        "users",
+        "u2",
+        { id: "u2", marker: "fresh" },
+        { primary: "u2" },
+        undefined,
+        undefined,
+        { "foo\u0000": "bar" },
+      ),
+    ).resolves.toBeUndefined();
+  });
+
   test("put preserves existing unique ownership when uniqueIndexes are omitted", async () => {
     const engine = createEngine();
 
