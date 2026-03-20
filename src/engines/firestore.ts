@@ -63,7 +63,6 @@ interface FirestoreCollectionLike extends FirestoreQueryLike {
 
 interface FirestoreTransactionLike {
   get(ref: FirestoreDocumentReferenceLike): Promise<unknown>;
-  getAll?(...refs: unknown[]): Promise<unknown[]>;
   create(
     ref: FirestoreDocumentReferenceLike,
     data: Record<string, unknown>,
@@ -1505,21 +1504,9 @@ async function synchronizeUniqueIndexOwnership(
     return;
   }
 
-  if (typeof transaction.getAll === "function") {
-    const raws = await transaction.getAll(...refEntries.map(([, ref]) => ref));
-
-    if (raws.length !== refEntries.length) {
-      throw new Error("Firestore returned an invalid unique index ownership record");
-    }
-
-    for (const [index, [docId]] of refEntries.entries()) {
-      snapshots.set(docId, parseDocumentSnapshot(raws[index], "unique index ownership record"));
-    }
-  } else {
-    for (const [docId, ref] of refEntries) {
-      const raw = await transaction.get(ref);
-      snapshots.set(docId, parseDocumentSnapshot(raw, "unique index ownership record"));
-    }
+  for (const [docId, ref] of refEntries) {
+    const raw = await transaction.get(ref);
+    snapshots.set(docId, parseDocumentSnapshot(raw, "unique index ownership record"));
   }
 
   for (const [indexName, indexValue] of nextEntries) {
