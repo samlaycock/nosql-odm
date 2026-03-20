@@ -1416,32 +1416,42 @@ async function synchronizeUniqueIndexOwnership(
   const nextEntryKeys = new Set(
     nextEntries.map(([indexName, indexValue]) => `${indexName}\u0000${indexValue}`),
   );
+  const refs = new Map<string, FirestoreDocumentReferenceLike>();
   const snapshots = new Map<string, FirestoreDocumentSnapshotLike>();
 
-  const loadUniqueSnapshot = async (indexName: string, indexValue: string) => {
+  const getUniqueRef = (indexName: string, indexValue: string) => {
     const docId = uniqueOwnershipDocId(collection, indexName, indexValue);
-    const cached = snapshots.get(docId);
+    const cached = refs.get(docId);
 
     if (cached) {
-      return {
-        ref: metadataRef(metadataCollection, docId),
-        snapshot: cached,
-      };
+      return cached;
     }
 
     const ref = metadataRef(metadataCollection, docId);
-    const raw = await transaction.get(ref);
-    const snapshot = parseDocumentSnapshot(raw, "unique index ownership record");
-    snapshots.set(docId, snapshot);
-
-    return {
-      ref,
-      snapshot,
-    };
+    refs.set(docId, ref);
+    return ref;
   };
 
   for (const [indexName, indexValue] of nextEntries) {
-    const { ref, snapshot } = await loadUniqueSnapshot(indexName, indexValue);
+    getUniqueRef(indexName, indexValue);
+  }
+
+  for (const [indexName, indexValue] of currentEntries) {
+    getUniqueRef(indexName, indexValue);
+  }
+
+  for (const [docId, ref] of refs) {
+    const raw = await transaction.get(ref);
+    snapshots.set(docId, parseDocumentSnapshot(raw, "unique index ownership record"));
+  }
+
+  for (const [indexName, indexValue] of nextEntries) {
+    const ref = getUniqueRef(indexName, indexValue);
+    const snapshot = snapshots.get(uniqueOwnershipDocId(collection, indexName, indexValue));
+
+    if (!snapshot) {
+      throw new Error("Missing unique index ownership snapshot");
+    }
 
     if (snapshot.exists) {
       const record = parseUniqueOwnershipRecord(
@@ -1473,7 +1483,12 @@ async function synchronizeUniqueIndexOwnership(
       continue;
     }
 
-    const { ref, snapshot } = await loadUniqueSnapshot(indexName, indexValue);
+    const ref = getUniqueRef(indexName, indexValue);
+    const snapshot = snapshots.get(uniqueOwnershipDocId(collection, indexName, indexValue));
+
+    if (!snapshot) {
+      throw new Error("Missing unique index ownership snapshot");
+    }
 
     if (!snapshot.exists) {
       continue;
