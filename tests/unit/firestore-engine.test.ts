@@ -301,6 +301,16 @@ describe("firestoreEngine unique constraints", () => {
     expect(database.transactions[0]?.getAllBatchSizes).toEqual([2]);
   });
 
+  test("create without unique indexes skips getAll", async () => {
+    const database = new CountingFirestoreDatabase();
+    const engine = createEngine(database);
+
+    await engine.create("users", "u1", { id: "u1", email: "sam@example.com" }, { primary: "u1" });
+
+    expect(database.transactions).toHaveLength(1);
+    expect(database.transactions[0]?.getAllBatchSizes).toEqual([]);
+  });
+
   test("update rejects duplicate unique index ownership", async () => {
     const engine = createEngine();
 

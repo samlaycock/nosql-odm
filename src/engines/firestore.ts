@@ -1501,6 +1501,10 @@ async function synchronizeUniqueIndexOwnership(
 
   const refEntries = [...refs.entries()];
 
+  if (refEntries.length === 0) {
+    return;
+  }
+
   if (typeof transaction.getAll === "function") {
     const raws = await transaction.getAll(...refEntries.map(([, ref]) => ref));
 
