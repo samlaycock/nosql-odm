@@ -224,12 +224,16 @@ function compareUnknown(left: unknown, right: unknown): number {
 }
 
 describe("firestoreEngine unique constraints", () => {
-  test("create rejects duplicate unique index ownership", async () => {
-    const engine = firestoreEngine({
+  function createEngine() {
+    return firestoreEngine({
       database: new FakeFirestoreDatabase() as unknown as Parameters<
         typeof firestoreEngine
       >[0]["database"],
     });
+  }
+
+  test("create rejects duplicate unique index ownership", async () => {
+    const engine = createEngine();
 
     await engine.create(
       "users",
@@ -254,12 +258,43 @@ describe("firestoreEngine unique constraints", () => {
     ).rejects.toBeInstanceOf(EngineUniqueConstraintError);
   });
 
+  test("update rejects duplicate unique index ownership", async () => {
+    const engine = createEngine();
+
+    await engine.create(
+      "users",
+      "u1",
+      { id: "u1", email: "sam@example.com" },
+      { primary: "u1" },
+      undefined,
+      undefined,
+      { byEmail: "sam@example.com" },
+    );
+    await engine.create(
+      "users",
+      "u2",
+      { id: "u2", email: "alex@example.com" },
+      { primary: "u2" },
+      undefined,
+      undefined,
+      { byEmail: "alex@example.com" },
+    );
+
+    return expect(
+      engine.update(
+        "users",
+        "u2",
+        { id: "u2", email: "sam@example.com" },
+        { primary: "u2" },
+        undefined,
+        undefined,
+        { byEmail: "sam@example.com" },
+      ),
+    ).rejects.toBeInstanceOf(EngineUniqueConstraintError);
+  });
+
   test("put preserves existing unique ownership when uniqueIndexes are omitted", async () => {
-    const engine = firestoreEngine({
-      database: new FakeFirestoreDatabase() as unknown as Parameters<
-        typeof firestoreEngine
-      >[0]["database"],
-    });
+    const engine = createEngine();
 
     await engine.put(
       "users",
@@ -287,11 +322,7 @@ describe("firestoreEngine unique constraints", () => {
   });
 
   test("delete releases unique ownership", async () => {
-    const engine = firestoreEngine({
-      database: new FakeFirestoreDatabase() as unknown as Parameters<
-        typeof firestoreEngine
-      >[0]["database"],
-    });
+    const engine = createEngine();
 
     await engine.create(
       "users",
@@ -304,6 +335,34 @@ describe("firestoreEngine unique constraints", () => {
     );
 
     await engine.delete("users", "u1");
+
+    return expect(
+      engine.create(
+        "users",
+        "u2",
+        { id: "u2", email: "sam@example.com" },
+        { primary: "u2" },
+        undefined,
+        undefined,
+        { byEmail: "sam@example.com" },
+      ),
+    ).resolves.toBeUndefined();
+  });
+
+  test("batchDelete releases unique ownership", async () => {
+    const engine = createEngine();
+
+    await engine.create(
+      "users",
+      "u1",
+      { id: "u1", email: "sam@example.com" },
+      { primary: "u1" },
+      undefined,
+      undefined,
+      { byEmail: "sam@example.com" },
+    );
+
+    await engine.batchDelete("users", ["u1"]);
 
     return expect(
       engine.create(

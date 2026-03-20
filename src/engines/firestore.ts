@@ -318,14 +318,16 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
 
         const existingRecord = parseStoredDocumentRecord(snapshotData(existing, "document record"));
 
-        await synchronizeUniqueIndexOwnership(
-          transaction,
-          metadataCollection,
-          collection,
-          key,
-          existingRecord.uniqueIndexes,
-          {},
-        );
+        if (Object.keys(existingRecord.uniqueIndexes).length > 0) {
+          await synchronizeUniqueIndexOwnership(
+            transaction,
+            metadataCollection,
+            collection,
+            key,
+            existingRecord.uniqueIndexes,
+            {},
+          );
+        }
         transaction.delete(ref);
       });
     },
@@ -603,14 +605,16 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
             snapshotData(existing, "document record"),
           );
 
-          await synchronizeUniqueIndexOwnership(
-            transaction,
-            metadataCollection,
-            collection,
-            key,
-            existingRecord.uniqueIndexes,
-            {},
-          );
+          if (Object.keys(existingRecord.uniqueIndexes).length > 0) {
+            await synchronizeUniqueIndexOwnership(
+              transaction,
+              metadataCollection,
+              collection,
+              key,
+              existingRecord.uniqueIndexes,
+              {},
+            );
+          }
           transaction.delete(ref);
         });
       }
