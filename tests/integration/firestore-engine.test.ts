@@ -14,6 +14,7 @@ import { firestoreEngine, type FirestoreQueryEngine } from "../../src/engines/fi
 import {
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
+  EngineUniqueConstraintError,
   type ComparableVersion,
 } from "../../src/engines/types";
 import { runQueryEngineConformanceSuite } from "./conformance-suite";
@@ -163,6 +164,7 @@ describe("firestoreEngine integration", () => {
     engineName: "firestoreEngine integration",
     getEngine: () => engine,
     nextCollection,
+    assertEngineUniqueConstraintConformance: true,
   });
 
   afterAll(async () => {
@@ -242,6 +244,68 @@ describe("firestoreEngine integration", () => {
     await engine.update(collection, "u1", { id: "u1", name: "Samuel" }, { primary: "u1" });
 
     expect(await engine.get(collection, "u1")).toEqual({ id: "u1", name: "Samuel" });
+  });
+
+  test("put preserves existing unique ownership when uniqueIndexes are omitted", async () => {
+    await engine.put(
+      collection,
+      "u1",
+      { id: "u1", email: "sam@example.com" },
+      { primary: "u1" },
+      undefined,
+      undefined,
+      { byEmail: "sam@example.com" },
+    );
+
+    await engine.put(
+      collection,
+      "u1",
+      { id: "u1", email: "updated@example.com" },
+      { primary: "u1" },
+    );
+
+    return expect(
+      engine.create(
+        collection,
+        "u2",
+        { id: "u2", email: "sam@example.com" },
+        { primary: "u2" },
+        undefined,
+        undefined,
+        { byEmail: "sam@example.com" },
+      ),
+    ).rejects.toBeInstanceOf(EngineUniqueConstraintError);
+  });
+
+  test("update preserves existing unique ownership when uniqueIndexes are omitted", async () => {
+    await engine.put(
+      collection,
+      "u1",
+      { id: "u1", email: "sam@example.com" },
+      { primary: "u1" },
+      undefined,
+      undefined,
+      { byEmail: "sam@example.com" },
+    );
+
+    await engine.update(
+      collection,
+      "u1",
+      { id: "u1", email: "updated@example.com" },
+      { primary: "u1" },
+    );
+
+    return expect(
+      engine.create(
+        collection,
+        "u2",
+        { id: "u2", email: "sam@example.com" },
+        { primary: "u2" },
+        undefined,
+        undefined,
+        { byEmail: "sam@example.com" },
+      ),
+    ).rejects.toBeInstanceOf(EngineUniqueConstraintError);
   });
 
   test("update throws not-found error when key does not exist", async () => {

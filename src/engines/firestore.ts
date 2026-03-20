@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import { DefaultMigrator } from "../migrator";
 import { getPreparedClone, prepareDocumentForStorage } from "./document-preparation";
 import {
@@ -9,6 +11,7 @@ import {
   type BatchSetResult,
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
+  EngineUniqueConstraintError,
   type ComparableVersion,
   type EngineQueryResult,
   type FieldCondition,
@@ -93,6 +96,7 @@ interface StoredDocumentRecord {
   writeVersion: number;
   doc: Record<string, unknown>;
   indexes: ResolvedIndexKeys;
+  uniqueIndexes: ResolvedIndexKeys;
   migrationTargetVersion: number;
   migrationVersionState: MigrationVersionState;
   migrationIndexSignature: string | null;
@@ -110,6 +114,11 @@ interface MigrationMetadata {
   targetVersion: number;
   versionState: MigrationVersionState;
   indexSignature: string | null;
+}
+
+interface UniqueOwnershipRecord {
+  ownerKey: string;
+  indexValue: string;
 }
 
 export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQueryEngine {
@@ -159,7 +168,7 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
       };
     },
 
-    async create(collection, key, doc, indexes, _options, migrationMetadata) {
+    async create(collection, key, doc, indexes, _options, migrationMetadata, uniqueIndexes) {
       const record = await database.runTransaction(async (transaction) => {
         const ref = documentRef(documentsCollection, collection, key);
         const existingRaw = await transaction.get(ref);
@@ -178,10 +187,19 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
           1,
           doc,
           indexes,
+          resolveWriteUniqueIndexes(null, uniqueIndexes),
           resolved.metadata,
           resolved.needsMigrationOverride,
         );
 
+        await synchronizeUniqueIndexOwnership(
+          transaction,
+          metadataCollection,
+          collection,
+          key,
+          {},
+          created.uniqueIndexes,
+        );
         transaction.create(ref, created);
 
         return created;
@@ -190,7 +208,7 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
       void record;
     },
 
-    async put(collection, key, doc, indexes, _options, migrationMetadata) {
+    async put(collection, key, doc, indexes, _options, migrationMetadata, uniqueIndexes) {
       await database.runTransaction(async (transaction) => {
         const ref = documentRef(documentsCollection, collection, key);
         const existingRaw = await transaction.get(ref);
@@ -210,15 +228,24 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
           writeVersion,
           doc,
           indexes,
+          resolveWriteUniqueIndexes(existingRecord, uniqueIndexes),
           resolved.metadata,
           resolved.needsMigrationOverride,
         );
 
+        await synchronizeUniqueIndexOwnership(
+          transaction,
+          metadataCollection,
+          collection,
+          key,
+          existingRecord?.uniqueIndexes ?? {},
+          updated.uniqueIndexes,
+        );
         transaction.set(ref, updated);
       });
     },
 
-    async update(collection, key, doc, indexes, _options, migrationMetadata) {
+    async update(collection, key, doc, indexes, _options, migrationMetadata, uniqueIndexes) {
       await database.runTransaction(async (transaction) => {
         const ref = documentRef(documentsCollection, collection, key);
         const existingRaw = await transaction.get(ref);
@@ -237,16 +264,45 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
           existingRecord.writeVersion + 1,
           doc,
           indexes,
+          resolveWriteUniqueIndexes(existingRecord, uniqueIndexes),
           resolved.metadata,
           resolved.needsMigrationOverride,
         );
 
+        await synchronizeUniqueIndexOwnership(
+          transaction,
+          metadataCollection,
+          collection,
+          key,
+          existingRecord.uniqueIndexes,
+          updated.uniqueIndexes,
+        );
         transaction.set(ref, updated);
       });
     },
 
     async delete(collection, key) {
-      await documentRef(documentsCollection, collection, key).delete();
+      await database.runTransaction(async (transaction) => {
+        const ref = documentRef(documentsCollection, collection, key);
+        const existingRaw = await transaction.get(ref);
+        const existing = parseDocumentSnapshot(existingRaw, "document record");
+
+        if (!existing.exists) {
+          return;
+        }
+
+        const existingRecord = parseStoredDocumentRecord(snapshotData(existing, "document record"));
+
+        await synchronizeUniqueIndexOwnership(
+          transaction,
+          metadataCollection,
+          collection,
+          key,
+          existingRecord.uniqueIndexes,
+          {},
+        );
+        transaction.delete(ref);
+      });
     },
 
     async query(collection, params) {
@@ -381,10 +437,19 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
             writeVersion,
             item.doc,
             item.indexes,
+            resolveWriteUniqueIndexes(existingRecord, item.uniqueIndexes),
             resolved.metadata,
             resolved.needsMigrationOverride,
           );
 
+          await synchronizeUniqueIndexOwnership(
+            transaction,
+            metadataCollection,
+            collection,
+            item.key,
+            existingRecord?.uniqueIndexes ?? {},
+            updated.uniqueIndexes,
+          );
           transaction.set(ref, updated);
         });
       }
@@ -418,8 +483,17 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
               existingRecord.writeVersion + 1,
               item.doc,
               item.indexes,
+              resolveWriteUniqueIndexes(existingRecord, item.uniqueIndexes),
               resolved.metadata,
               resolved.needsMigrationOverride,
+            );
+            await synchronizeUniqueIndexOwnership(
+              transaction,
+              metadataCollection,
+              collection,
+              item.key,
+              existingRecord.uniqueIndexes,
+              updated.uniqueIndexes,
             );
             transaction.set(ref, updated);
             return "persisted" as const;
@@ -436,8 +510,17 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
             writeVersion,
             item.doc,
             item.indexes,
+            resolveWriteUniqueIndexes(existingRecord, item.uniqueIndexes),
             resolved.metadata,
             resolved.needsMigrationOverride,
+          );
+          await synchronizeUniqueIndexOwnership(
+            transaction,
+            metadataCollection,
+            collection,
+            item.key,
+            existingRecord?.uniqueIndexes ?? {},
+            updated.uniqueIndexes,
           );
           transaction.set(ref, updated);
           return "persisted" as const;
@@ -458,7 +541,29 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
 
     async batchDelete(collection, keys) {
       for (const key of keys) {
-        await documentRef(documentsCollection, collection, key).delete();
+        await database.runTransaction(async (transaction) => {
+          const ref = documentRef(documentsCollection, collection, key);
+          const existingRaw = await transaction.get(ref);
+          const existing = parseDocumentSnapshot(existingRaw, "document record");
+
+          if (!existing.exists) {
+            return;
+          }
+
+          const existingRecord = parseStoredDocumentRecord(
+            snapshotData(existing, "document record"),
+          );
+
+          await synchronizeUniqueIndexOwnership(
+            transaction,
+            metadataCollection,
+            collection,
+            key,
+            existingRecord.uniqueIndexes,
+            {},
+          );
+          transaction.delete(ref);
+        });
       }
     },
 
@@ -647,12 +752,20 @@ function checkpointDocId(collection: string): string {
   return `checkpoint:${encodeIdPart(collection)}`;
 }
 
+function uniqueOwnershipDocId(collection: string, indexName: string, indexValue: string): string {
+  return `unique:${encodeIdPart(collection)}:${encodeIdPart(indexName)}:${hashIndexValue(indexValue)}`;
+}
+
 function sequenceDocId(collection: string): string {
   return `sequence:${encodeIdPart(collection)}`;
 }
 
 function encodeIdPart(value: string): string {
   return encodeURIComponent(value);
+}
+
+function hashIndexValue(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
 }
 
 async function nextCreatedAt(
@@ -1024,6 +1137,7 @@ function parseStoredDocumentRecord(raw: unknown): StoredDocumentRecord {
   }
 
   const indexes = parseIndexes(record.indexes);
+  const uniqueIndexes = parseOptionalIndexes(record.uniqueIndexes);
   const migrationMetadata = parseMigrationMetadataFields(record);
   const migrationNeedsMigration = parseMigrationNeedsMigration(record, migrationMetadata);
   const migrationOrder = parseMigrationOrderKey(record, createdAt, key);
@@ -1039,6 +1153,7 @@ function parseStoredDocumentRecord(raw: unknown): StoredDocumentRecord {
     writeVersion,
     doc: docRaw,
     indexes,
+    uniqueIndexes,
     migrationTargetVersion: migrationMetadata.targetVersion,
     migrationVersionState: migrationMetadata.versionState,
     migrationIndexSignature: migrationMetadata.indexSignature,
@@ -1080,6 +1195,23 @@ function parseIndexes(raw: unknown): ResolvedIndexKeys {
   }
 
   return indexes;
+}
+
+function parseOptionalIndexes(raw: unknown): ResolvedIndexKeys {
+  if (raw === undefined || raw === null) {
+    return {};
+  }
+
+  return parseIndexes(raw);
+}
+
+function parseUniqueOwnershipRecord(raw: unknown): UniqueOwnershipRecord {
+  const record = parseRecord(raw, "unique index ownership record");
+
+  return {
+    ownerKey: readString(record, "ownerKey", "unique index ownership record"),
+    indexValue: readString(record, "indexValue", "unique index ownership record"),
+  };
 }
 
 function readWriteVersion(record: Record<string, unknown>): number {
@@ -1214,9 +1346,10 @@ function createStoredDocumentRecord(
   writeVersion: number,
   doc: unknown,
   indexes: ResolvedIndexKeys,
+  uniqueIndexes: ResolvedIndexKeys,
   metadata: MigrationMetadata,
   needsMigrationOverride?: boolean | null,
-): Record<string, unknown> {
+): Record<string, unknown> & { uniqueIndexes: ResolvedIndexKeys } {
   const defaultNeedsMigration =
     metadata.versionState === "stale" || metadata.indexSignature === null;
   const needsMigration =
@@ -1230,6 +1363,7 @@ function createStoredDocumentRecord(
     writeVersion,
     doc: normalizeDocument(doc),
     indexes: normalizeIndexes(indexes),
+    uniqueIndexes: normalizeIndexes(uniqueIndexes),
     migrationTargetVersion: metadata.targetVersion,
     migrationVersionState: metadata.versionState,
     migrationIndexSignature: metadata.indexSignature,
@@ -1241,6 +1375,124 @@ function createStoredDocumentRecord(
       partitionNeedsMigration,
     ),
   };
+}
+
+function createUniqueOwnershipRecord(
+  collection: string,
+  key: string,
+  indexName: string,
+  indexValue: string,
+): Record<string, unknown> {
+  return {
+    kind: "unique",
+    collection,
+    indexName,
+    ownerKey: key,
+    indexValue,
+  };
+}
+
+function resolveWriteUniqueIndexes(
+  existingRecord: StoredDocumentRecord | null,
+  uniqueIndexes: ResolvedIndexKeys | undefined,
+): ResolvedIndexKeys {
+  if (uniqueIndexes === undefined) {
+    return { ...existingRecord?.uniqueIndexes };
+  }
+
+  return normalizeIndexes(uniqueIndexes);
+}
+
+async function synchronizeUniqueIndexOwnership(
+  transaction: FirestoreTransactionLike,
+  metadataCollection: FirestoreCollectionLike,
+  collection: string,
+  key: string,
+  currentUniqueIndexes: ResolvedIndexKeys,
+  nextUniqueIndexes: ResolvedIndexKeys,
+): Promise<void> {
+  const currentEntries = Object.entries(currentUniqueIndexes);
+  const nextEntries = Object.entries(nextUniqueIndexes);
+  const nextEntryKeys = new Set(
+    nextEntries.map(([indexName, indexValue]) => `${indexName}\u0000${indexValue}`),
+  );
+  const snapshots = new Map<string, FirestoreDocumentSnapshotLike>();
+
+  const loadUniqueSnapshot = async (indexName: string, indexValue: string) => {
+    const docId = uniqueOwnershipDocId(collection, indexName, indexValue);
+    const cached = snapshots.get(docId);
+
+    if (cached) {
+      return {
+        ref: metadataRef(metadataCollection, docId),
+        snapshot: cached,
+      };
+    }
+
+    const ref = metadataRef(metadataCollection, docId);
+    const raw = await transaction.get(ref);
+    const snapshot = parseDocumentSnapshot(raw, "unique index ownership record");
+    snapshots.set(docId, snapshot);
+
+    return {
+      ref,
+      snapshot,
+    };
+  };
+
+  for (const [indexName, indexValue] of nextEntries) {
+    const { ref, snapshot } = await loadUniqueSnapshot(indexName, indexValue);
+
+    if (snapshot.exists) {
+      const record = parseUniqueOwnershipRecord(
+        snapshotData(snapshot, "unique index ownership record"),
+      );
+
+      if (record.indexValue !== indexValue) {
+        throw new Error(
+          `Firestore unique index hash collision detected in model "${collection}" for index "${indexName}"`,
+        );
+      }
+
+      if (record.ownerKey !== key) {
+        throw new EngineUniqueConstraintError(
+          collection,
+          key,
+          indexName,
+          indexValue,
+          record.ownerKey,
+        );
+      }
+    }
+
+    transaction.set(ref, createUniqueOwnershipRecord(collection, key, indexName, indexValue));
+  }
+
+  for (const [indexName, indexValue] of currentEntries) {
+    if (nextEntryKeys.has(`${indexName}\u0000${indexValue}`)) {
+      continue;
+    }
+
+    const { ref, snapshot } = await loadUniqueSnapshot(indexName, indexValue);
+
+    if (!snapshot.exists) {
+      continue;
+    }
+
+    const record = parseUniqueOwnershipRecord(
+      snapshotData(snapshot, "unique index ownership record"),
+    );
+
+    if (record.indexValue !== indexValue) {
+      throw new Error(
+        `Firestore unique index hash collision detected in model "${collection}" for index "${indexName}"`,
+      );
+    }
+
+    if (record.ownerKey === key) {
+      transaction.delete(ref);
+    }
+  }
 }
 
 function parseDocumentSnapshot(raw: unknown, context: string): FirestoreDocumentSnapshotLike {
