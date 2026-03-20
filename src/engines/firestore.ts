@@ -121,6 +121,11 @@ interface UniqueOwnershipRecord {
   indexValue: string;
 }
 
+interface CreatedAtReservation {
+  ref: FirestoreDocumentReferenceLike;
+  value: number;
+}
+
 export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQueryEngine {
   const database = options.database;
   const documentsCollection = database.collection(
@@ -178,12 +183,16 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
           throw new EngineDocumentAlreadyExistsError(collection, key);
         }
 
-        const createdAt = await nextCreatedAt(transaction, metadataCollection, collection);
+        const createdAtReservation = await reserveNextCreatedAt(
+          transaction,
+          metadataCollection,
+          collection,
+        );
         const resolved = resolveWriteMetadata(migrationMetadata, doc);
         const created = createStoredDocumentRecord(
           collection,
           key,
-          createdAt,
+          createdAtReservation.value,
           1,
           doc,
           indexes,
@@ -199,6 +208,10 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
           key,
           {},
           created.uniqueIndexes,
+        );
+        transaction.set(
+          createdAtReservation.ref,
+          createSequenceRecord(collection, createdAtReservation.value),
         );
         transaction.create(ref, created);
 
@@ -217,9 +230,15 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
         const existingRecord = existing.exists
           ? parseStoredDocumentRecord(snapshotData(existing, "document record"))
           : null;
-        const createdAt = existingRecord?.createdAt
-          ? existingRecord.createdAt
-          : await nextCreatedAt(transaction, metadataCollection, collection);
+        const createdAtReservation = existingRecord
+          ? null
+          : await reserveNextCreatedAt(transaction, metadataCollection, collection);
+        const createdAt = existingRecord?.createdAt ?? createdAtReservation?.value;
+
+        if (createdAt === undefined) {
+          throw new Error("Missing Firestore createdAt reservation");
+        }
+
         const writeVersion = existingRecord ? existingRecord.writeVersion + 1 : 1;
         const updated = createStoredDocumentRecord(
           collection,
@@ -241,6 +260,12 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
           existingRecord?.uniqueIndexes ?? {},
           updated.uniqueIndexes,
         );
+        if (createdAtReservation) {
+          transaction.set(
+            createdAtReservation.ref,
+            createSequenceRecord(collection, createdAtReservation.value),
+          );
+        }
         transaction.set(ref, updated);
       });
     },
@@ -425,9 +450,15 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
           const existingRecord = existing.exists
             ? parseStoredDocumentRecord(snapshotData(existing, "document record"))
             : null;
-          const createdAt = existingRecord
-            ? existingRecord.createdAt
-            : await nextCreatedAt(transaction, metadataCollection, collection);
+          const createdAtReservation = existingRecord
+            ? null
+            : await reserveNextCreatedAt(transaction, metadataCollection, collection);
+          const createdAt = existingRecord?.createdAt ?? createdAtReservation?.value;
+
+          if (createdAt === undefined) {
+            throw new Error("Missing Firestore createdAt reservation");
+          }
+
           const writeVersion = existingRecord ? existingRecord.writeVersion + 1 : 1;
           const resolved = resolveWriteMetadata(item.migrationMetadata, item.doc);
           const updated = createStoredDocumentRecord(
@@ -450,6 +481,12 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
             existingRecord?.uniqueIndexes ?? {},
             updated.uniqueIndexes,
           );
+          if (createdAtReservation) {
+            transaction.set(
+              createdAtReservation.ref,
+              createSequenceRecord(collection, createdAtReservation.value),
+            );
+          }
           transaction.set(ref, updated);
         });
       }
@@ -499,9 +536,15 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
             return "persisted" as const;
           }
 
-          const createdAt = existingRecord
-            ? existingRecord.createdAt
-            : await nextCreatedAt(transaction, metadataCollection, collection);
+          const createdAtReservation = existingRecord
+            ? null
+            : await reserveNextCreatedAt(transaction, metadataCollection, collection);
+          const createdAt = existingRecord?.createdAt ?? createdAtReservation?.value;
+
+          if (createdAt === undefined) {
+            throw new Error("Missing Firestore createdAt reservation");
+          }
+
           const writeVersion = existingRecord ? existingRecord.writeVersion + 1 : 1;
           const updated = createStoredDocumentRecord(
             collection,
@@ -522,6 +565,12 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
             existingRecord?.uniqueIndexes ?? {},
             updated.uniqueIndexes,
           );
+          if (createdAtReservation) {
+            transaction.set(
+              createdAtReservation.ref,
+              createSequenceRecord(collection, createdAtReservation.value),
+            );
+          }
           transaction.set(ref, updated);
           return "persisted" as const;
         });
@@ -768,11 +817,11 @@ function hashIndexValue(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
-async function nextCreatedAt(
+async function reserveNextCreatedAt(
   transaction: FirestoreTransactionLike,
   metadataCollection: FirestoreCollectionLike,
   collection: string,
-): Promise<number> {
+): Promise<CreatedAtReservation> {
   const ref = metadataRef(metadataCollection, sequenceDocId(collection));
   const raw = await transaction.get(ref);
   const snapshot = parseDocumentSnapshot(raw, "sequence record");
@@ -786,13 +835,18 @@ async function nextCreatedAt(
     : 0;
   const next = value + 1;
 
-  transaction.set(ref, {
+  return {
+    ref,
+    value: next,
+  };
+}
+
+function createSequenceRecord(collection: string, value: number): Record<string, unknown> {
+  return {
     kind: "sequence",
     collection,
-    value: next,
-  });
-
-  return next;
+    value,
+  };
 }
 
 async function listCollectionDocuments(
