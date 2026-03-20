@@ -120,6 +120,10 @@ class FakeFirestoreTransaction {
     return getFakeRef(ref).readSnapshot();
   }
 
+  async getAll(...refs: unknown[]) {
+    return Promise.all(refs.map(async (ref) => this.get(ref)));
+  }
+
   create(ref: unknown, data: Record<string, unknown>) {
     this.pendingOperations.push(() => {
       getFakeRef(ref).applyCreate(data);
@@ -178,6 +182,29 @@ class FakeFirestoreDatabase {
   }
 }
 
+class CountingFirestoreTransaction extends FakeFirestoreTransaction {
+  readonly getAllBatchSizes: number[] = [];
+
+  override async getAll(...refs: unknown[]) {
+    this.getAllBatchSizes.push(refs.length);
+    return refs.map((ref) => getFakeRef(ref).readSnapshot());
+  }
+}
+
+class CountingFirestoreDatabase extends FakeFirestoreDatabase {
+  readonly transactions: CountingFirestoreTransaction[] = [];
+
+  override async runTransaction<T>(
+    updateFunction: (transaction: CountingFirestoreTransaction) => Promise<T>,
+  ) {
+    const transaction = new CountingFirestoreTransaction();
+    this.transactions.push(transaction);
+    const result = await updateFunction(transaction);
+    transaction.commit();
+    return result;
+  }
+}
+
 function getFakeRef(ref: unknown): FakeFirestoreDocumentReference {
   if (!(ref instanceof FakeFirestoreDocumentReference)) {
     throw new Error("Expected a FakeFirestoreDocumentReference");
@@ -224,11 +251,9 @@ function compareUnknown(left: unknown, right: unknown): number {
 }
 
 describe("firestoreEngine unique constraints", () => {
-  function createEngine() {
+  function createEngine(database: FakeFirestoreDatabase = new FakeFirestoreDatabase()) {
     return firestoreEngine({
-      database: new FakeFirestoreDatabase() as unknown as Parameters<
-        typeof firestoreEngine
-      >[0]["database"],
+      database: database as unknown as Parameters<typeof firestoreEngine>[0]["database"],
     });
   }
 
@@ -256,6 +281,24 @@ describe("firestoreEngine unique constraints", () => {
         { byEmail: "sam@example.com" },
       ),
     ).rejects.toBeInstanceOf(EngineUniqueConstraintError);
+  });
+
+  test("create batches unique ownership reads with getAll", async () => {
+    const database = new CountingFirestoreDatabase();
+    const engine = createEngine(database);
+
+    await engine.create(
+      "users",
+      "u1",
+      { id: "u1", email: "sam@example.com", username: "sam" },
+      { primary: "u1" },
+      undefined,
+      undefined,
+      { byEmail: "sam@example.com", byUsername: "sam" },
+    );
+
+    expect(database.transactions).toHaveLength(1);
+    expect(database.transactions[0]?.getAllBatchSizes).toEqual([2]);
   });
 
   test("update rejects duplicate unique index ownership", async () => {
