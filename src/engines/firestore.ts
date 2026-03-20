@@ -1531,6 +1531,8 @@ async function synchronizeUniqueIndexOwnership(
           record.ownerKey,
         );
       }
+
+      continue;
     }
 
     transaction.set(ref, createUniqueOwnershipRecord(collection, key, indexName, indexValue));
