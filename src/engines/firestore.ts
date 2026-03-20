@@ -1472,7 +1472,7 @@ async function synchronizeUniqueIndexOwnership(
   const currentEntries = Object.entries(currentUniqueIndexes);
   const nextEntries = Object.entries(nextUniqueIndexes);
   const nextEntryKeys = new Set(
-    nextEntries.map(([indexName, indexValue]) => `${indexName}\u0000${indexValue}`),
+    nextEntries.map(([indexName, indexValue]) => pairCacheKey(indexName, indexValue)),
   );
   const refs = new Map<string, FirestoreDocumentReferenceLike>();
   const snapshots = new Map<string, FirestoreDocumentSnapshotLike>();
@@ -1545,7 +1545,7 @@ async function synchronizeUniqueIndexOwnership(
   }
 
   for (const [indexName, indexValue] of currentEntries) {
-    if (nextEntryKeys.has(`${indexName}\u0000${indexValue}`)) {
+    if (nextEntryKeys.has(pairCacheKey(indexName, indexValue))) {
       continue;
     }
 
@@ -1574,6 +1574,10 @@ async function synchronizeUniqueIndexOwnership(
       transaction.delete(ref);
     }
   }
+}
+
+function pairCacheKey(left: string, right: string): string {
+  return JSON.stringify([left, right]);
 }
 
 function parseDocumentSnapshot(raw: unknown, context: string): FirestoreDocumentSnapshotLike {
