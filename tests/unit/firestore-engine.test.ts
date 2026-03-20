@@ -182,22 +182,21 @@ class FakeFirestoreDatabase {
   }
 }
 
-class CountingFirestoreTransaction extends FakeFirestoreTransaction {
-  readonly getAllBatchSizes: number[] = [];
-
-  override async getAll(...refs: unknown[]) {
-    this.getAllBatchSizes.push(refs.length);
-    return refs.map((ref) => getFakeRef(ref).readSnapshot());
+class RejectingGetAllFirestoreTransaction extends FakeFirestoreTransaction {
+  override getAll(..._refs: unknown[]) {
+    return Promise.reject(new Error("getAll should not be called")) as ReturnType<
+      FakeFirestoreTransaction["getAll"]
+    >;
   }
 }
 
-class CountingFirestoreDatabase extends FakeFirestoreDatabase {
-  readonly transactions: CountingFirestoreTransaction[] = [];
+class RejectingGetAllFirestoreDatabase extends FakeFirestoreDatabase {
+  readonly transactions: RejectingGetAllFirestoreTransaction[] = [];
 
   override async runTransaction<T>(
-    updateFunction: (transaction: CountingFirestoreTransaction) => Promise<T>,
+    updateFunction: (transaction: FakeFirestoreTransaction) => Promise<T>,
   ) {
-    const transaction = new CountingFirestoreTransaction();
+    const transaction = new RejectingGetAllFirestoreTransaction();
     this.transactions.push(transaction);
     const result = await updateFunction(transaction);
     transaction.commit();
@@ -283,8 +282,8 @@ describe("firestoreEngine unique constraints", () => {
     ).rejects.toBeInstanceOf(EngineUniqueConstraintError);
   });
 
-  test("create batches unique ownership reads with getAll", async () => {
-    const database = new CountingFirestoreDatabase();
+  test("create does not rely on getAll for unique ownership reads", async () => {
+    const database = new RejectingGetAllFirestoreDatabase();
     const engine = createEngine(database);
 
     await engine.create(
@@ -298,17 +297,15 @@ describe("firestoreEngine unique constraints", () => {
     );
 
     expect(database.transactions).toHaveLength(1);
-    expect(database.transactions[0]?.getAllBatchSizes).toEqual([2]);
   });
 
-  test("create without unique indexes skips getAll", async () => {
-    const database = new CountingFirestoreDatabase();
+  test("create without unique indexes still succeeds when getAll is unavailable", async () => {
+    const database = new RejectingGetAllFirestoreDatabase();
     const engine = createEngine(database);
 
     await engine.create("users", "u1", { id: "u1", email: "sam@example.com" }, { primary: "u1" });
 
     expect(database.transactions).toHaveLength(1);
-    expect(database.transactions[0]?.getAllBatchSizes).toEqual([]);
   });
 
   test("update rejects duplicate unique index ownership", async () => {
