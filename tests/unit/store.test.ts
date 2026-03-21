@@ -9,11 +9,12 @@ import { memoryEngine, type MemoryQueryEngine } from "../../src/engines/memory";
 import {
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
+  type KeyedDocument,
   type MigrationLock,
   type QueryEngine,
 } from "../../src/engines/types";
 import { DefaultMigrator } from "../../src/migrator";
-import { model, ValidationError } from "../../src/model";
+import { model, ModelDefinition, ValidationError } from "../../src/model";
 import {
   ConcurrentWriteError,
   createStore,
@@ -283,6 +284,83 @@ function buildBlobV2WithBigIntMigration() {
     )
     .index({ name: "primary", value: "id" })
     .build();
+}
+
+interface ReadProjectionTracker {
+  inFlight: number;
+  maxInFlight: number;
+  startedKeys: string[];
+  completedKeys: string[];
+}
+
+function createReadProjectionTracker(): ReadProjectionTracker {
+  return {
+    inFlight: 0,
+    maxInFlight: 0,
+    startedKeys: [],
+    completedKeys: [],
+  };
+}
+
+async function waitForMicrotasks(turns: number): Promise<void> {
+  for (let i = 0; i < turns; i++) {
+    await new Promise<void>((resolve) => {
+      queueMicrotask(resolve);
+    });
+  }
+}
+
+function buildTrackedUserV2(
+  tracker: ReadProjectionTracker,
+  microtaskTurnsByKey: Record<string, number>,
+): ModelDefinition<
+  {
+    id: string;
+    firstName: string;
+    lastName: string;
+    email: string;
+  },
+  Record<string, unknown>,
+  "user",
+  "primary" | "byEmail",
+  false
+> {
+  const trackedModel = buildUserV2();
+  const originalProjectToLatest = trackedModel.projectToLatest.bind(trackedModel);
+
+  trackedModel.projectToLatest = async (doc) => {
+    const key = String(doc.id);
+    tracker.startedKeys.push(key);
+    tracker.inFlight += 1;
+    tracker.maxInFlight = Math.max(tracker.maxInFlight, tracker.inFlight);
+
+    await waitForMicrotasks(microtaskTurnsByKey[key] ?? 1);
+
+    tracker.completedKeys.push(key);
+    tracker.inFlight -= 1;
+
+    return originalProjectToLatest(doc);
+  };
+
+  return trackedModel;
+}
+
+function createMigratedUserDocuments(count: number): KeyedDocument[] {
+  return Array.from({ length: count }, (_, index) => {
+    const id = `u${String(index + 1)}`;
+
+    return {
+      key: id,
+      writeToken: `token-${id}`,
+      doc: {
+        __v: 1,
+        __indexes: ["byEmail", "primary"],
+        id,
+        name: `User ${String(index + 1)}`,
+        email: `${id}@example.com`,
+      },
+    };
+  });
 }
 
 let engine: MemoryQueryEngine;
@@ -1655,6 +1733,103 @@ describe("store.query()", () => {
     expect(page2.documents).toHaveLength(1);
     expect(page2.cursor).toBeNull();
   });
+
+  test("projects read results with bounded concurrency while preserving document order", async () => {
+    const tracker = createReadProjectionTracker();
+    const migratedDocs = createMigratedUserDocuments(10);
+    const writebackKeys: string[][] = [];
+    const trackingEngine: QueryEngine<never> = {
+      async get() {
+        return null;
+      },
+      async create() {},
+      async put() {},
+      async update() {},
+      async delete() {},
+      async query() {
+        return {
+          documents: migratedDocs,
+          cursor: null,
+        };
+      },
+      async batchGet() {
+        return [];
+      },
+      async batchSet(_collection, items) {
+        writebackKeys.push(items.map((item) => item.key));
+      },
+      async batchDelete() {},
+      migration: {
+        async acquireLock() {
+          return null;
+        },
+        async releaseLock() {},
+        async getOutdated() {
+          return { documents: [], cursor: null };
+        },
+      },
+    };
+    const trackedModel = buildTrackedUserV2(
+      tracker,
+      Object.fromEntries(migratedDocs.map(({ key }) => [key, 1])),
+    );
+    const store = createStore(trackingEngine, [trackedModel]);
+
+    const result = await store.user.query({});
+
+    expect(result.documents.map((doc) => doc.id)).toEqual(migratedDocs.map(({ key }) => key));
+    expect(tracker.maxInFlight).toBe(8);
+    expect(writebackKeys).toEqual([migratedDocs.map(({ key }) => key)]);
+  });
+
+  test("keeps query results in engine order when projections finish out of order", async () => {
+    const tracker = createReadProjectionTracker();
+    const migratedDocs = createMigratedUserDocuments(3);
+    const writebackKeys: string[][] = [];
+    const trackingEngine: QueryEngine<never> = {
+      async get() {
+        return null;
+      },
+      async create() {},
+      async put() {},
+      async update() {},
+      async delete() {},
+      async query() {
+        return {
+          documents: migratedDocs,
+          cursor: null,
+        };
+      },
+      async batchGet() {
+        return [];
+      },
+      async batchSet(_collection, items) {
+        writebackKeys.push(items.map((item) => item.key));
+      },
+      async batchDelete() {},
+      migration: {
+        async acquireLock() {
+          return null;
+        },
+        async releaseLock() {},
+        async getOutdated() {
+          return { documents: [], cursor: null };
+        },
+      },
+    };
+    const trackedModel = buildTrackedUserV2(tracker, {
+      u1: 3,
+      u2: 2,
+      u3: 1,
+    });
+    const store = createStore(trackingEngine, [trackedModel]);
+
+    const result = await store.user.query({});
+
+    expect(tracker.completedKeys).toEqual(["u3", "u2", "u1"]);
+    expect(result.documents.map((doc) => doc.id)).toEqual(["u1", "u2", "u3"]);
+    expect(writebackKeys).toEqual([["u1", "u2", "u3"]]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -2190,6 +2365,51 @@ describe("store.batchGet()", () => {
 
     expect(results).toEqual([{ id: "u1", name: "Sam", email: "sam@example.com" }]);
     expect(calls).toEqual(["batchGet"]);
+  });
+
+  test("projects batchGet results with bounded concurrency while preserving output order", async () => {
+    const tracker = createReadProjectionTracker();
+    const migratedDocs = createMigratedUserDocuments(10);
+    const writebackKeys: string[][] = [];
+    const trackingEngine: QueryEngine<never> = {
+      async get() {
+        return null;
+      },
+      async create() {},
+      async put() {},
+      async update() {},
+      async delete() {},
+      async query() {
+        return { documents: [], cursor: null };
+      },
+      async batchGet() {
+        return migratedDocs;
+      },
+      async batchSet(_collection, items) {
+        writebackKeys.push(items.map((item) => item.key));
+      },
+      async batchDelete() {},
+      migration: {
+        async acquireLock() {
+          return null;
+        },
+        async releaseLock() {},
+        async getOutdated() {
+          return { documents: [], cursor: null };
+        },
+      },
+    };
+    const trackedModel = buildTrackedUserV2(
+      tracker,
+      Object.fromEntries(migratedDocs.map(({ key }) => [key, 1])),
+    );
+    const store = createStore(trackingEngine, [trackedModel]);
+
+    const result = await store.user.batchGet(migratedDocs.map(({ key }) => key));
+
+    expect(result.map((doc) => doc.id)).toEqual(migratedDocs.map(({ key }) => key));
+    expect(tracker.maxInFlight).toBe(8);
+    expect(writebackKeys).toEqual([migratedDocs.map(({ key }) => key)]);
   });
 });
 

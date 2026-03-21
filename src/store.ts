@@ -1,5 +1,6 @@
 import type { ProjectionSkipReason } from "./model";
 
+import { forEachWithConcurrencyLimit, mapWithConcurrencyLimit } from "./concurrency";
 import {
   type PreparedDocument,
   validateJsonCompatibleDocument,
@@ -9,6 +10,7 @@ import {
   EngineDocumentNotFoundError,
   EngineUniqueConstraintError,
   type EngineGetResult,
+  type KeyedDocument,
   type MigrationDocumentMetadata,
   type MigrationLock,
   type QueryEngine,
@@ -429,6 +431,7 @@ function resolveUniqueConstraintLockOptions(
 }
 
 const DEFAULT_UNIQUE_CONSTRAINT_PRECHECK_CONCURRENCY = 8;
+const READ_PROJECTION_CONCURRENCY = 8;
 
 function resolveUniqueConstraintPrecheckConcurrency(
   options?: UniqueConstraintPrecheckOptions,
@@ -446,60 +449,6 @@ function resolveUniqueConstraintPrecheckConcurrency(
   }
 
   return concurrency;
-}
-
-async function forEachWithConcurrencyLimit<T>(
-  items: readonly T[],
-  limit: number,
-  worker: (item: T) => Promise<void>,
-): Promise<void> {
-  if (items.length === 0) {
-    return;
-  }
-
-  const state: {
-    nextIndex: number;
-    firstError: Error | null;
-  } = {
-    nextIndex: 0,
-    firstError: null,
-  };
-
-  const runner = async (): Promise<void> => {
-    while (true) {
-      if (state.firstError !== null) {
-        return;
-      }
-
-      const index = state.nextIndex;
-
-      if (index >= items.length) {
-        return;
-      }
-
-      state.nextIndex = index + 1;
-
-      try {
-        await worker(items[index] as T);
-      } catch (error) {
-        if (state.firstError === null) {
-          state.firstError =
-            error instanceof Error
-              ? error
-              : new Error("Concurrent worker failed", {
-                  cause: error,
-                });
-        }
-        return;
-      }
-    }
-  };
-
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => runner()));
-
-  if (state.firstError !== null) {
-    throw state.firstError;
-  }
 }
 
 function findDuplicateBatchSetKeyConflicts<T>(
@@ -598,27 +547,7 @@ class BoundModelImpl<
     const raw = this.engine.queryWithMetadata
       ? await this.engine.queryWithMetadata(this.model.name, resolved, options)
       : await this.engine.query(this.model.name, resolved, options);
-    const documents: T[] = [];
-    const writebacks: { key: string; value: T; expectedWriteToken?: string }[] = [];
-
-    for (const { key, doc: rawDoc, writeToken } of raw.documents) {
-      const projected = await this.model.projectToLatest(rawDoc as Record<string, unknown>);
-
-      if (!projected.ok) {
-        await this.handleProjectionFailure(projected.reason, key, "query", projected.error);
-        continue;
-      }
-
-      if (projected.migrated) {
-        writebacks.push({
-          key,
-          value: projected.value,
-          expectedWriteToken: this.normalizeWriteToken(writeToken),
-        });
-      }
-
-      documents.push(projected.value);
-    }
+    const { writebacks, values: documents } = await this.projectReadResults(raw.documents, "query");
 
     await this.writebackMany(writebacks, "query", options);
 
@@ -805,27 +734,7 @@ class BoundModelImpl<
     const rawDocs = this.engine.batchGetWithMetadata
       ? await this.engine.batchGetWithMetadata(this.model.name, keys, options)
       : await this.engine.batchGet(this.model.name, keys, options);
-    const results: { key: string; value: T }[] = [];
-    const writebacks: { key: string; value: T; expectedWriteToken?: string }[] = [];
-
-    for (const { key, doc: rawDoc, writeToken } of rawDocs) {
-      const projected = await this.model.projectToLatest(rawDoc as Record<string, unknown>);
-
-      if (!projected.ok) {
-        await this.handleProjectionFailure(projected.reason, key, "batchGet", projected.error);
-        continue;
-      }
-
-      if (projected.migrated) {
-        writebacks.push({
-          key,
-          value: projected.value,
-          expectedWriteToken: this.normalizeWriteToken(writeToken),
-        });
-      }
-
-      results.push({ key, value: projected.value });
-    }
+    const { results, writebacks } = await this.projectReadResults(rawDocs, "batchGet");
 
     await this.writebackMany(writebacks, "batchGet", options);
 
@@ -1122,6 +1031,52 @@ class BoundModelImpl<
       indexesField: this.model.options.indexesField,
       parseVersion: this.model.options.parseVersion,
       compareVersions: this.model.options.compareVersions,
+    };
+  }
+
+  private async projectReadResults(
+    rawDocs: readonly KeyedDocument[],
+    operation: Extract<ProjectionSkipOperation, "query" | "batchGet">,
+  ): Promise<{
+    results: { key: string; value: T }[];
+    values: T[];
+    writebacks: { key: string; value: T; expectedWriteToken?: string }[];
+  }> {
+    const projectedEntries = await mapWithConcurrencyLimit(
+      rawDocs,
+      READ_PROJECTION_CONCURRENCY,
+      async ({ key, doc, writeToken }) => ({
+        key,
+        writeToken,
+        projected: await this.model.projectToLatest(doc as Record<string, unknown>),
+      }),
+    );
+    const results: { key: string; value: T }[] = [];
+    const values: T[] = [];
+    const writebacks: { key: string; value: T; expectedWriteToken?: string }[] = [];
+
+    for (const { key, writeToken, projected } of projectedEntries) {
+      if (!projected.ok) {
+        await this.handleProjectionFailure(projected.reason, key, operation, projected.error);
+        continue;
+      }
+
+      if (projected.migrated) {
+        writebacks.push({
+          key,
+          value: projected.value,
+          expectedWriteToken: this.normalizeWriteToken(writeToken),
+        });
+      }
+
+      values.push(projected.value);
+      results.push({ key, value: projected.value });
+    }
+
+    return {
+      results,
+      values,
+      writebacks,
     };
   }
 
