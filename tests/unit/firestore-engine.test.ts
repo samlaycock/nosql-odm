@@ -407,6 +407,112 @@ describe("firestoreEngine unique constraints", () => {
     ).rejects.toBeInstanceOf(EngineUniqueConstraintError);
   });
 
+  test("batchSet rejects duplicate unique index ownership", async () => {
+    const engine = createEngine();
+
+    await engine.create(
+      "users",
+      "u1",
+      { id: "u1", email: "sam@example.com" },
+      { primary: "u1" },
+      undefined,
+      undefined,
+      { byEmail: "sam@example.com" },
+    );
+
+    return expect(
+      engine.batchSet("users", [
+        {
+          key: "u2",
+          doc: { id: "u2", email: "sam@example.com" },
+          indexes: { primary: "u2" },
+          uniqueIndexes: { byEmail: "sam@example.com" },
+        },
+      ]),
+    ).rejects.toBeInstanceOf(EngineUniqueConstraintError);
+  });
+
+  test("batchSetWithResult rejects duplicate unique index ownership", async () => {
+    const engine = createEngine();
+
+    await engine.create(
+      "users",
+      "u1",
+      { id: "u1", email: "sam@example.com" },
+      { primary: "u1" },
+      undefined,
+      undefined,
+      { byEmail: "sam@example.com" },
+    );
+
+    return expect(
+      engine.batchSetWithResult("users", [
+        {
+          key: "u2",
+          doc: { id: "u2", email: "sam@example.com" },
+          indexes: { primary: "u2" },
+          uniqueIndexes: { byEmail: "sam@example.com" },
+        },
+      ]),
+    ).rejects.toBeInstanceOf(EngineUniqueConstraintError);
+  });
+
+  test("batchSetWithResult reports stale-token conflicts before unique checks", async () => {
+    const engine = createEngine();
+
+    await engine.put(
+      "users",
+      "u1",
+      { id: "u1", email: "before@example.com" },
+      { primary: "u1" },
+      undefined,
+      undefined,
+      { byEmail: "before@example.com" },
+    );
+    await engine.put(
+      "users",
+      "u2",
+      { id: "u2", email: "taken@example.com" },
+      { primary: "u2" },
+      undefined,
+      undefined,
+      { byEmail: "taken@example.com" },
+    );
+
+    const current = await engine.getWithMetadata("users", "u1");
+
+    expect(current).not.toBeNull();
+
+    await engine.update(
+      "users",
+      "u1",
+      { id: "u1", email: "concurrent@example.com" },
+      { primary: "u1" },
+      undefined,
+      undefined,
+      { byEmail: "concurrent@example.com" },
+    );
+
+    const result = await engine.batchSetWithResult("users", [
+      {
+        key: "u1",
+        doc: { id: "u1", email: "taken@example.com" },
+        indexes: { primary: "u1" },
+        expectedWriteToken: current?.writeToken,
+        uniqueIndexes: { byEmail: "taken@example.com" },
+      },
+    ]);
+
+    expect(result).toEqual({
+      persistedKeys: [],
+      conflictedKeys: ["u1"],
+    });
+    expect(await engine.get("users", "u1")).toEqual({
+      id: "u1",
+      email: "concurrent@example.com",
+    });
+  });
+
   test("delete releases unique ownership", async () => {
     const engine = createEngine();
 
