@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { EngineUniqueConstraintError, type QueryEngine } from "../../src/engines/types";
+import { expectRejectInstanceOf } from "./helpers";
 
 interface QueryEngineConformanceSuiteOptions<TOptions = Record<string, unknown>> {
   readonly engineName: string;
@@ -164,7 +165,7 @@ export function runQueryEngineConformanceSuite<TOptions = Record<string, unknown
           { byEmail: "other@example.com" },
         );
 
-        await expect(
+        await expectRejectInstanceOf(
           engine.create(
             collection,
             "u3",
@@ -174,9 +175,10 @@ export function runQueryEngineConformanceSuite<TOptions = Record<string, unknown
             undefined,
             { byEmail: "sam@example.com" },
           ),
-        ).rejects.toBeInstanceOf(EngineUniqueConstraintError);
+          EngineUniqueConstraintError,
+        );
 
-        await expect(
+        await expectRejectInstanceOf(
           engine.update(
             collection,
             "u2",
@@ -186,9 +188,10 @@ export function runQueryEngineConformanceSuite<TOptions = Record<string, unknown
             undefined,
             { byEmail: "sam@example.com" },
           ),
-        ).rejects.toBeInstanceOf(EngineUniqueConstraintError);
+          EngineUniqueConstraintError,
+        );
 
-        await expect(
+        await expectRejectInstanceOf(
           engine.put(
             collection,
             "u2",
@@ -198,9 +201,10 @@ export function runQueryEngineConformanceSuite<TOptions = Record<string, unknown
             undefined,
             { byEmail: "sam@example.com" },
           ),
-        ).rejects.toBeInstanceOf(EngineUniqueConstraintError);
+          EngineUniqueConstraintError,
+        );
 
-        await expect(
+        await expectRejectInstanceOf(
           engine.batchSet(collection, [
             {
               key: "u4",
@@ -209,9 +213,10 @@ export function runQueryEngineConformanceSuite<TOptions = Record<string, unknown
               uniqueIndexes: { byEmail: "sam@example.com" },
             },
           ]),
-        ).rejects.toBeInstanceOf(EngineUniqueConstraintError);
+          EngineUniqueConstraintError,
+        );
 
-        await expect(
+        await expectRejectInstanceOf(
           engine.batchSet(collection, [
             {
               key: "u4",
@@ -226,7 +231,8 @@ export function runQueryEngineConformanceSuite<TOptions = Record<string, unknown
               uniqueIndexes: { byEmail: "fresh@example.com" },
             },
           ]),
-        ).rejects.toBeInstanceOf(EngineUniqueConstraintError);
+          EngineUniqueConstraintError,
+        );
 
         await engine.update(
           collection,
@@ -277,7 +283,7 @@ export function runQueryEngineConformanceSuite<TOptions = Record<string, unknown
           { byEmail: "sam@example.com" },
         );
 
-        await expect(
+        await expectRejectInstanceOf(
           engine.batchSetWithResult(collection, [
             {
               key: "u2",
@@ -286,7 +292,8 @@ export function runQueryEngineConformanceSuite<TOptions = Record<string, unknown
               uniqueIndexes: { byEmail: "sam@example.com" },
             },
           ]),
-        ).rejects.toBeInstanceOf(EngineUniqueConstraintError);
+          EngineUniqueConstraintError,
+        );
 
         expect(await engine.get(collection, "u2")).toBeNull();
       },

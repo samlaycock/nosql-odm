@@ -435,6 +435,10 @@ describe("firestoreEngine unique constraints", () => {
   test("batchSetWithResult rejects duplicate unique index ownership", async () => {
     const engine = createEngine();
 
+    if (!engine.batchSetWithResult) {
+      throw new Error("Expected Fake Firestore engine to implement batchSetWithResult");
+    }
+
     await engine.create(
       "users",
       "u1",
@@ -459,6 +463,14 @@ describe("firestoreEngine unique constraints", () => {
 
   test("batchSetWithResult reports stale-token conflicts before unique checks", async () => {
     const engine = createEngine();
+
+    if (!engine.getWithMetadata) {
+      throw new Error("Expected Fake Firestore engine to implement getWithMetadata");
+    }
+
+    if (!engine.batchSetWithResult) {
+      throw new Error("Expected Fake Firestore engine to implement batchSetWithResult");
+    }
 
     await engine.put(
       "users",
