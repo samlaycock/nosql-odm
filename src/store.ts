@@ -1638,9 +1638,7 @@ class BoundModelImpl<
     const fields = Object.keys(where);
 
     if (fields.length === 0) {
-      throw new Error(
-        `"where" must contain exactly one field, got ${fields.length}: ${fields.join(", ")}`,
-      );
+      throw new Error(`"where" must contain at least one field`);
     }
 
     if (fields.length > 1) {
@@ -1693,10 +1691,7 @@ class BoundModelImpl<
 
     if (matchingIndexes.length === 0) {
       const available = this.model.indexes
-        .filter(
-          (index) =>
-            typeof index.name === "string" && index.fields !== undefined && index.fields.length > 1,
-        )
+        .filter((index) => typeof index.name === "string" && index.fields !== undefined)
         .map((index) => `${index.key}(${index.fields!.join(", ")})`)
         .join(", ");
 

@@ -2092,7 +2092,7 @@ describe("store.query() with where", () => {
     const store = createStore(engine, [buildUserV1()]);
 
     expect(store.user.query({ where: {} })).rejects.toThrow(
-      '"where" must contain exactly one field',
+      '"where" must contain at least one field',
     );
   });
 
