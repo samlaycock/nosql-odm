@@ -466,7 +466,7 @@ describe("firestoreEngine unique constraints", () => {
     ).resolves.toBeUndefined();
   });
 
-  test("batchSetWithResult reports unique index ownership conflicts without aborting persisted items", async () => {
+  test("batchSetWithResult rejects duplicate unique ownership after persisting earlier items", async () => {
     const engine = createEngine();
 
     if (!engine.batchSetWithResult) {
@@ -483,31 +483,92 @@ describe("firestoreEngine unique constraints", () => {
       { byEmail: "sam@example.com" },
     );
 
-    const result = await engine.batchSetWithResult("users", [
-      {
-        key: "u2",
-        doc: { id: "u2", email: "fresh@example.com" },
-        indexes: { primary: "u2" },
-        uniqueIndexes: { byEmail: "fresh@example.com" },
-      },
-      {
-        key: "u3",
-        doc: { id: "u3", email: "sam@example.com" },
-        indexes: { primary: "u3" },
-        uniqueIndexes: { byEmail: "sam@example.com" },
-      },
-    ]);
+    let duplicateError: unknown;
 
-    expect(result).toEqual({
-      persistedKeys: ["u2"],
-      conflictedKeys: ["u3"],
-    });
+    try {
+      await engine.batchSetWithResult("users", [
+        {
+          key: "u2",
+          doc: { id: "u2", email: "fresh@example.com" },
+          indexes: { primary: "u2" },
+          uniqueIndexes: { byEmail: "fresh@example.com" },
+        },
+        {
+          key: "u3",
+          doc: { id: "u3", email: "sam@example.com" },
+          indexes: { primary: "u3" },
+          uniqueIndexes: { byEmail: "sam@example.com" },
+        },
+      ]);
+    } catch (error) {
+      duplicateError = error;
+    }
+
+    expect(duplicateError).toBeInstanceOf(EngineUniqueConstraintError);
     expect(await engine.get("users", "u2")).toEqual({
       id: "u2",
       email: "fresh@example.com",
     });
 
     return expect(await engine.get("users", "u3")).toBeNull();
+  });
+
+  test("batchSetWithResult rethrows unique conflicts when the write token is current", async () => {
+    const engine = createEngine();
+
+    if (!engine.getWithMetadata) {
+      throw new Error("Expected Fake Firestore engine to implement getWithMetadata");
+    }
+
+    if (!engine.batchSetWithResult) {
+      throw new Error("Expected Fake Firestore engine to implement batchSetWithResult");
+    }
+
+    await engine.put(
+      "users",
+      "u1",
+      { id: "u1", email: "taken@example.com" },
+      { primary: "u1" },
+      undefined,
+      undefined,
+      { byEmail: "taken@example.com" },
+    );
+    await engine.put(
+      "users",
+      "u2",
+      { id: "u2", email: "before@example.com" },
+      { primary: "u2" },
+      undefined,
+      undefined,
+      { byEmail: "before@example.com" },
+    );
+
+    const current = await engine.getWithMetadata("users", "u2");
+
+    expect(current).not.toBeNull();
+
+    let uniqueConflictError: unknown;
+
+    try {
+      await engine.batchSetWithResult("users", [
+        {
+          key: "u2",
+          doc: { id: "u2", email: "taken@example.com" },
+          indexes: { primary: "u2" },
+          expectedWriteToken: current?.writeToken,
+          uniqueIndexes: { byEmail: "taken@example.com" },
+        },
+      ]);
+    } catch (error) {
+      uniqueConflictError = error;
+    }
+
+    expect(uniqueConflictError).toBeInstanceOf(EngineUniqueConstraintError);
+
+    expect(await engine.get("users", "u2")).toEqual({
+      id: "u2",
+      email: "before@example.com",
+    });
   });
 
   test("batchSetWithResult reports stale-token conflicts before unique checks", async () => {

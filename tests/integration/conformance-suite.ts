@@ -262,7 +262,7 @@ export function runQueryEngineConformanceSuite<TOptions = Record<string, unknown
     );
 
     uniqueConstraintConformanceTest(
-      "batchSetWithResult surfaces unique index violations without persisting the conflicted item",
+      "batchSetWithResult rejects unique index violations without persisting the conflicted item",
       async () => {
         const engine = getEngine();
         const batchSetWithResult = engine.batchSetWithResult?.bind(engine);
@@ -284,23 +284,17 @@ export function runQueryEngineConformanceSuite<TOptions = Record<string, unknown
           { byEmail: "sam@example.com" },
         );
 
-        try {
-          const result = await batchSetWithResult(collection, [
+        await expectRejectInstanceOf(
+          batchSetWithResult(collection, [
             {
               key: "u2",
               doc: { id: "u2", email: "sam@example.com" },
               indexes: { primary: "u2" },
               uniqueIndexes: { byEmail: "sam@example.com" },
             },
-          ]);
-
-          expect(result).toEqual({
-            persistedKeys: [],
-            conflictedKeys: ["u2"],
-          });
-        } catch (error) {
-          expect(error).toBeInstanceOf(EngineUniqueConstraintError);
-        }
+          ]),
+          EngineUniqueConstraintError,
+        );
 
         expect(await engine.get(collection, "u2")).toBeNull();
       },
