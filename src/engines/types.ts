@@ -54,10 +54,9 @@ export interface BatchSetResult {
    */
   persistedKeys: string[];
   /**
-   * Keys skipped while the engine continued persisting the rest of the batch.
-   * This primarily covers optimistic-write token mismatches, but engines that
-   * execute items independently may also report per-item unique conflicts here
-   * so callers can still tell which writes committed.
+   * Keys skipped due to optimistic-write token mismatches.
+   * Engines should still reject the full batch for structural validation
+   * failures or unique-constraint violations.
    */
   conflictedKeys: string[];
 }
@@ -356,10 +355,11 @@ export interface QueryEngine<TOptions = Record<string, unknown>> {
    */
   batchSet(collection: string, items: BatchSetItem[], options?: TOptions): Promise<void>;
   /**
-   * Like batchSet(), but reports per-item conflicts through conflictedKeys
-   * when the engine can continue applying the rest of the batch. Engines
-   * should still reject on structural validation errors or unrecoverable
-   * batch-level failures.
+   * Like batchSet(), but reports per-item optimistic-write token conflicts
+   * through conflictedKeys. Engines should still reject on validation or
+   * unique-constraint errors rather than translating them into conflictedKeys.
+   * As with batchSet(), engines may already have committed earlier items if a
+   * later storage transaction fails while processing the batch incrementally.
    */
   batchSetWithResult?(
     collection: string,

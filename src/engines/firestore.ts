@@ -502,60 +502,24 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
         const expectedWriteVersion = parseExpectedWriteVersion(item.expectedWriteToken);
         const resolved = resolveWriteMetadata(item.migrationMetadata, item.doc);
 
-        let result: "persisted" | "conflict";
+        const result = await database.runTransaction(async (transaction) => {
+          const ref = documentRef(documentsCollection, collection, item.key);
+          const existingRaw = await transaction.get(ref);
+          const existing = parseDocumentSnapshot(existingRaw, "document record");
+          const existingRecord = existing.exists
+            ? parseStoredDocumentRecord(snapshotData(existing, "document record"))
+            : null;
 
-        try {
-          result = await database.runTransaction(async (transaction) => {
-            const ref = documentRef(documentsCollection, collection, item.key);
-            const existingRaw = await transaction.get(ref);
-            const existing = parseDocumentSnapshot(existingRaw, "document record");
-            const existingRecord = existing.exists
-              ? parseStoredDocumentRecord(snapshotData(existing, "document record"))
-              : null;
-
-            if (expectedWriteVersion !== undefined) {
-              if (!existingRecord || existingRecord.writeVersion !== expectedWriteVersion) {
-                return "conflict" as const;
-              }
-
-              const updated = createStoredDocumentRecord(
-                collection,
-                item.key,
-                existingRecord.createdAt,
-                existingRecord.writeVersion + 1,
-                item.doc,
-                item.indexes,
-                resolveWriteUniqueIndexes(existingRecord, item.uniqueIndexes),
-                resolved.metadata,
-                resolved.needsMigrationOverride,
-              );
-              await synchronizeUniqueIndexOwnership(
-                transaction,
-                metadataCollection,
-                collection,
-                item.key,
-                existingRecord.uniqueIndexes,
-                updated.uniqueIndexes,
-              );
-              transaction.set(ref, updated);
-              return "persisted" as const;
+          if (expectedWriteVersion !== undefined) {
+            if (!existingRecord || existingRecord.writeVersion !== expectedWriteVersion) {
+              return "conflict" as const;
             }
 
-            const createdAtReservation = existingRecord
-              ? null
-              : await reserveNextCreatedAt(transaction, metadataCollection, collection);
-            const createdAt = existingRecord?.createdAt ?? createdAtReservation?.value;
-
-            if (createdAt === undefined) {
-              throw new Error("Missing Firestore createdAt reservation");
-            }
-
-            const writeVersion = existingRecord ? existingRecord.writeVersion + 1 : 1;
             const updated = createStoredDocumentRecord(
               collection,
               item.key,
-              createdAt,
-              writeVersion,
+              existingRecord.createdAt,
+              existingRecord.writeVersion + 1,
               item.doc,
               item.indexes,
               resolveWriteUniqueIndexes(existingRecord, item.uniqueIndexes),
@@ -567,28 +531,51 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
               metadataCollection,
               collection,
               item.key,
-              existingRecord?.uniqueIndexes ?? {},
+              existingRecord.uniqueIndexes,
               updated.uniqueIndexes,
             );
-            if (createdAtReservation) {
-              transaction.set(
-                createdAtReservation.ref,
-                createSequenceRecord(collection, createdAtReservation.value),
-              );
-            }
             transaction.set(ref, updated);
             return "persisted" as const;
-          });
-        } catch (error) {
-          if (error instanceof EngineUniqueConstraintError) {
-            // Firestore applies each item in its own transaction, so preserve
-            // the structured batch result when a later item hits a unique conflict.
-            conflictedKeys.push(item.key);
-            continue;
           }
 
-          throw error;
-        }
+          const createdAtReservation = existingRecord
+            ? null
+            : await reserveNextCreatedAt(transaction, metadataCollection, collection);
+          const createdAt = existingRecord?.createdAt ?? createdAtReservation?.value;
+
+          if (createdAt === undefined) {
+            throw new Error("Missing Firestore createdAt reservation");
+          }
+
+          const writeVersion = existingRecord ? existingRecord.writeVersion + 1 : 1;
+          const updated = createStoredDocumentRecord(
+            collection,
+            item.key,
+            createdAt,
+            writeVersion,
+            item.doc,
+            item.indexes,
+            resolveWriteUniqueIndexes(existingRecord, item.uniqueIndexes),
+            resolved.metadata,
+            resolved.needsMigrationOverride,
+          );
+          await synchronizeUniqueIndexOwnership(
+            transaction,
+            metadataCollection,
+            collection,
+            item.key,
+            existingRecord?.uniqueIndexes ?? {},
+            updated.uniqueIndexes,
+          );
+          if (createdAtReservation) {
+            transaction.set(
+              createdAtReservation.ref,
+              createSequenceRecord(collection, createdAtReservation.value),
+            );
+          }
+          transaction.set(ref, updated);
+          return "persisted" as const;
+        });
 
         if (result === "persisted") {
           persistedKeys.push(item.key);
