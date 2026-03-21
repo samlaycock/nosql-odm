@@ -547,7 +547,8 @@ class BoundModelImpl<
     const raw = this.engine.queryWithMetadata
       ? await this.engine.queryWithMetadata(this.model.name, resolved, options)
       : await this.engine.query(this.model.name, resolved, options);
-    const { writebacks, values: documents } = await this.projectReadResults(raw.documents, "query");
+    const { results, writebacks } = await this.projectReadResults(raw.documents, "query");
+    const documents = results.map((result) => result.value);
 
     await this.writebackMany(writebacks, "query", options);
 
@@ -1039,7 +1040,6 @@ class BoundModelImpl<
     operation: Extract<ProjectionSkipOperation, "query" | "batchGet">,
   ): Promise<{
     results: { key: string; value: T }[];
-    values: T[];
     writebacks: { key: string; value: T; expectedWriteToken?: string }[];
   }> {
     const projectedEntries = await mapWithConcurrencyLimit(
@@ -1052,7 +1052,6 @@ class BoundModelImpl<
       }),
     );
     const results: { key: string; value: T }[] = [];
-    const values: T[] = [];
     const writebacks: { key: string; value: T; expectedWriteToken?: string }[] = [];
 
     for (const { key, writeToken, projected } of projectedEntries) {
@@ -1069,13 +1068,11 @@ class BoundModelImpl<
         });
       }
 
-      values.push(projected.value);
       results.push({ key, value: projected.value });
     }
 
     return {
       results,
-      values,
       writebacks,
     };
   }
