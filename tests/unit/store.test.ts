@@ -161,6 +161,25 @@ function buildUserV1WithRoleLastNameIndex() {
     .build();
 }
 
+function buildUserV1WithNormalizedEmailIndex() {
+  return model("user")
+    .schema(
+      1,
+      z.object({
+        id: z.string(),
+        name: z.string(),
+        email: z.email(),
+      }),
+    )
+    .index({ name: "primary", value: "id" })
+    .index({
+      name: "byNormalizedEmail",
+      fields: ["email"],
+      value: (user) => user.email.toLowerCase(),
+    })
+    .build();
+}
+
 function buildUserV2() {
   return model("user")
     .schema(
@@ -1883,6 +1902,32 @@ describe("store.query() with where", () => {
     });
   });
 
+  test("queries by single-field function index metadata", async () => {
+    const store = createStore(engine, [buildUserV1WithNormalizedEmailIndex()]);
+
+    await store.user.create("u1", {
+      id: "u1",
+      name: "Sam",
+      email: "Sam@Example.com",
+    });
+    await store.user.create("u2", {
+      id: "u2",
+      name: "Other",
+      email: "Other@Example.com",
+    });
+
+    const results = await store.user.query({
+      where: { email: "Sam@Example.com" },
+    });
+
+    expect(results.documents).toHaveLength(1);
+    expect(results.documents[0]).toEqual({
+      id: "u1",
+      name: "Sam",
+      email: "Sam@Example.com",
+    });
+  });
+
   test("works with FieldCondition operators", async () => {
     const store = createStore(engine, [buildUserV1()]);
 
@@ -2141,6 +2186,16 @@ describe("store.query() with where", () => {
     expect(
       store.user.query({
         where: { lastName: { $begins: "Sm" }, role: "member" },
+      }),
+    ).rejects.toThrow('Composite "where" only supports exact field equality');
+  });
+
+  test("throws when single-field function metadata where uses FieldCondition values", async () => {
+    const store = createStore(engine, [buildUserV1WithNormalizedEmailIndex()]);
+
+    expect(
+      store.user.query({
+        where: { email: { $begins: "sam@" } },
       }),
     ).rejects.toThrow('Composite "where" only supports exact field equality');
   });
