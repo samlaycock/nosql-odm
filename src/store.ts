@@ -1657,22 +1657,33 @@ class BoundModelImpl<
       (idx) => typeof idx.value === "string" && idx.value === field,
     );
 
-    if (!matchingIndex) {
-      const indexedFields = this.model.indexes
-        .filter((idx) => typeof idx.value === "string")
-        .map((idx) => idx.value as string);
-
-      throw new Error(
-        `No index found for field "${field}". Indexed fields: ${
-          indexedFields.length > 0
-            ? indexedFields.join(", ")
-            : "(none — all indexes use custom functions)"
-        }. ` + `For function-based indexes, use { index: "...", filter: { value: ... } } instead.`,
-      );
+    if (matchingIndex) {
+      // Use the storage key for the engine, not the query name
+      return { index: matchingIndex.key, filter: { value } };
     }
 
-    // Use the storage key for the engine, not the query name
-    return { index: matchingIndex.key, filter: { value } };
+    const hasMetadataMatch = this.model.indexes.some(
+      (index) =>
+        typeof index.name === "string" &&
+        index.fields !== undefined &&
+        hasSameFieldSet(index.fields, fields),
+    );
+
+    if (hasMetadataMatch) {
+      return this.resolveCompositeWhere(where, fields);
+    }
+
+    const indexedFields = this.model.indexes
+      .filter((idx) => typeof idx.value === "string")
+      .map((idx) => idx.value as string);
+
+    throw new Error(
+      `No index found for field "${field}". Indexed fields: ${
+        indexedFields.length > 0
+          ? indexedFields.join(", ")
+          : "(none — all indexes use custom functions)"
+      }. ` + `For function-based indexes, use { index: "...", filter: { value: ... } } instead.`,
+    );
   }
 
   private resolveCompositeWhere(

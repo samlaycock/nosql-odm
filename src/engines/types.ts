@@ -171,8 +171,10 @@ export interface QueryParams {
 
 /**
  * Field-level filter for `where` queries. Single-field lookups resolve from
- * string-backed indexes. Multi-field lookups require composite index metadata
- * and use exact field equality semantics.
+ * string-backed indexes, or from static indexes with matching `fields`
+ * metadata when exact field equality is enough to compute the stored value.
+ * Multi-field lookups require composite index metadata and use exact field
+ * equality semantics.
  */
 export type WhereFilter = Record<string, string | number | FieldCondition>;
 

@@ -646,6 +646,7 @@ const allUsers = await store.user.query({});
 
 - Cannot be combined with `index`/`filter`.
 - Single-field `where` works with indexes whose `value` is a field name string.
+- Single-field `where` can also use a static function-valued index when it declares matching `fields` metadata; these lookups use exact equality semantics only.
 - Multi-field `where` works when a static index declares matching `fields` metadata.
 - Multi-field `where` uses exact equality semantics only (plain values or `$eq`).
 - Dynamic-name indexes still require `index` + `filter`.
@@ -702,6 +703,30 @@ If you declare `fields` metadata, `where` can resolve that composite index autom
 ```ts
 const smithMembers = await store.user.query({
   where: { role: "member", lastName: "Smith" },
+});
+```
+
+The same metadata can also make a single-field function-valued index reachable through `where`:
+
+```ts
+const User = model("user")
+  .schema(
+    1,
+    z.object({
+      id: z.string(),
+      email: z.email(),
+    }),
+  )
+  .index({ name: "primary", value: "id" })
+  .index({
+    name: "byNormalizedEmail",
+    fields: ["email"],
+    value: (u) => u.email.toLowerCase(),
+  })
+  .build();
+
+await store.user.query({
+  where: { email: "Sam@Example.com" },
 });
 ```
 
