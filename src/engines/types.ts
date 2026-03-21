@@ -170,8 +170,9 @@ export interface QueryParams {
 }
 
 /**
- * Field-level filter for `where` queries. Exactly one key (the field name)
- * mapping to a plain value (shorthand for $eq) or a FieldCondition.
+ * Field-level filter for `where` queries. Single-field lookups resolve from
+ * string-backed indexes. Multi-field lookups require composite index metadata
+ * and use exact field equality semantics.
  */
 export type WhereFilter = Record<string, string | number | FieldCondition>;
 

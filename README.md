@@ -644,9 +644,11 @@ const allUsers = await store.user.query({});
 
 `where` rules:
 
-- Must contain exactly one field.
 - Cannot be combined with `index`/`filter`.
-- Works with indexes whose `value` is a field name string (for function-based indexes, use `index` + `filter`).
+- Single-field `where` works with indexes whose `value` is a field name string.
+- Multi-field `where` works when a static index declares matching `fields` metadata.
+- Multi-field `where` uses exact equality semantics only (plain values or `$eq`).
+- Dynamic-name indexes still require `index` + `filter`.
 
 Supported filter operators:
 
@@ -676,7 +678,11 @@ const User = model("user")
   .index({ name: "primary", value: "id" })
   .index({ name: "byEmail", value: "email" })
   .index({ name: "byCreatedAt", value: "createdAt" })
-  .index({ name: "byRoleLastName", value: (u) => `${u.role}#${u.lastName.toLowerCase()}` })
+  .index({
+    name: "byRoleLastName",
+    fields: ["role", "lastName"],
+    value: (u) => `${u.role}#${u.lastName.toLowerCase()}`,
+  })
   .build();
 ```
 
@@ -688,6 +694,14 @@ const members = await store.user.query({
   filter: { value: { $begins: "member#" } },
   sort: "asc",
   limit: 25,
+});
+```
+
+If you declare `fields` metadata, `where` can resolve that composite index automatically:
+
+```ts
+const smithMembers = await store.user.query({
+  where: { role: "member", lastName: "Smith" },
 });
 ```
 

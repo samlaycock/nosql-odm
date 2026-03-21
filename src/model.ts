@@ -42,6 +42,11 @@ export interface IndexDefinition<T, TName extends string = string> {
   name: TName;
   value: IndexValue<T>;
   unique?: boolean;
+  /**
+   * Optional metadata used by `where` to resolve multi-field lookups onto a
+   * precomputed composite index.
+   */
+  fields?: readonly (keyof T & string)[];
 }
 
 /**
@@ -160,6 +165,7 @@ interface StoredIndex<T> {
   name: string | ((data: T) => string);
   value: IndexValue<T>;
   unique?: boolean;
+  fields?: readonly string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -530,6 +536,7 @@ class ModelBuilderImpl<
         name: def.name,
         value: def.value,
         unique: def.unique,
+        fields: def.fields ? [...def.fields] : undefined,
       };
     }
 
@@ -575,6 +582,36 @@ class ModelBuilderImpl<
       }
 
       keyCategories.set(index.key, category);
+      this.validateIndexFields(index);
+    }
+  }
+
+  private validateIndexFields(index: StoredIndex<T>): void {
+    const indexIdentifier = typeof index.name === "string" ? index.name : index.key;
+    const fields = index.fields;
+
+    if (!fields) {
+      return;
+    }
+
+    if (fields.length === 0) {
+      throw new Error(
+        `Model "${this.name}" index "${indexIdentifier}" must declare at least one field in "fields" metadata`,
+      );
+    }
+
+    const duplicateFields = findDuplicateStrings(fields);
+
+    if (duplicateFields.length > 0) {
+      throw new Error(
+        `Model "${this.name}" index "${indexIdentifier}" has duplicate "fields" metadata entries: ${duplicateFields.join(", ")}`,
+      );
+    }
+
+    if (typeof index.value === "string" && (fields.length !== 1 || fields[0] !== index.value)) {
+      throw new Error(
+        `Model "${this.name}" index "${indexIdentifier}" uses field value "${index.value}" and must declare matching "fields" metadata`,
+      );
     }
   }
 
@@ -601,6 +638,20 @@ class ModelBuilderImpl<
 
     for (const index of this.indexes) {
       if (typeof index.value !== "string") {
+        const indexIdentifier = typeof index.name === "string" ? index.name : index.key;
+
+        for (const field of index.fields ?? []) {
+          const optionNames = reservedFieldUsages.get(field);
+
+          if (!optionNames) {
+            continue;
+          }
+
+          throw new Error(
+            `Model "${this.name}" index "${indexIdentifier}" composite field metadata references reserved metadata field "${field}" used by ${formatReservedMetadataOptionNames(optionNames)}`,
+          );
+        }
+
         continue;
       }
 
@@ -736,6 +787,22 @@ function resolveIndexValue<T>(value: IndexValue<T>, data: T): string | undefined
   }
 
   return String(fieldValue as string | number | boolean | bigint | symbol);
+}
+
+function findDuplicateStrings(values: readonly string[]): string[] {
+  const seen = new Set<string>();
+  const duplicates = new Set<string>();
+
+  for (const value of values) {
+    if (seen.has(value)) {
+      duplicates.add(value);
+      continue;
+    }
+
+    seen.add(value);
+  }
+
+  return [...duplicates];
 }
 
 function collectReservedMetadataFieldUsages(
