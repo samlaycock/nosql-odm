@@ -546,6 +546,7 @@ class ModelBuilderImpl<
       throw new Error(`Model "${this.name}" must have at least one schema version`);
     }
 
+    this.validateReservedMetadataFields();
     this.validateIndexes();
 
     return new ModelDefinition<T, TOptions, TName, TStaticIndexNames, THasDynamicIndexes>(
@@ -574,6 +575,46 @@ class ModelBuilderImpl<
       }
 
       keyCategories.set(index.key, category);
+    }
+  }
+
+  private validateReservedMetadataFields(): void {
+    const reservedFieldUsages = collectReservedMetadataFieldUsages(this.options);
+
+    for (const schemaVersion of this.versions) {
+      const topLevelFields = extractTopLevelSchemaFields(schemaVersion.shape);
+
+      if (topLevelFields === null) {
+        continue;
+      }
+
+      for (const [fieldName, optionNames] of reservedFieldUsages.entries()) {
+        if (!topLevelFields.has(fieldName)) {
+          continue;
+        }
+
+        throw new Error(
+          `Model "${this.name}" schema version ${schemaVersion.version} defines reserved metadata field "${fieldName}" used by ${formatReservedMetadataOptionNames(optionNames)}`,
+        );
+      }
+    }
+
+    for (const index of this.indexes) {
+      if (typeof index.value !== "string") {
+        continue;
+      }
+
+      const optionNames = reservedFieldUsages.get(index.value);
+
+      if (!optionNames) {
+        continue;
+      }
+
+      const indexIdentifier = typeof index.name === "string" ? index.name : index.key;
+
+      throw new Error(
+        `Model "${this.name}" index "${indexIdentifier}" references reserved metadata field "${index.value}" used by ${formatReservedMetadataOptionNames(optionNames)}`,
+      );
     }
   }
 }
@@ -695,6 +736,109 @@ function resolveIndexValue<T>(value: IndexValue<T>, data: T): string | undefined
   }
 
   return String(fieldValue as string | number | boolean | bigint | symbol);
+}
+
+function collectReservedMetadataFieldUsages(
+  options: Required<ModelOptions>,
+): ReadonlyMap<string, string[]> {
+  const usages = new Map<string, string[]>();
+
+  for (const [optionName, fieldName] of [
+    ["versionField", options.versionField],
+    ["indexesField", options.indexesField],
+  ] as const) {
+    const optionNames = usages.get(fieldName);
+
+    if (optionNames) {
+      optionNames.push(optionName);
+      continue;
+    }
+
+    usages.set(fieldName, [optionName]);
+  }
+
+  return usages;
+}
+
+function formatReservedMetadataOptionNames(optionNames: readonly string[]): string {
+  if (optionNames.length === 1) {
+    return `option "${optionNames[0]}"`;
+  }
+
+  return `options ${optionNames.map((optionName) => `"${optionName}"`).join(", ")}`;
+}
+
+function extractTopLevelSchemaFields(shape: StandardSchemaV1): ReadonlySet<string> | null {
+  const directShape = getObjectPropertyShape(shape);
+
+  if (directShape) {
+    return new Set(Object.keys(directShape));
+  }
+
+  const outputJsonSchema = getOutputJsonSchema(shape);
+  const properties = getJsonSchemaProperties(outputJsonSchema);
+
+  if (properties) {
+    return new Set(Object.keys(properties));
+  }
+
+  return null;
+}
+
+function getObjectPropertyShape(shape: StandardSchemaV1): Record<string, unknown> | null {
+  for (const candidate of [
+    (shape as { shape?: unknown }).shape,
+    (shape as { def?: { shape?: unknown } }).def?.shape,
+    (shape as { _def?: { shape?: unknown } })._def?.shape,
+  ]) {
+    if (isRecord(candidate)) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+function getOutputJsonSchema(shape: StandardSchemaV1): unknown {
+  const standard = shape["~standard"] as StandardSchemaV1["~standard"] & {
+    jsonSchema?: {
+      output?: (options: { target: string }) => unknown;
+    };
+  };
+
+  if (typeof standard.jsonSchema?.output === "function") {
+    try {
+      return standard.jsonSchema.output({ target: "draft-2020-12" });
+    } catch {}
+  }
+
+  const toJsonSchema = (shape as { toJSONSchema?: () => unknown }).toJSONSchema;
+
+  if (typeof toJsonSchema === "function") {
+    try {
+      return toJsonSchema.call(shape);
+    } catch {}
+  }
+
+  return null;
+}
+
+function getJsonSchemaProperties(schema: unknown): Record<string, unknown> | null {
+  if (!isRecord(schema)) {
+    return null;
+  }
+
+  const properties = schema.properties;
+
+  if (!isRecord(properties)) {
+    return null;
+  }
+
+  return properties;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 interface ParsedSemverVersion {
