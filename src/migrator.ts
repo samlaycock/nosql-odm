@@ -1,3 +1,4 @@
+import { mapWithConcurrencyLimit } from "./concurrency";
 import {
   type BatchSetItem,
   type BatchSetResult,
@@ -496,7 +497,7 @@ export class DefaultMigrator<TOptions = Record<string, unknown>> implements Migr
     const skipReasons: Record<string, number> = {};
     const writes: { key: string; migrated: boolean; item: BatchSetItem }[] = [];
 
-    const projectedEntries = await mapWithConcurrency(
+    const projectedEntries = await mapWithConcurrencyLimit(
       page.documents,
       PROJECTION_CONCURRENCY,
       async (entry) => ({
@@ -1048,41 +1049,6 @@ function tunePageSizeHint(
   if (next !== current) {
     run.pageSizeByModel[modelName] = next;
   }
-}
-
-async function mapWithConcurrency<TInput, TOutput>(
-  items: readonly TInput[],
-  concurrency: number,
-  map: (item: TInput, index: number) => Promise<TOutput>,
-): Promise<TOutput[]> {
-  if (items.length === 0) {
-    return [];
-  }
-
-  const normalizedConcurrency = Math.max(1, Math.floor(concurrency));
-  const results = Array.from({ length: items.length }) as TOutput[];
-  let nextIndex = 0;
-
-  // Workers process items out of order, but each result is written back to its
-  // original slot so callers receive a stable, input-ordered array.
-  const workers = Array.from(
-    { length: Math.min(normalizedConcurrency, items.length) },
-    async () => {
-      while (true) {
-        const current = nextIndex;
-        nextIndex += 1;
-
-        if (current >= items.length) {
-          return;
-        }
-
-        results[current] = await map(items[current]!, current);
-      }
-    },
-  );
-
-  await Promise.all(workers);
-  return results;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
