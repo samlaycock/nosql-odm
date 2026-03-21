@@ -290,6 +290,34 @@ describe("builder validation", () => {
     );
   });
 
+  test('throws when composite index "fields" metadata is empty', () => {
+    expect(() => {
+      model("user")
+        .schema(1, z.object({ id: z.string(), role: z.string() }))
+        .index({
+          name: "byRole",
+          fields: [],
+          value: (user) => user.role,
+        })
+        .build();
+    }).toThrow('Model "user" index "byRole" must declare at least one field in "fields" metadata');
+  });
+
+  test('throws when single-field index "fields" metadata does not match the indexed field', () => {
+    expect(() => {
+      model("user")
+        .schema(1, z.object({ id: z.string(), email: z.string() }))
+        .index({
+          name: "byEmail",
+          fields: ["id"],
+          value: "email",
+        })
+        .build();
+    }).toThrow(
+      'Model "user" index "byEmail" uses field value "email" and must declare matching "fields" metadata',
+    );
+  });
+
   test("throws when a schema defines the default reserved metadata fields", () => {
     expect(() => {
       model("user")

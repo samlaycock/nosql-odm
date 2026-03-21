@@ -141,6 +141,26 @@ function buildUserV1WithOptionalUniqueEmail() {
     .build();
 }
 
+function buildUserV1WithRoleLastNameIndex() {
+  return model("user")
+    .schema(
+      1,
+      z.object({
+        id: z.string(),
+        email: z.email(),
+        role: z.enum(["admin", "member", "guest"]),
+        lastName: z.string(),
+      }),
+    )
+    .index({ name: "primary", value: "id" })
+    .index({
+      name: "byRoleLastName",
+      fields: ["role", "lastName"],
+      value: (user) => `${user.role}#${user.lastName.toLowerCase()}`,
+    })
+    .build();
+}
+
 function buildUserV2() {
   return model("user")
     .schema(
@@ -2060,11 +2080,11 @@ describe("store.query() with where", () => {
     ).rejects.toThrow('Cannot use both "index"/"filter" and "where"');
   });
 
-  test("throws when where has multiple fields", async () => {
+  test("throws when where has multiple fields and no matching composite metadata", async () => {
     const store = createStore(engine, [buildUserV1()]);
 
     expect(store.user.query({ where: { email: "a", id: "b" } })).rejects.toThrow(
-      '"where" must contain exactly one field',
+      "No composite index found for fields",
     );
   });
 
@@ -2074,6 +2094,55 @@ describe("store.query() with where", () => {
     expect(store.user.query({ where: {} })).rejects.toThrow(
       '"where" must contain exactly one field',
     );
+  });
+
+  test("queries by composite field metadata", async () => {
+    const store = createStore(engine, [buildUserV1WithRoleLastNameIndex()]);
+
+    await store.user.create("u1", {
+      id: "u1",
+      email: "sam@example.com",
+      role: "member",
+      lastName: "Smith",
+    });
+    await store.user.create("u2", {
+      id: "u2",
+      email: "other@example.com",
+      role: "member",
+      lastName: "Jones",
+    });
+
+    const results = await store.user.query({
+      where: { lastName: "Smith", role: "member" },
+    });
+
+    expect(results.documents).toHaveLength(1);
+    expect(results.documents[0]).toEqual({
+      id: "u1",
+      email: "sam@example.com",
+      role: "member",
+      lastName: "Smith",
+    });
+  });
+
+  test("throws when composite where has no matching index metadata", async () => {
+    const store = createStore(engine, [buildUserV1WithRoleLastNameIndex()]);
+
+    expect(
+      store.user.query({
+        where: { email: "sam@example.com", role: "member" },
+      }),
+    ).rejects.toThrow("No composite index found for fields");
+  });
+
+  test("throws when composite where uses FieldCondition values", async () => {
+    const store = createStore(engine, [buildUserV1WithRoleLastNameIndex()]);
+
+    expect(
+      store.user.query({
+        where: { lastName: { $begins: "Sm" }, role: "member" },
+      }),
+    ).rejects.toThrow('Composite "where" only supports exact field equality');
   });
 });
 

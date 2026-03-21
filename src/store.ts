@@ -1637,10 +1637,14 @@ class BoundModelImpl<
   } {
     const fields = Object.keys(where);
 
-    if (fields.length !== 1) {
+    if (fields.length === 0) {
       throw new Error(
         `"where" must contain exactly one field, got ${fields.length}: ${fields.join(", ")}`,
       );
+    }
+
+    if (fields.length > 1) {
+      return this.resolveCompositeWhere(where, fields);
     }
 
     const field = fields[0]!;
@@ -1672,6 +1676,149 @@ class BoundModelImpl<
     // Use the storage key for the engine, not the query name
     return { index: matchingIndex.key, filter: { value } };
   }
+
+  private resolveCompositeWhere(
+    where: WhereFilter,
+    fields: readonly string[],
+  ): {
+    index: string;
+    filter: QueryFilter;
+  } {
+    const matchingIndexes = this.model.indexes.filter(
+      (index) =>
+        typeof index.name === "string" &&
+        index.fields !== undefined &&
+        hasSameFieldSet(index.fields, fields),
+    );
+
+    if (matchingIndexes.length === 0) {
+      const available = this.model.indexes
+        .filter(
+          (index) =>
+            typeof index.name === "string" && index.fields !== undefined && index.fields.length > 1,
+        )
+        .map((index) => `${index.key}(${index.fields!.join(", ")})`)
+        .join(", ");
+
+      throw new Error(
+        `No composite index found for fields "${fields.slice().sort().join(", ")}". Available composite indexes: ${
+          available || "(none)"
+        }. Use { index: "...", filter: { value: ... } } when no matching composite metadata exists.`,
+      );
+    }
+
+    if (matchingIndexes.length > 1) {
+      throw new Error(
+        `Multiple composite indexes match fields "${fields.slice().sort().join(", ")}": ${matchingIndexes
+          .map((index) => index.key)
+          .join(", ")}. Use { index: "...", filter: { value: ... } } to disambiguate.`,
+      );
+    }
+
+    const matchingIndex = matchingIndexes[0]!;
+    const queryData: Record<string, unknown> = {};
+
+    for (const field of matchingIndex.fields!) {
+      const exactValue = this.extractCompositeWhereEqualityValue(field, where[field]);
+
+      queryData[field] = exactValue;
+    }
+
+    const resolvedValue = this.resolveCompositeWhereIndexValue(matchingIndex.value, queryData);
+
+    if (resolvedValue === undefined) {
+      throw new Error(
+        `Composite "where" for index "${matchingIndex.key}" did not resolve to an index value. Ensure the index value can be derived from fields: ${matchingIndex.fields!.join(", ")}`,
+      );
+    }
+
+    return {
+      index: matchingIndex.key,
+      filter: { value: resolvedValue },
+    };
+  }
+
+  private extractCompositeWhereEqualityValue(
+    field: string,
+    value: WhereFilter[string] | undefined,
+  ): string | number {
+    if (value === undefined) {
+      throw new Error(`"where.${field}" must have a value`);
+    }
+
+    if (typeof value === "string" || typeof value === "number") {
+      return value;
+    }
+
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      throw new Error(
+        `Composite "where" only supports exact field equality. Field "${field}" must use a plain value or {$eq: ...}.`,
+      );
+    }
+
+    const definedOperators = Object.entries(value).filter(
+      ([, operatorValue]) => operatorValue !== undefined,
+    );
+
+    if (definedOperators.length === 1 && definedOperators[0]![0] === "$eq") {
+      const exactValue = definedOperators[0]![1];
+
+      if (typeof exactValue === "string" || typeof exactValue === "number") {
+        return exactValue;
+      }
+    }
+
+    throw new Error(
+      `Composite "where" only supports exact field equality. Field "${field}" must use a plain value or {$eq: ...}.`,
+    );
+  }
+
+  private resolveCompositeWhereIndexValue(
+    value: string | ((data: T) => string),
+    data: Record<string, unknown>,
+  ): string | undefined {
+    if (typeof value === "function") {
+      const resolved = value(data as T);
+
+      if (resolved === undefined || resolved === null) {
+        return undefined;
+      }
+
+      return resolved;
+    }
+
+    const fieldValue = data[value];
+
+    if (fieldValue === undefined || fieldValue === null) {
+      return undefined;
+    }
+
+    if (typeof fieldValue === "string") {
+      return fieldValue;
+    }
+
+    if (typeof fieldValue === "number") {
+      return String(fieldValue);
+    }
+
+    return undefined;
+  }
+}
+
+function hasSameFieldSet(left: readonly string[], right: readonly string[]): boolean {
+  if (left.length !== right.length) {
+    return false;
+  }
+
+  const rightSet = new Set(right);
+
+  for (const field of left) {
+    if (!rightSet.has(field)) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 // ---------------------------------------------------------------------------
