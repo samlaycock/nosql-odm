@@ -44,7 +44,8 @@ export interface IndexDefinition<T, TName extends string = string> {
   unique?: boolean;
   /**
    * Optional metadata used by `where` to resolve multi-field lookups onto a
-   * precomputed composite index.
+   * precomputed composite index. When `value` is a function, it must derive
+   * the lookup value entirely from these declared fields.
    */
   fields?: readonly (keyof T & string)[];
 }
