@@ -432,7 +432,41 @@ describe("firestoreEngine unique constraints", () => {
     ).rejects.toBeInstanceOf(EngineUniqueConstraintError);
   });
 
-  test("batchSetWithResult rejects duplicate unique index ownership", async () => {
+  test("batchSet releases previous ownership when unique value changes", async () => {
+    const engine = createEngine();
+
+    await engine.batchSet("users", [
+      {
+        key: "u1",
+        doc: { id: "u1", email: "old@example.com" },
+        indexes: { primary: "u1" },
+        uniqueIndexes: { byEmail: "old@example.com" },
+      },
+    ]);
+
+    await engine.batchSet("users", [
+      {
+        key: "u1",
+        doc: { id: "u1", email: "new@example.com" },
+        indexes: { primary: "u1" },
+        uniqueIndexes: { byEmail: "new@example.com" },
+      },
+    ]);
+
+    return expect(
+      engine.create(
+        "users",
+        "u2",
+        { id: "u2", email: "old@example.com" },
+        { primary: "u2" },
+        undefined,
+        undefined,
+        { byEmail: "old@example.com" },
+      ),
+    ).resolves.toBeUndefined();
+  });
+
+  test("batchSetWithResult reports unique index ownership conflicts without aborting persisted items", async () => {
     const engine = createEngine();
 
     if (!engine.batchSetWithResult) {
@@ -449,16 +483,31 @@ describe("firestoreEngine unique constraints", () => {
       { byEmail: "sam@example.com" },
     );
 
-    return expect(
-      engine.batchSetWithResult("users", [
-        {
-          key: "u2",
-          doc: { id: "u2", email: "sam@example.com" },
-          indexes: { primary: "u2" },
-          uniqueIndexes: { byEmail: "sam@example.com" },
-        },
-      ]),
-    ).rejects.toBeInstanceOf(EngineUniqueConstraintError);
+    const result = await engine.batchSetWithResult("users", [
+      {
+        key: "u2",
+        doc: { id: "u2", email: "fresh@example.com" },
+        indexes: { primary: "u2" },
+        uniqueIndexes: { byEmail: "fresh@example.com" },
+      },
+      {
+        key: "u3",
+        doc: { id: "u3", email: "sam@example.com" },
+        indexes: { primary: "u3" },
+        uniqueIndexes: { byEmail: "sam@example.com" },
+      },
+    ]);
+
+    expect(result).toEqual({
+      persistedKeys: ["u2"],
+      conflictedKeys: ["u3"],
+    });
+    expect(await engine.get("users", "u2")).toEqual({
+      id: "u2",
+      email: "fresh@example.com",
+    });
+
+    return expect(await engine.get("users", "u3")).toBeNull();
   });
 
   test("batchSetWithResult reports stale-token conflicts before unique checks", async () => {

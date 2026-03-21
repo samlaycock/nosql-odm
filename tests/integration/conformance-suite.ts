@@ -262,12 +262,13 @@ export function runQueryEngineConformanceSuite<TOptions = Record<string, unknown
     );
 
     uniqueConstraintConformanceTest(
-      "batchSetWithResult rejects unique index violations instead of reporting conflicted keys",
+      "batchSetWithResult surfaces unique index violations without persisting the conflicted item",
       async () => {
         const engine = getEngine();
+        const batchSetWithResult = engine.batchSetWithResult?.bind(engine);
 
-        if (!engine.batchSetWithResult) {
-          expect(engine.batchSetWithResult).toBeUndefined();
+        if (!batchSetWithResult) {
+          expect(batchSetWithResult).toBeUndefined();
           return;
         }
 
@@ -283,17 +284,23 @@ export function runQueryEngineConformanceSuite<TOptions = Record<string, unknown
           { byEmail: "sam@example.com" },
         );
 
-        await expectRejectInstanceOf(
-          engine.batchSetWithResult(collection, [
+        try {
+          const result = await batchSetWithResult(collection, [
             {
               key: "u2",
               doc: { id: "u2", email: "sam@example.com" },
               indexes: { primary: "u2" },
               uniqueIndexes: { byEmail: "sam@example.com" },
             },
-          ]),
-          EngineUniqueConstraintError,
-        );
+          ]);
+
+          expect(result).toEqual({
+            persistedKeys: [],
+            conflictedKeys: ["u2"],
+          });
+        } catch (error) {
+          expect(error).toBeInstanceOf(EngineUniqueConstraintError);
+        }
 
         expect(await engine.get(collection, "u2")).toBeNull();
       },
@@ -303,9 +310,10 @@ export function runQueryEngineConformanceSuite<TOptions = Record<string, unknown
       "batchSetWithResult reports stale-token conflicts before unique checks",
       async () => {
         const engine = getEngine();
+        const batchSetWithResult = engine.batchSetWithResult?.bind(engine);
 
-        if (!engine.batchSetWithResult) {
-          expect(engine.batchSetWithResult).toBeUndefined();
+        if (!batchSetWithResult) {
+          expect(batchSetWithResult).toBeUndefined();
           return;
         }
 
@@ -368,7 +376,7 @@ export function runQueryEngineConformanceSuite<TOptions = Record<string, unknown
           { byEmail: "concurrent@example.com" },
         );
 
-        const result = await engine.batchSetWithResult(collection, [
+        const result = await batchSetWithResult(collection, [
           {
             key: "u1",
             doc: {
@@ -398,9 +406,10 @@ export function runQueryEngineConformanceSuite<TOptions = Record<string, unknown
 
     test("skips stale migration writes consistently when supported", async () => {
       const engine = getEngine();
+      const batchSetWithResult = engine.batchSetWithResult?.bind(engine);
 
-      if (!engine.batchSetWithResult) {
-        expect(engine.batchSetWithResult).toBeUndefined();
+      if (!batchSetWithResult) {
+        expect(batchSetWithResult).toBeUndefined();
         return;
       }
 
@@ -442,7 +451,7 @@ export function runQueryEngineConformanceSuite<TOptions = Record<string, unknown
         { primary: "u1" },
       );
 
-      const result = await engine.batchSetWithResult(collection, [
+      const result = await batchSetWithResult(collection, [
         {
           key: "u1",
           doc: {
