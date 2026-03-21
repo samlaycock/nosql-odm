@@ -289,6 +289,92 @@ describe("builder validation", () => {
       'Model "user" has duplicate index key "tenantIdx_v1" shared by a static index name and a dynamic index key',
     );
   });
+
+  test("throws when a schema defines the default reserved metadata fields", () => {
+    expect(() => {
+      model("user")
+        .schema(
+          1,
+          z.object({
+            id: z.string(),
+            __v: z.number(),
+          }),
+        )
+        .build();
+    }).toThrow(
+      'Model "user" schema version 1 defines reserved metadata field "__v" used by option "versionField"',
+    );
+
+    expect(() => {
+      model("user")
+        .schema(
+          1,
+          z.object({
+            id: z.string(),
+            __indexes: z.array(z.string()),
+          }),
+        )
+        .build();
+    }).toThrow(
+      'Model "user" schema version 1 defines reserved metadata field "__indexes" used by option "indexesField"',
+    );
+  });
+
+  test("throws when a schema defines custom reserved metadata fields", () => {
+    expect(() => {
+      model("user", { versionField: "versionTag", indexesField: "indexTags" })
+        .schema(1, z.object({ id: z.string() }))
+        .schema(
+          2,
+          z.object({
+            id: z.string(),
+            versionTag: z.number(),
+          }),
+          {
+            migrate(old) {
+              return old;
+            },
+          },
+        )
+        .build();
+    }).toThrow(
+      'Model "user" schema version 2 defines reserved metadata field "versionTag" used by option "versionField"',
+    );
+
+    expect(() => {
+      model("user", { versionField: "versionTag", indexesField: "indexTags" })
+        .schema(
+          1,
+          z.object({
+            id: z.string(),
+            indexTags: z.array(z.string()),
+          }),
+        )
+        .build();
+    }).toThrow(
+      'Model "user" schema version 1 defines reserved metadata field "indexTags" used by option "indexesField"',
+    );
+  });
+
+  test("throws when a static index reads a reserved metadata field", () => {
+    expect(() => {
+      model("user", { versionField: "versionTag", indexesField: "indexTags" })
+        .schema(1, z.object({ id: z.string(), email: z.string() }))
+        .index({ name: "byVersion", value: "versionTag" as never })
+        .build();
+    }).toThrow(
+      'Model "user" index "byVersion" references reserved metadata field "versionTag" used by option "versionField"',
+    );
+
+    expect(() => {
+      model("user")
+        .schema(1, z.object({ id: z.string(), email: z.string() }))
+        .index({ name: "byIndexes", value: "__indexes" as never })
+        .build();
+    }).toThrow(
+      'Model "user" index "byIndexes" references reserved metadata field "__indexes" used by option "indexesField"',
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------
