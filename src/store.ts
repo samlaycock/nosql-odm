@@ -749,27 +749,27 @@ class BoundModelImpl<
       throw new DuplicateBatchSetKeysError(this.model.name, duplicateKeyConflicts);
     }
 
-    const prepared: {
-      key: string;
-      validated: T;
-      doc: Record<string, unknown> | PreparedDocument;
-      indexes: Record<string, string>;
-      uniqueIndexes: Record<string, string>;
-      migrationMetadata: MigrationDocumentMetadata;
-    }[] = [];
+    const preparedResults = await Promise.allSettled(
+      items.map(async (item) => {
+        const validated = await this.model.validate(item.data);
 
-    for (const item of items) {
-      const validated = await this.model.validate(item.data);
+        return {
+          key: item.key,
+          validated,
+          doc: this.stamp(validated as object, item.key),
+          indexes: this.model.resolveIndexKeys(validated),
+          uniqueIndexes: this.model.resolveUniqueIndexKeys(validated),
+          migrationMetadata: this.currentMigrationMetadata(),
+        };
+      }),
+    );
+    const prepared = preparedResults.map((result) => {
+      if (result.status !== "fulfilled") {
+        throw result.reason;
+      }
 
-      prepared.push({
-        key: item.key,
-        validated,
-        doc: this.stamp(validated as object, item.key),
-        indexes: this.model.resolveIndexKeys(validated),
-        uniqueIndexes: this.model.resolveUniqueIndexKeys(validated),
-        migrationMetadata: this.currentMigrationMetadata(),
-      });
-    }
+      return result.value;
+    });
 
     try {
       await this.withUniqueConstraintGuard(
