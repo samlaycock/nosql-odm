@@ -332,6 +332,12 @@ interface ReadProjectionTracker {
   completedKeys: string[];
 }
 
+interface BatchValidationTracker {
+  inFlight: number;
+  maxInFlight: number;
+  completedKeys: string[];
+}
+
 function createReadProjectionTracker(): ReadProjectionTracker {
   return {
     inFlight: 0,
@@ -379,6 +385,39 @@ function buildTrackedUserV2(
     tracker.inFlight -= 1;
 
     return originalProjectToLatest(doc);
+  };
+
+  return trackedModel;
+}
+
+function buildBatchValidationTrackedUserV1(
+  tracker: BatchValidationTracker,
+  microtaskTurnsByKey: Record<string, number>,
+): ModelDefinition<
+  {
+    id: string;
+    name: string;
+    email: string;
+  },
+  Record<string, unknown>,
+  "user",
+  "primary" | "byEmail",
+  false
+> {
+  const trackedModel = buildUserV1();
+  const originalValidate = trackedModel.validate.bind(trackedModel);
+
+  trackedModel.validate = async (data) => {
+    const key = String((data as { id: string }).id);
+    tracker.inFlight += 1;
+    tracker.maxInFlight = Math.max(tracker.maxInFlight, tracker.inFlight);
+
+    await waitForMicrotasks(microtaskTurnsByKey[key] ?? 1);
+
+    tracker.completedKeys.push(key);
+    tracker.inFlight -= 1;
+
+    return originalValidate(data);
   };
 
   return trackedModel;
@@ -772,6 +811,31 @@ describe("unique indexes", () => {
     );
 
     expect(calls).toHaveLength(0);
+  });
+
+  test("validates batchSet documents concurrently while preserving result order", async () => {
+    const tracker: BatchValidationTracker = {
+      inFlight: 0,
+      maxInFlight: 0,
+      completedKeys: [],
+    };
+    const store = createStore(engine, [
+      buildBatchValidationTrackedUserV1(tracker, {
+        u1: 3,
+        u2: 2,
+        u3: 1,
+      }),
+    ]);
+
+    const results = await store.user.batchSet([
+      { key: "u1", data: { id: "u1", name: "Sam", email: "sam@example.com" } },
+      { key: "u2", data: { id: "u2", name: "Jamie", email: "jamie@example.com" } },
+      { key: "u3", data: { id: "u3", name: "Casey", email: "casey@example.com" } },
+    ]);
+
+    expect(results.map((doc) => doc.id)).toEqual(["u1", "u2", "u3"]);
+    expect(tracker.completedKeys).toEqual(["u3", "u2", "u1"]);
+    expect(tracker.maxInFlight).toBeGreaterThan(1);
   });
 
   test("batchSet runs unique pre-check queries in parallel", async () => {
