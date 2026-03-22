@@ -838,6 +838,41 @@ describe("unique indexes", () => {
     expect(tracker.maxInFlight).toBeGreaterThan(1);
   });
 
+  test("batchSet reports the first validation error by input order when failures race", async () => {
+    const tracker: BatchValidationTracker = {
+      inFlight: 0,
+      maxInFlight: 0,
+      completedKeys: [],
+    };
+    const store = createStore(engine, [
+      buildBatchValidationTrackedUserV1(tracker, {
+        u1: 3,
+        u2: 2,
+        u3: 1,
+      }),
+    ]);
+
+    let error: unknown = null;
+
+    try {
+      await store.user.batchSet([
+        { key: "u1", data: { id: "u1", name: "Sam", email: "invalid-email" } },
+        { key: "u2", data: { id: "u2", name: "Jamie", email: "jamie@example.com" } },
+        { key: "u3", data: { id: "u3", name: 42 as never, email: "casey@example.com" } },
+      ]);
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toBeInstanceOf(ValidationError);
+    expect((error as ValidationError).issues[0]?.path).toEqual(["email"]);
+    expect(tracker.completedKeys).toEqual(["u3", "u2", "u1"]);
+    expect(tracker.maxInFlight).toBeGreaterThan(1);
+    expect(await store.user.findByKey("u1")).toBeNull();
+    expect(await store.user.findByKey("u2")).toBeNull();
+    expect(await store.user.findByKey("u3")).toBeNull();
+  });
+
   test("batchSet runs unique pre-check queries in parallel", async () => {
     const precheck: UniquePrecheckTracker = {
       inFlight: 0,
