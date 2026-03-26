@@ -45,6 +45,32 @@ export interface MigrationModelProgress {
   readonly skipped: number;
   readonly pages: number;
   readonly skipReasons: Record<string, number>;
+  readonly telemetry: MigrationModelTelemetry;
+}
+
+export interface MigrationPageTelemetry {
+  readonly startedAt: number;
+  readonly completedAt: number;
+  readonly durationMs: number;
+  readonly processedRecords: number;
+  readonly persistedRecords: number;
+  readonly migratedRecords: number;
+  readonly skippedRecords: number;
+  readonly writebackFailures: number;
+  readonly recordsPerSecond: number;
+  readonly skipReasons: Record<string, number>;
+}
+
+export interface MigrationModelTelemetry {
+  readonly totalDurationMs: number;
+  readonly averagePageDurationMs: number;
+  readonly processedRecords: number;
+  readonly persistedRecords: number;
+  readonly migratedRecords: number;
+  readonly skippedRecords: number;
+  readonly writebackFailures: number;
+  readonly recordsPerSecond: number;
+  readonly recentPages: readonly MigrationPageTelemetry[];
 }
 
 export interface MigrationRunProgress {
@@ -74,6 +100,7 @@ export interface MigrationNextPageResult {
   readonly migrated: number;
   readonly skipped: number;
   readonly skipReasons?: Record<string, number>;
+  readonly telemetry?: MigrationPageTelemetry;
   readonly completed: boolean;
   readonly hasMore: boolean;
   readonly progress: MigrationRunProgress | null;
@@ -123,6 +150,7 @@ export interface MigrationPageCommittedEvent {
   readonly skipped: number;
   readonly cursor: string | null;
   readonly hasMore: boolean;
+  readonly telemetry: MigrationPageTelemetry;
 }
 
 export interface MigrationCompletedEvent {
@@ -169,6 +197,32 @@ interface PersistedMigrationModelProgress {
   skipped: number;
   pages: number;
   skipReasons: Record<string, number>;
+  telemetry: PersistedMigrationModelTelemetry;
+}
+
+interface PersistedMigrationPageTelemetry {
+  startedAt: number;
+  completedAt: number;
+  durationMs: number;
+  processedRecords: number;
+  persistedRecords: number;
+  migratedRecords: number;
+  skippedRecords: number;
+  writebackFailures: number;
+  recordsPerSecond: number;
+  skipReasons: Record<string, number>;
+}
+
+interface PersistedMigrationModelTelemetry {
+  totalDurationMs: number;
+  averagePageDurationMs: number;
+  processedRecords: number;
+  persistedRecords: number;
+  migratedRecords: number;
+  skippedRecords: number;
+  writebackFailures: number;
+  recordsPerSecond: number;
+  recentPages: PersistedMigrationPageTelemetry[];
 }
 
 interface PersistedMigrationRun {
@@ -194,6 +248,7 @@ const MAX_MIGRATION_PAGE_SIZE = 500;
 const PROJECTION_CONCURRENCY = 8;
 const FAST_PAGE_MS = 500;
 const SLOW_PAGE_MS = 2000;
+const MAX_RECENT_TELEMETRY_PAGES = 25;
 
 export class MigrationScopeConflictError extends NosqlOdmError<
   typeof ERROR_CODES.MIGRATION_SCOPE_CONFLICT
@@ -378,9 +433,22 @@ export class DefaultMigrator<TOptions = Record<string, unknown>> implements Migr
 
         const pageStartedAt = Date.now();
         const result = await this.migrateDocuments(run, modelName, context, page);
+        const pageTelemetry = createPageTelemetry(
+          pageStartedAt,
+          Date.now(),
+          page.documents.length,
+          {
+            migrated: result.migrated,
+            skipped: result.skipped,
+            persistedRecords: result.persistedRecords,
+            writebackFailures: result.writebackFailures,
+            skipReasons: result.skipReasons,
+          },
+        );
+        recordPageTelemetry(run, modelName, pageTelemetry);
         tunePageSizeHint(run, modelName, {
           fetchedCount: page.documents.length,
-          durationMs: Date.now() - pageStartedAt,
+          durationMs: pageTelemetry.durationMs,
           hadMore: page.cursor !== null,
           conflictCount: result.skipReasons.concurrent_write ?? 0,
         });
@@ -405,6 +473,7 @@ export class DefaultMigrator<TOptions = Record<string, unknown>> implements Migr
             migrated: result.migrated,
             skipped: result.skipped,
             skipReasons: hasKeys(result.skipReasons) ? result.skipReasons : undefined,
+            telemetry: pageTelemetry,
             completed: true,
             hasMore: false,
             progress: null,
@@ -421,6 +490,7 @@ export class DefaultMigrator<TOptions = Record<string, unknown>> implements Migr
           skipped: result.skipped,
           cursor: run.cursor,
           hasMore: true,
+          telemetry: pageTelemetry,
         });
 
         return {
@@ -429,6 +499,7 @@ export class DefaultMigrator<TOptions = Record<string, unknown>> implements Migr
           migrated: result.migrated,
           skipped: result.skipped,
           skipReasons: hasKeys(result.skipReasons) ? result.skipReasons : undefined,
+          telemetry: pageTelemetry,
           completed: false,
           hasMore: true,
           progress,
@@ -490,6 +561,8 @@ export class DefaultMigrator<TOptions = Record<string, unknown>> implements Migr
   ): Promise<{
     migrated: number;
     skipped: number;
+    persistedRecords: number;
+    writebackFailures: number;
     skipReasons: Record<string, number>;
   }> {
     let migrated = 0;
@@ -538,6 +611,8 @@ export class DefaultMigrator<TOptions = Record<string, unknown>> implements Migr
 
     let persistedKeys: Set<string> | null = null;
     let conflictedKeys: Set<string> = new Set();
+    let persistedRecords = 0;
+    let writebackFailures = 0;
 
     if (writes.length > 0) {
       const persisted = await context.persist(writes.map((entry) => entry.item));
@@ -546,6 +621,9 @@ export class DefaultMigrator<TOptions = Record<string, unknown>> implements Migr
       if (normalized) {
         persistedKeys = new Set(normalized.persistedKeys);
         conflictedKeys = new Set(normalized.conflictedKeys);
+        persistedRecords = normalized.persistedKeys.filter(
+          (key) => !conflictedKeys.has(key),
+        ).length;
       }
 
       const attemptedKeys = writes.map((write) => write.key);
@@ -568,6 +646,7 @@ export class DefaultMigrator<TOptions = Record<string, unknown>> implements Migr
         // A write conflict means someone updated the document after it was read
         // for migration; count it as skipped so the next run can retry safely.
         skipped += 1;
+        writebackFailures += 1;
         skipReasons.concurrent_write = (skipReasons.concurrent_write ?? 0) + 1;
         await this.runHook("onDocumentSkipped", {
           runId: run.id,
@@ -579,6 +658,7 @@ export class DefaultMigrator<TOptions = Record<string, unknown>> implements Migr
       }
 
       if (persistedKeys && !persistedKeys.has(write.key)) {
+        writebackFailures += 1;
         continue;
       }
 
@@ -606,6 +686,8 @@ export class DefaultMigrator<TOptions = Record<string, unknown>> implements Migr
       migrated,
       skipped,
       skipReasons,
+      persistedRecords,
+      writebackFailures,
     };
   }
 
@@ -762,6 +844,7 @@ function createRun(scope: MigrationScope): PersistedMigrationRun {
       skipped: 0,
       pages: 0,
       skipReasons: {},
+      telemetry: createEmptyModelTelemetry(),
     };
   }
 
@@ -793,9 +876,80 @@ function ensureModelProgress(
     skipped: 0,
     pages: 0,
     skipReasons: {},
+    telemetry: createEmptyModelTelemetry(),
   };
   run.progressByModel[modelName] = created;
   return created;
+}
+
+function createEmptyModelTelemetry(): PersistedMigrationModelTelemetry {
+  return {
+    totalDurationMs: 0,
+    averagePageDurationMs: 0,
+    processedRecords: 0,
+    persistedRecords: 0,
+    migratedRecords: 0,
+    skippedRecords: 0,
+    writebackFailures: 0,
+    recordsPerSecond: 0,
+    recentPages: [],
+  };
+}
+
+function createPageTelemetry(
+  startedAt: number,
+  completedAt: number,
+  processedRecords: number,
+  stats: {
+    migrated: number;
+    skipped: number;
+    persistedRecords: number;
+    writebackFailures: number;
+    skipReasons: Record<string, number>;
+  },
+): PersistedMigrationPageTelemetry {
+  const durationMs = Math.max(0, completedAt - startedAt);
+  const recordsPerSecond =
+    durationMs > 0 ? Number(((processedRecords * 1000) / durationMs).toFixed(2)) : 0;
+
+  return {
+    startedAt,
+    completedAt,
+    durationMs,
+    processedRecords,
+    persistedRecords: stats.persistedRecords,
+    migratedRecords: stats.migrated,
+    skippedRecords: stats.skipped,
+    writebackFailures: stats.writebackFailures,
+    recordsPerSecond,
+    skipReasons: structuredClone(stats.skipReasons),
+  };
+}
+
+function recordPageTelemetry(
+  run: PersistedMigrationRun,
+  modelName: string,
+  pageTelemetry: PersistedMigrationPageTelemetry,
+): void {
+  const current = ensureModelProgress(run, modelName);
+  const telemetry = current.telemetry;
+  telemetry.totalDurationMs += pageTelemetry.durationMs;
+  telemetry.processedRecords += pageTelemetry.processedRecords;
+  telemetry.persistedRecords += pageTelemetry.persistedRecords;
+  telemetry.migratedRecords += pageTelemetry.migratedRecords;
+  telemetry.skippedRecords += pageTelemetry.skippedRecords;
+  telemetry.writebackFailures += pageTelemetry.writebackFailures;
+  telemetry.averagePageDurationMs =
+    current.pages > 0 ? Number((telemetry.totalDurationMs / current.pages).toFixed(2)) : 0;
+  telemetry.recordsPerSecond =
+    telemetry.totalDurationMs > 0
+      ? Number(((telemetry.processedRecords * 1000) / telemetry.totalDurationMs).toFixed(2))
+      : 0;
+  telemetry.recentPages.push(pageTelemetry);
+
+  if (telemetry.recentPages.length > MAX_RECENT_TELEMETRY_PAGES) {
+    telemetry.recentPages.splice(0, telemetry.recentPages.length - MAX_RECENT_TELEMETRY_PAGES);
+  }
 }
 
 function toProgress(run: PersistedMigrationRun, running: boolean): MigrationRunProgress {
@@ -834,6 +988,7 @@ function placeholderProgress(scope: MigrationScope, startedAt: number): Migratio
       skipped: 0,
       pages: 0,
       skipReasons: {},
+      telemetry: createEmptyModelTelemetry(),
     };
   }
 
@@ -924,6 +1079,7 @@ function parseRun(raw: string): PersistedMigrationRun {
       skipped: readFiniteInteger(rawProgress, "skipped", "migration run state model progress"),
       pages: readFiniteInteger(rawProgress, "pages", "migration run state model progress"),
       skipReasons,
+      telemetry: parseModelTelemetry(rawProgress.telemetry),
     };
   }
 
@@ -959,6 +1115,73 @@ function parseRun(raw: string): PersistedMigrationRun {
     updatedAt,
     progressByModel,
     pageSizeByModel,
+  };
+}
+
+function parseModelTelemetry(raw: unknown): PersistedMigrationModelTelemetry {
+  if (raw === undefined) {
+    return createEmptyModelTelemetry();
+  }
+
+  if (!isRecord(raw)) {
+    throw new Error("Migration run state has invalid model telemetry");
+  }
+
+  const recentPagesRaw = raw.recentPages;
+
+  if (!Array.isArray(recentPagesRaw)) {
+    throw new Error("Migration run state has invalid recent page telemetry");
+  }
+
+  return {
+    totalDurationMs: readFiniteNumber(raw, "totalDurationMs", "migration model telemetry"),
+    averagePageDurationMs: readFiniteNumber(
+      raw,
+      "averagePageDurationMs",
+      "migration model telemetry",
+    ),
+    processedRecords: readFiniteInteger(raw, "processedRecords", "migration model telemetry"),
+    persistedRecords: readFiniteInteger(raw, "persistedRecords", "migration model telemetry"),
+    migratedRecords: readFiniteInteger(raw, "migratedRecords", "migration model telemetry"),
+    skippedRecords: readFiniteInteger(raw, "skippedRecords", "migration model telemetry"),
+    writebackFailures: readFiniteInteger(raw, "writebackFailures", "migration model telemetry"),
+    recordsPerSecond: readFiniteNumber(raw, "recordsPerSecond", "migration model telemetry"),
+    recentPages: recentPagesRaw.map((page) => parsePageTelemetry(page)),
+  };
+}
+
+function parsePageTelemetry(raw: unknown): PersistedMigrationPageTelemetry {
+  if (!isRecord(raw)) {
+    throw new Error("Migration run state has invalid page telemetry");
+  }
+
+  const skipReasonsRaw = raw.skipReasons;
+
+  if (!isRecord(skipReasonsRaw)) {
+    throw new Error("Migration run state has invalid telemetry skip reasons");
+  }
+
+  const skipReasons: Record<string, number> = {};
+
+  for (const [reason, rawCount] of Object.entries(skipReasonsRaw)) {
+    if (typeof rawCount !== "number" || !Number.isFinite(rawCount) || rawCount < 0) {
+      throw new Error("Migration run state has invalid telemetry skip reason counts");
+    }
+
+    skipReasons[reason] = rawCount;
+  }
+
+  return {
+    startedAt: readFiniteInteger(raw, "startedAt", "migration page telemetry"),
+    completedAt: readFiniteInteger(raw, "completedAt", "migration page telemetry"),
+    durationMs: readFiniteNumber(raw, "durationMs", "migration page telemetry"),
+    processedRecords: readFiniteInteger(raw, "processedRecords", "migration page telemetry"),
+    persistedRecords: readFiniteInteger(raw, "persistedRecords", "migration page telemetry"),
+    migratedRecords: readFiniteInteger(raw, "migratedRecords", "migration page telemetry"),
+    skippedRecords: readFiniteInteger(raw, "skippedRecords", "migration page telemetry"),
+    writebackFailures: readFiniteInteger(raw, "writebackFailures", "migration page telemetry"),
+    recordsPerSecond: readFiniteNumber(raw, "recordsPerSecond", "migration page telemetry"),
+    skipReasons,
   };
 }
 
@@ -1070,6 +1293,16 @@ function readFiniteInteger(record: Record<string, unknown>, key: string, context
 
   if (typeof value !== "number" || !Number.isFinite(value) || Math.floor(value) !== value) {
     throw new Error(`Invalid ${context}: expected finite integer at "${key}"`);
+  }
+
+  return value;
+}
+
+function readFiniteNumber(record: Record<string, unknown>, key: string, context: string): number {
+  const value = record[key];
+
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new Error(`Invalid ${context}: expected finite number at "${key}"`);
   }
 
   return value;

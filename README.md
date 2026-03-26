@@ -1017,6 +1017,12 @@ Returned shape:
 - `migrated`: number of documents successfully moved/reindexed in this page
 - `skipped`: number of documents skipped in this page
 - `skipReasons`: optional per-reason counts for skipped docs
+- `telemetry`: per-page timing/throughput snapshot:
+  - `durationMs`
+  - `recordsPerSecond`
+  - `writebackFailures`
+  - `processedRecords`, `persistedRecords`, `migratedRecords`, `skippedRecords`
+  - `skipReasons` for this page
 - `completed`: whether the run finished in this call
 - `hasMore`: whether more work remains
 - `progress`: current run progress snapshot, or `null` when completed
@@ -1066,7 +1072,16 @@ Progress includes:
 - `startedAt`, `updatedAt`
 - `running`
 - `totals`: aggregate migrated/skipped
-- `progressByModel[model]`: `{ migrated, skipped, pages, skipReasons }`
+- `progressByModel[model]`: `{ migrated, skipped, pages, skipReasons, telemetry }`
+
+Per-model telemetry includes:
+
+- `totalDurationMs`
+- `averagePageDurationMs`
+- `recordsPerSecond`
+- `processedRecords`, `persistedRecords`, `migratedRecords`, `skippedRecords`
+- `writebackFailures`
+- `recentPages`: rolling page history (latest 25 pages) with per-page durations, throughput, writeback failures, and skip-reason histograms
 
 `getMigrationStatus()` (model API only) returns raw engine migration status for that collection lock/checkpoint:
 
@@ -1109,6 +1124,14 @@ const store = createStore(engine, [User], {
     onMigrationCreated: ({ progress }) => {
       console.log("created", progress.id);
     },
+    onPageCommitted: ({ runId, model, telemetry }) => {
+      console.log("page", runId, model, {
+        durationMs: telemetry.durationMs,
+        recordsPerSecond: telemetry.recordsPerSecond,
+        writebackFailures: telemetry.writebackFailures,
+        skipReasons: telemetry.skipReasons,
+      });
+    },
     onDocumentMigrated: ({ runId, model, key }) => {
       console.log("migrated", runId, model, key);
     },
@@ -1116,7 +1139,12 @@ const store = createStore(engine, [User], {
       console.warn("skipped", runId, model, key, reason, error);
     },
     onMigrationCompleted: ({ progress }) => {
-      console.log("completed", progress.id, progress.totals);
+      console.log(
+        "completed",
+        progress.id,
+        progress.totals,
+        progress.progressByModel.user.telemetry,
+      );
     },
     onMigrationFailed: ({ runId, error, progress }) => {
       console.error("failed", runId, error, progress);
@@ -1132,11 +1160,41 @@ Available hooks:
 - `onPageClaimed`
 - `onDocumentMigrated`
 - `onDocumentSkipped`
+- `onDocumentsPersisted`
 - `onPageCommitted`
 - `onMigrationCompleted`
 - `onMigrationFailed`
 
 Hook errors are intentionally swallowed so observability code cannot break migration execution.
+
+Example telemetry log output:
+
+```ts
+const page = await store.user.migrateNextPage();
+
+if (page.telemetry) {
+  console.info("migration-page", {
+    model: page.model,
+    durationMs: page.telemetry.durationMs,
+    recordsPerSecond: page.telemetry.recordsPerSecond,
+    writebackFailures: page.telemetry.writebackFailures,
+    skipReasons: page.telemetry.skipReasons,
+  });
+}
+
+const progress = await store.user.getMigrationProgress();
+const recentPages = progress?.progressByModel.user.telemetry.recentPages ?? [];
+
+console.table(
+  recentPages.map((entry) => ({
+    startedAt: new Date(entry.startedAt).toISOString(),
+    durationMs: entry.durationMs,
+    recordsPerSecond: entry.recordsPerSecond,
+    writebackFailures: entry.writebackFailures,
+    skipReasons: JSON.stringify(entry.skipReasons),
+  })),
+);
+```
 
 ### 11. Migrator selection and overriding
 
