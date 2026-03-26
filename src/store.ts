@@ -25,8 +25,10 @@ import { ERROR_CODES, NosqlOdmError } from "./errors";
 import {
   DefaultMigrator,
   type MigrationHooks,
+  type MigrationModelTelemetry,
   type MigrationModelContext,
   type MigrationNextPageResult,
+  type MigrationPageTelemetry,
   type MigrationRunOptions,
   type MigrationRunProgress,
   type Migrator,
@@ -37,7 +39,9 @@ import { ModelDefinition } from "./model";
 
 export type {
   MigrationHooks,
+  MigrationModelTelemetry,
   MigrationNextPageResult,
+  MigrationPageTelemetry,
   MigrationRunOptions,
   MigrationRunProgress,
   Migrator,

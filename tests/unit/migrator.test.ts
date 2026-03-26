@@ -2,7 +2,12 @@ import { beforeEach, describe, expect, test } from "bun:test";
 import * as z from "zod";
 
 import { memoryEngine, type MemoryQueryEngine } from "../../src/engines/memory";
-import { createStore, MigrationScopeConflictError, MissingMigratorError } from "../../src/store";
+import {
+  createStore,
+  MigrationScopeConflictError,
+  MissingMigratorError,
+  type MigrationRunProgress,
+} from "../../src/store";
 
 function buildUserV2() {
   return model("user")
@@ -199,6 +204,119 @@ describe("paged migration API", () => {
     expect(observed[1]?.pageSizeHint).toBeGreaterThan(0);
     expect(observed[1]?.skipMetadataSyncHint).toBe(true);
     expect(observed[1]?.cursor).toBeDefined();
+  });
+
+  test("migrateNextPage surfaces telemetry in page results, progress snapshots, and hooks", async () => {
+    await seedUsers(engine, 150);
+
+    await engine.put(
+      "user",
+      "u0000",
+      { __v: 1, id: "u0000", name: "Broken Zero", email: "not-an-email" },
+      { primary: "u0000" },
+    );
+    await engine.put(
+      "user",
+      "u0100",
+      { __v: 1, id: "u0100", name: "Broken Hundred", email: "not-an-email" },
+      { primary: "u0100" },
+    );
+
+    const originalGetOutdated = engine.migration.getOutdated.bind(engine.migration);
+    engine.migration.getOutdated = async (collection, criteria, cursor) => {
+      await Bun.sleep(15);
+      return originalGetOutdated(collection, criteria, cursor);
+    };
+    const originalBatchSet = engine.batchSet.bind(engine);
+    engine.batchSet = async (collection, items) => {
+      await Bun.sleep(15);
+      return originalBatchSet(collection, items);
+    };
+
+    const pageCommittedEvents: Array<{
+      model: string;
+      telemetry: {
+        durationMs: number;
+        recordsPerSecond: number;
+        writebackFailures: number;
+        skipReasons: Record<string, number>;
+      };
+    }> = [];
+    let completedProgress: MigrationRunProgress | null = null;
+
+    const store = createStore(engine, [buildUserV2()], {
+      migrationHooks: {
+        onPageCommitted(event) {
+          pageCommittedEvents.push({
+            model: event.model,
+            telemetry: {
+              durationMs: event.telemetry.durationMs,
+              recordsPerSecond: event.telemetry.recordsPerSecond,
+              writebackFailures: event.telemetry.writebackFailures,
+              skipReasons: event.telemetry.skipReasons,
+            },
+          });
+        },
+        onMigrationCompleted(event) {
+          completedProgress = event.progress;
+        },
+      },
+    });
+
+    const first = await store.user.migrateNextPage();
+    expect(first.status).toBe("processed");
+    expect(first.telemetry).toBeDefined();
+    const firstTelemetry = first.telemetry!;
+    expect(firstTelemetry.durationMs).toBeGreaterThanOrEqual(15);
+    expect(firstTelemetry.recordsPerSecond).toBeGreaterThan(0);
+    expect(firstTelemetry.writebackFailures).toBe(0);
+    expect(firstTelemetry.skipReasons).toEqual({ validation_error: 1 });
+
+    const progress = await store.user.getMigrationProgress();
+    expect(progress).not.toBeNull();
+    const userProgress = progress?.progressByModel.user;
+    expect(userProgress).toBeDefined();
+    const userTelemetry = userProgress!.telemetry;
+    expect(userTelemetry.totalDurationMs).toBeGreaterThanOrEqual(15);
+    expect(userTelemetry.recordsPerSecond).toBeGreaterThan(0);
+    expect(userTelemetry.writebackFailures).toBe(0);
+    expect(userTelemetry.recentPages).toHaveLength(1);
+    expect(userTelemetry.recentPages[0]?.skipReasons).toEqual({
+      validation_error: 1,
+    });
+
+    const second = await store.user.migrateNextPage();
+    expect(second.status).toBe("completed");
+    expect(second.telemetry).toBeDefined();
+    const secondTelemetry = second.telemetry!;
+    expect(secondTelemetry.durationMs).toBeGreaterThanOrEqual(15);
+    expect(secondTelemetry.skipReasons.validation_error).toBeGreaterThanOrEqual(1);
+
+    expect(pageCommittedEvents).toHaveLength(1);
+    expect(pageCommittedEvents[0]).toEqual({
+      model: "user",
+      telemetry: {
+        durationMs: firstTelemetry.durationMs,
+        recordsPerSecond: firstTelemetry.recordsPerSecond,
+        writebackFailures: 0,
+        skipReasons: { validation_error: 1 },
+      },
+    });
+
+    expect(completedProgress).not.toBeNull();
+    const completedUserProgress = completedProgress!.progressByModel.user;
+    expect(completedUserProgress).toBeDefined();
+    const completedTelemetry = completedUserProgress!.telemetry;
+    expect(completedTelemetry.totalDurationMs).toBeGreaterThanOrEqual(
+      firstTelemetry.durationMs + secondTelemetry.durationMs,
+    );
+    expect(completedTelemetry.recordsPerSecond).toBeGreaterThan(0);
+    expect(completedTelemetry.writebackFailures).toBe(0);
+    expect(completedTelemetry.recentPages).toHaveLength(2);
+    expect(completedTelemetry.recentPages[0]?.skipReasons.validation_error).toBe(1);
+    expect(completedTelemetry.recentPages[1]?.skipReasons.validation_error).toBeGreaterThanOrEqual(
+      1,
+    );
   });
 });
 
