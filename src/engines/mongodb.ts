@@ -1,6 +1,13 @@
 import { DefaultMigrator } from "../migrator";
 import { getPreparedClone, prepareDocumentForStorage } from "./document-preparation";
 import {
+  encodeQueryPageCursor,
+  resolveQueryPageCursorPosition,
+  resolveQueryPageStartIndex,
+  type QueryCursorPosition,
+  type QueryCursorRecordPosition,
+} from "./query-cursor";
+import {
   type BatchSetResult,
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
@@ -333,7 +340,7 @@ export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine
       const records = await listCollectionDocuments(documentsCollection, collection);
       const matched = matchDocuments(records, params);
 
-      return paginate(matched, params);
+      return paginate(collection, matched, params);
     },
 
     async queryWithMetadata(collection, params) {
@@ -358,7 +365,7 @@ export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine
       const records = await listCollectionDocuments(documentsCollection, collection);
       const matched = matchDocuments(records, params);
 
-      return paginateWithWriteTokens(matched, params);
+      return paginateWithWriteTokens(collection, matched, params);
     },
 
     async batchGet(collection, keys) {
@@ -1083,21 +1090,19 @@ async function queryDocumentsNative(
   let queryFilter = plan.filter;
 
   if (params.cursor) {
-    const cursorRaw = await documentsCollection.findOne({
-      collection: plan.collection,
-      key: params.cursor,
-    });
+    const cursorPosition = resolveQueryPageCursorPosition(plan.collection, params);
 
-    if (cursorRaw) {
-      const cursorRecord = parseStoredDocumentRecord(cursorRaw);
-      const cursorPredicate = buildMongoCursorPredicate(cursorRecord, plan, params);
+    if (!cursorPosition) {
+      throw new Error("Invalid query cursor");
+    }
 
-      if (cursorPredicate) {
-        queryFilter = {
-          ...queryFilter,
-          ...cursorPredicate,
-        };
-      }
+    const cursorPredicate = buildMongoCursorPredicate(cursorPosition, plan, params);
+
+    if (cursorPredicate) {
+      queryFilter = {
+        ...queryFilter,
+        ...cursorPredicate,
+      };
     }
   }
 
@@ -1123,7 +1128,14 @@ async function queryDocumentsNative(
 
   return {
     records,
-    cursor: hasMore && records.length > 0 ? records[records.length - 1]!.key : null,
+    cursor:
+      hasMore && records.length > 0
+        ? encodeQueryPageCursor(
+            plan.collection,
+            params,
+            getQueryCursorRecordPosition(records[records.length - 1]!, params),
+          )
+        : null,
   };
 }
 
@@ -1260,55 +1272,75 @@ function escapeMongoRegex(value: string): string {
 }
 
 function buildMongoCursorPredicate(
-  cursorRecord: StoredDocumentRecord,
+  cursorPosition: QueryCursorPosition,
   plan: MongoNativeQueryPlan,
   params: QueryParams,
 ): Record<string, unknown> | null {
-  const cursorIndexValue = cursorRecord.indexes[plan.indexName];
-
-  if (cursorIndexValue === undefined || !matchesFilter(cursorIndexValue, params.filter!.value)) {
-    return null;
-  }
-
   if (!params.sort) {
+    if (cursorPosition.kind !== "scan") {
+      throw new Error("Query cursor no longer points to a valid result");
+    }
+
     return {
       $or: [
         {
           createdAt: {
-            $gt: cursorRecord.createdAt,
+            $gt: cursorPosition.createdAt,
           },
         },
         {
-          createdAt: cursorRecord.createdAt,
+          createdAt: cursorPosition.createdAt,
           key: {
-            $gt: cursorRecord.key,
+            $gt: cursorPosition.key,
           },
         },
       ],
     };
   }
 
+  if (cursorPosition.kind !== "sorted-index") {
+    throw new Error("Query cursor no longer points to a valid result");
+  }
+
   const indexField = `indexes.${plan.indexName}`;
   const primaryOp = params.sort === "desc" ? "$lt" : "$gt";
+
+  if (cursorPosition.createdAt === undefined) {
+    return {
+      $or: [
+        {
+          [indexField]: {
+            [primaryOp]: cursorPosition.indexValue,
+          },
+        },
+        {
+          [indexField]: cursorPosition.indexValue,
+          key: {
+            $gt: cursorPosition.key,
+          },
+        },
+      ],
+    };
+  }
 
   return {
     $or: [
       {
         [indexField]: {
-          [primaryOp]: cursorIndexValue,
+          [primaryOp]: cursorPosition.indexValue,
         },
       },
       {
-        [indexField]: cursorIndexValue,
+        [indexField]: cursorPosition.indexValue,
         createdAt: {
-          $gt: cursorRecord.createdAt,
+          $gt: cursorPosition.createdAt,
         },
       },
       {
-        [indexField]: cursorIndexValue,
-        createdAt: cursorRecord.createdAt,
+        [indexField]: cursorPosition.indexValue,
+        createdAt: cursorPosition.createdAt,
         key: {
-          $gt: cursorRecord.key,
+          $gt: cursorPosition.key,
         },
       },
     ],
@@ -2009,17 +2041,17 @@ function matchDocuments(
   return results;
 }
 
-function paginate(records: StoredDocumentRecord[], params: QueryParams): EngineQueryResult {
-  let startIndex = 0;
-
-  if (params.cursor) {
-    const cursorIndex = records.findIndex((record) => record.key === params.cursor);
-
-    if (cursorIndex !== -1) {
-      startIndex = cursorIndex + 1;
-    }
-  }
-
+function paginate(
+  collection: string,
+  records: StoredDocumentRecord[],
+  params: QueryParams,
+): EngineQueryResult {
+  const startIndex = resolveQueryPageStartIndex(
+    records,
+    collection,
+    params,
+    getQueryCursorRecordPosition,
+  );
   const normalizedLimit = normalizeLimit(params.limit);
   const limit = normalizedLimit ?? records.length;
   const hasLimit = normalizedLimit !== null;
@@ -2034,7 +2066,11 @@ function paginate(records: StoredDocumentRecord[], params: QueryParams): EngineQ
   const page = records.slice(startIndex, startIndex + limit);
   const cursor =
     page.length > 0 && hasLimit && startIndex + limit < records.length
-      ? page[page.length - 1]!.key
+      ? encodeQueryPageCursor(
+          collection,
+          params,
+          getQueryCursorRecordPosition(page[page.length - 1]!, params),
+        )
       : null;
 
   return {
@@ -2047,19 +2083,16 @@ function paginate(records: StoredDocumentRecord[], params: QueryParams): EngineQ
 }
 
 function paginateWithWriteTokens(
+  collection: string,
   records: StoredDocumentRecord[],
   params: QueryParams,
 ): EngineQueryResult {
-  let startIndex = 0;
-
-  if (params.cursor) {
-    const cursorIndex = records.findIndex((record) => record.key === params.cursor);
-
-    if (cursorIndex !== -1) {
-      startIndex = cursorIndex + 1;
-    }
-  }
-
+  const startIndex = resolveQueryPageStartIndex(
+    records,
+    collection,
+    params,
+    getQueryCursorRecordPosition,
+  );
   const normalizedLimit = normalizeLimit(params.limit);
   const limit = normalizedLimit ?? records.length;
   const hasLimit = normalizedLimit !== null;
@@ -2074,7 +2107,11 @@ function paginateWithWriteTokens(
   const page = records.slice(startIndex, startIndex + limit);
   const cursor =
     page.length > 0 && hasLimit && startIndex + limit < records.length
-      ? page[page.length - 1]!.key
+      ? encodeQueryPageCursor(
+          collection,
+          params,
+          getQueryCursorRecordPosition(page[page.length - 1]!, params),
+        )
       : null;
 
   return {
@@ -2084,6 +2121,17 @@ function paginateWithWriteTokens(
       writeToken: String(record.writeVersion),
     })),
     cursor,
+  };
+}
+
+function getQueryCursorRecordPosition(
+  record: StoredDocumentRecord,
+  params: QueryParams,
+): QueryCursorRecordPosition {
+  return {
+    key: record.key,
+    createdAt: record.createdAt,
+    indexValue: params.index ? (record.indexes[params.index] ?? "") : undefined,
   };
 }
 
