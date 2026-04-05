@@ -91,8 +91,14 @@ export interface MongoDbEngineOptions {
   documentsCollection?: string;
   metadataCollection?: string;
   /**
+   * When true, query/queryWithMetadata may fall back to an in-memory
+   * collection scan when a native MongoDB plan is unavailable.
+   */
+  allowFallbackCollectionScans?: boolean;
+  /**
    * When true, indexed queries with unsupported filter operators throw instead
-   * of silently falling back to an in-memory collection scan.
+   * of using the in-memory collection scan fallback, even when fallback scans
+   * are enabled.
    */
   rejectUnsupportedQueries?: boolean;
   /**
@@ -157,6 +163,7 @@ interface OutdatedCursorState {
 
 export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine {
   const database = options.database;
+  const allowFallbackCollectionScans = options.allowFallbackCollectionScans === true;
   const rejectUnsupportedQueries = options.rejectUnsupportedQueries === true;
   const onQueryFallbackScan = options.onQueryFallbackScan;
   const documentsCollection = database.collection(
@@ -329,6 +336,7 @@ export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine
       }
 
       handleMongoQueryFallback({
+        allowFallbackCollectionScans,
         collection,
         params,
         operation: "query",
@@ -354,6 +362,7 @@ export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine
       }
 
       handleMongoQueryFallback({
+        allowFallbackCollectionScans,
         collection,
         params,
         operation: "queryWithMetadata",
@@ -1000,6 +1009,7 @@ type MongoIndexFilterResolution =
     };
 
 interface HandleMongoQueryFallbackParams {
+  allowFallbackCollectionScans: boolean;
   collection: string;
   params: QueryParams;
   operation: "query" | "queryWithMetadata";
@@ -1020,6 +1030,10 @@ function handleMongoQueryFallback(params: HandleMongoQueryFallbackParams): void 
     console.error("[nosql-odm] onQueryFallbackScan threw", error);
   }
 
+  if (!params.allowFallbackCollectionScans) {
+    throw createMongoQueryFallbackError(params);
+  }
+
   if (params.reason === "unsupported_filter" && params.rejectUnsupportedQueries) {
     throw new Error(
       `MongoDB cannot push down unsupported query filters for index "${
@@ -1027,6 +1041,20 @@ function handleMongoQueryFallback(params: HandleMongoQueryFallbackParams): void 
       }"`,
     );
   }
+}
+
+function createMongoQueryFallbackError(params: HandleMongoQueryFallbackParams): Error {
+  if (params.reason === "unsupported_filter") {
+    return new Error(
+      `MongoDB cannot push down unsupported query filters for index "${
+        params.params.index ?? "(unknown)"
+      }". Set allowFallbackCollectionScans: true to permit an in-memory collection scan.`,
+    );
+  }
+
+  return new Error(
+    `MongoDB query requires allowFallbackCollectionScans: true to permit an in-memory collection scan for collection "${params.collection}"`,
+  );
 }
 
 function resolveMongoNativeQueryPlan(

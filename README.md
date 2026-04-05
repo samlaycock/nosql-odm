@@ -308,7 +308,10 @@ await client.connect();
 
 const engine = mongoDbEngine({
   database: client.db("app"),
-  // Optional: fail fast when an indexed filter cannot be pushed down.
+  // Optional: explicitly permit in-memory collection-scan fallback behavior.
+  allowFallbackCollectionScans: true,
+  // Optional: still fail fast on unsupported indexed filters even when
+  // collection-scan fallback is enabled.
   rejectUnsupportedQueries: true,
   // Optional: telemetry hook for in-memory scan fallback usage.
   onQueryFallbackScan(event) {
@@ -329,8 +332,10 @@ Document migration metadata used for outdated-page queries is co-located with ea
 `nosql_odm_metadata` stores migration lock/checkpoint/sequence state.
 
 You can override collection names with `documentsCollection` / `metadataCollection`.
-Set `rejectUnsupportedQueries: true` to throw on unsupported indexed filters instead of silently
-running an in-memory collection scan. Use `onQueryFallbackScan` to instrument fallback scans.
+MongoDB collection-scan fallback is disabled by default. Set
+`allowFallbackCollectionScans: true` to opt into the previous in-memory scan behavior when no
+native query plan is available, and add `rejectUnsupportedQueries: true` if unsupported indexed
+filters should still fail fast. Use `onQueryFallbackScan` to instrument fallback scans.
 
 ## MySQL Engine (`mysql2`)
 
