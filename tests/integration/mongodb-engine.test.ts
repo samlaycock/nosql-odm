@@ -581,25 +581,26 @@ describe("mongoDbEngine integration", () => {
       limit: 1,
     });
 
-    expect(
-      engine.query(collection, {
-        index: "byRole",
-        filter: { value: { $begins: "member#" } },
-        sort: "asc",
-        cursor: "u1",
-        limit: 1,
-      }),
-    ).rejects.toThrow(/cursor/i);
-
-    expect(
-      engine.query(collection, {
-        index: "byRole",
-        filter: { value: { $begins: "admin#" } },
-        sort: "asc",
-        cursor: first.cursor ?? undefined,
-        limit: 1,
-      }),
-    ).rejects.toThrow(/cursor/i);
+    await Promise.all([
+      expect(
+        engine.query(collection, {
+          index: "byRole",
+          filter: { value: { $begins: "member#" } },
+          sort: "asc",
+          cursor: "u1",
+          limit: 1,
+        }),
+      ).rejects.toThrow(/cursor/i),
+      expect(
+        engine.query(collection, {
+          index: "byRole",
+          filter: { value: { $begins: "admin#" } },
+          sort: "asc",
+          cursor: first.cursor ?? undefined,
+          limit: 1,
+        }),
+      ).rejects.toThrow(/cursor/i),
+    ]);
   });
 
   test("query pagination remains stable when the cursor row is deleted", async () => {

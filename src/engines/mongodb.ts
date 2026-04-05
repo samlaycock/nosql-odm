@@ -1090,12 +1090,7 @@ async function queryDocumentsNative(
   let queryFilter = plan.filter;
 
   if (params.cursor) {
-    const cursorPosition = resolveQueryPageCursorPosition(plan.collection, params);
-
-    if (!cursorPosition) {
-      throw new Error("Invalid query cursor");
-    }
-
+    const cursorPosition = resolveQueryPageCursorPosition(plan.collection, params)!;
     const cursorPredicate = buildMongoCursorPredicate(cursorPosition, plan, params);
 
     if (cursorPredicate) {
