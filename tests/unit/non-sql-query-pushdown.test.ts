@@ -539,12 +539,12 @@ describe("non-SQL query pushdown", () => {
     expect(result.documents.map((doc) => doc.key)).toEqual(["u2"]);
   });
 
-  test("mongodb query rejects raw key cursors for native pagination", async () => {
+  test("mongodb query rejects raw key cursors for native pagination", () => {
     const engine = mongoDbEngine({
       database: new FakeMongoDatabase(mongoDocs, mongoMeta),
     });
 
-    expect(
+    return expect(
       engine.query("users", {
         index: "byEmail",
         filter: { value: { $gte: "a@example.com" } },
