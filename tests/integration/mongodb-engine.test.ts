@@ -123,6 +123,7 @@ describe("mongoDbEngine integration", () => {
     collection = nextCollection("users");
     engine = mongoDbEngine({
       database: requireDatabase(),
+      allowFallbackCollectionScans: true,
     });
   });
 
@@ -496,7 +497,7 @@ describe("mongoDbEngine integration", () => {
     expect(second.cursor).toBeNull();
   });
 
-  test("query supports comparison filters and scan behavior", async () => {
+  test("query supports comparison filters and explicit scan behavior", async () => {
     await engine.put(collection, "u1", { id: "u1" }, { byScore: "001" });
     await engine.put(collection, "u2", { id: "u2" }, { byScore: "010" });
     await engine.put(collection, "u3", { id: "u3" }, { byScore: "020" });
@@ -519,6 +520,19 @@ describe("mongoDbEngine integration", () => {
     expect(range.documents.map((item) => item.key)).toEqual(["u2"]);
     expect(between.documents.map((item) => item.key)).toEqual(["u2", "u3"]);
     expect(scan.documents).toHaveLength(3);
+  });
+
+  test("query rejects collection scans by default unless explicitly enabled", async () => {
+    const strictEngine = mongoDbEngine({
+      database: requireDatabase(),
+    });
+
+    await strictEngine.put(collection, "u1", { id: "u1" }, { byScore: "001" });
+
+    await expectReject(
+      strictEngine.query(collection, {}),
+      /allowFallbackCollectionScans|collection scan/i,
+    );
   });
 
   test("query pagination edge cases", async () => {

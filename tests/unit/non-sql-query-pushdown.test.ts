@@ -678,10 +678,9 @@ describe("non-SQL query pushdown", () => {
     expect(result.documents).toEqual([]);
   });
 
-  test("mongodb query can reject unsupported filters instead of scanning", async () => {
+  test("mongodb query rejects unsupported filters by default instead of scanning", async () => {
     const engine = mongoDbEngine({
       database: new FakeMongoDatabase(mongoDocs, mongoMeta),
-      rejectUnsupportedQueries: true,
     } as Parameters<typeof mongoDbEngine>[0]);
     let error: unknown = null;
 
@@ -700,10 +699,28 @@ describe("non-SQL query pushdown", () => {
     expect(mongoDocs.lastFindFilter).toBeNull();
   });
 
-  test("mongodb query reports fallback scans with a hook", async () => {
+  test("mongodb query rejects full scans by default", async () => {
+    const engine = mongoDbEngine({
+      database: new FakeMongoDatabase(mongoDocs, mongoMeta),
+    } as Parameters<typeof mongoDbEngine>[0]);
+    let error: unknown = null;
+
+    try {
+      await engine.query("users", {});
+    } catch (candidate) {
+      error = candidate;
+    }
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toMatch(/allowFallbackCollectionScans|collection scan/i);
+    expect(mongoDocs.lastFindFilter).toBeNull();
+  });
+
+  test("mongodb query can opt into unsupported-filter fallback scans with a hook", async () => {
     const events: Array<Record<string, unknown>> = [];
     const engine = mongoDbEngine({
       database: new FakeMongoDatabase(mongoDocs, mongoMeta),
+      allowFallbackCollectionScans: true,
       onQueryFallbackScan(event) {
         events.push(event as unknown as Record<string, unknown>);
       },
@@ -723,10 +740,11 @@ describe("non-SQL query pushdown", () => {
     });
   });
 
-  test("mongodb query reports full_scan fallback with a hook when no index is provided", async () => {
+  test("mongodb query reports full_scan fallback with a hook when explicitly enabled", async () => {
     const events: Array<Record<string, unknown>> = [];
     const engine = mongoDbEngine({
       database: new FakeMongoDatabase(mongoDocs, mongoMeta),
+      allowFallbackCollectionScans: true,
       onQueryFallbackScan(event) {
         events.push(event as unknown as Record<string, unknown>);
       },
@@ -740,6 +758,9 @@ describe("non-SQL query pushdown", () => {
       collection: "users",
       operation: "query",
       reason: "full_scan",
+    });
+    expect(mongoDocs.lastFindFilter).toEqual({
+      collection: "users",
     });
   });
 
@@ -787,6 +808,7 @@ describe("non-SQL query pushdown", () => {
     const events: Array<Record<string, unknown>> = [];
     const engine = mongoDbEngine({
       database: new FakeMongoDatabase(mongoDocs, mongoMeta),
+      allowFallbackCollectionScans: true,
       onQueryFallbackScan(event) {
         events.push(event as unknown as Record<string, unknown>);
       },
@@ -809,6 +831,28 @@ describe("non-SQL query pushdown", () => {
     });
   });
 
+  test("mongodb query can reject unsupported filters even when fallback scans are enabled", async () => {
+    const engine = mongoDbEngine({
+      database: new FakeMongoDatabase(mongoDocs, mongoMeta),
+      allowFallbackCollectionScans: true,
+      rejectUnsupportedQueries: true,
+    } as Parameters<typeof mongoDbEngine>[0]);
+    let error: unknown = null;
+
+    try {
+      await engine.query("users", {
+        index: "byEmail",
+        filter: { value: { $foo: "bar" } as unknown as Record<string, unknown> },
+      });
+    } catch (candidate) {
+      error = candidate;
+    }
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toMatch(/unsupported/i);
+    expect(mongoDocs.lastFindFilter).toBeNull();
+  });
+
   test("mongodb fallback hook errors do not suppress rejectUnsupportedQueries errors", async () => {
     const originalConsoleError = console.error;
     const logged: unknown[][] = [];
@@ -817,6 +861,7 @@ describe("non-SQL query pushdown", () => {
     };
     const engine = mongoDbEngine({
       database: new FakeMongoDatabase(mongoDocs, mongoMeta),
+      allowFallbackCollectionScans: true,
       rejectUnsupportedQueries: true,
       onQueryFallbackScan() {
         throw new Error("hook failure");
