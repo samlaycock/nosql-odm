@@ -555,6 +555,45 @@ describe("non-SQL query pushdown", () => {
     ).rejects.toThrow(/cursor/i);
   });
 
+  test("mongodb query rejects opaque cursors reused with a different query", async () => {
+    const engine = mongoDbEngine({
+      database: new FakeMongoDatabase(mongoDocs, mongoMeta),
+    });
+    const cursor = encodeQueryPageCursor(
+      "users",
+      {
+        index: "byEmail",
+        filter: { value: { $gte: "a@example.com" } },
+        sort: "asc",
+      },
+      {
+        key: "u1",
+        createdAt: 1,
+        indexValue: "a@example.com",
+      },
+    );
+
+    let error: unknown = null;
+
+    try {
+      await engine.query("users", {
+        index: "byEmail",
+        filter: { value: { $gte: "b@example.com" } },
+        sort: "asc",
+        cursor,
+        limit: 1,
+      });
+    } catch (candidate) {
+      error = candidate;
+    }
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toBe("Query cursor does not match the requested query");
+
+    expect(mongoDocs.lastFindFilter).toBeNull();
+    expect(mongoDocs.findOneCalls).toHaveLength(0);
+  });
+
   test("mongodb query pushes combined between/range filters to backend", async () => {
     const engine = mongoDbEngine({
       database: new FakeMongoDatabase(mongoDocs, mongoMeta),

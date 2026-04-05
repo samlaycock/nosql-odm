@@ -3,11 +3,27 @@ import { describe, expect, test } from "bun:test";
 import { EngineUniqueConstraintError, type QueryEngine } from "../../src/engines/types";
 import { expectRejectInstanceOf } from "./helpers";
 
+interface DecodedQueryCursorPayload {
+  readonly kind: "nosql-odm-query-cursor";
+  readonly version: number;
+  readonly signature: string;
+  readonly position: {
+    readonly kind: string;
+    readonly key: string;
+    readonly createdAt?: number;
+    readonly indexValue?: string;
+  };
+}
+
 interface QueryEngineConformanceSuiteOptions<TOptions = Record<string, unknown>> {
   readonly engineName: string;
   readonly getEngine: () => QueryEngine<TOptions>;
   readonly nextCollection: (prefix: string) => string;
   readonly assertEngineUniqueConstraintConformance?: boolean;
+}
+
+function decodeQueryCursor(cursor: string): DecodedQueryCursorPayload {
+  return JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as DecodedQueryCursorPayload;
 }
 
 export function runQueryEngineConformanceSuite<TOptions = Record<string, unknown>>(
@@ -138,6 +154,72 @@ export function runQueryEngineConformanceSuite<TOptions = Record<string, unknown
       expect(page1.cursor).not.toBeNull();
       expect(page2.documents).toHaveLength(1);
       expect(page2.cursor).toBeNull();
+    });
+
+    test("uses opaque, query-bound cursors that resume correctly after cursor row deletion", async () => {
+      const engine = getEngine();
+      const collection = nextCollection("cursor_users");
+
+      await engine.batchSet(collection, [
+        { key: "u1", doc: { id: "u1" }, indexes: { status: "active" } },
+        { key: "u2", doc: { id: "u2" }, indexes: { status: "active" } },
+        { key: "u3", doc: { id: "u3" }, indexes: { status: "active" } },
+        { key: "u4", doc: { id: "u4" }, indexes: { status: "inactive" } },
+      ]);
+
+      const firstPage = await engine.query(collection, {
+        index: "status",
+        filter: { value: "active" },
+        limit: 2,
+      });
+      const cursor = firstPage.cursor;
+
+      expect(firstPage.documents).toHaveLength(2);
+      expect(cursor).not.toBeNull();
+
+      const decodedCursor = decodeQueryCursor(cursor!);
+      const cursorKey = firstPage.documents[firstPage.documents.length - 1]!.key;
+
+      expect(decodedCursor).toMatchObject({
+        kind: "nosql-odm-query-cursor",
+        position: {
+          kind: "scan",
+          key: cursorKey,
+        },
+      });
+      expect(decodedCursor.signature.length).toBeGreaterThan(0);
+      expect(typeof decodedCursor.position.createdAt).toBe("number");
+
+      let mismatchError: unknown = null;
+
+      try {
+        await engine.query(collection, {
+          index: "status",
+          filter: { value: "inactive" },
+          limit: 2,
+          cursor: cursor!,
+        });
+      } catch (error) {
+        mismatchError = error;
+      }
+
+      expect(mismatchError).toBeInstanceOf(Error);
+      expect((mismatchError as Error).message).toBe(
+        "Query cursor does not match the requested query",
+      );
+
+      await engine.delete(collection, cursorKey);
+
+      const secondPage = await engine.query(collection, {
+        index: "status",
+        filter: { value: "active" },
+        limit: 2,
+        cursor: cursor!,
+      });
+
+      expect(secondPage.documents).toHaveLength(1);
+      expect(secondPage.documents[0]?.key).not.toBe(cursorKey);
+      expect(secondPage.cursor).toBeNull();
     });
 
     uniqueConstraintConformanceTest(
