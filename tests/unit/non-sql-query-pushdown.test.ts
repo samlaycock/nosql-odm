@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, test } from "bun:test";
 import { dynamoDbEngine } from "../../src/engines/dynamodb";
 import { firestoreEngine } from "../../src/engines/firestore";
 import { mongoDbEngine } from "../../src/engines/mongodb";
+import { encodeQueryPageCursor } from "../../src/engines/query-cursor";
 
 type AnyRecord = Record<string, unknown>;
 
@@ -439,29 +440,119 @@ describe("non-SQL query pushdown", () => {
     });
     expect(mongoDocs.lastLimit).toBe(3);
     expect(result.documents.map((doc) => doc.key)).toEqual(["u1", "u2"]);
-    expect(result.cursor).toBe("u2");
+    expect(result.cursor).toBe(
+      encodeQueryPageCursor(
+        "users",
+        {
+          index: "byEmail",
+          filter: { value: { $gte: "a@example.com" } },
+          sort: "asc",
+          limit: 2,
+        },
+        {
+          key: "u2",
+          createdAt: 2,
+          indexValue: "b@example.com",
+        },
+      ),
+    );
   });
 
   test("mongodb query pushes cursor pagination when cursor matches filter", async () => {
     const engine = mongoDbEngine({
       database: new FakeMongoDatabase(mongoDocs, mongoMeta),
     });
+    const cursor = encodeQueryPageCursor(
+      "users",
+      {
+        index: "byEmail",
+        filter: { value: { $gte: "a@example.com" } },
+        sort: "asc",
+      },
+      {
+        key: "u1",
+        createdAt: 1,
+        indexValue: "a@example.com",
+      },
+    );
 
     const result = await engine.query("users", {
       index: "byEmail",
       filter: { value: { $gte: "a@example.com" } },
       sort: "asc",
-      cursor: "u1",
+      cursor,
       limit: 1,
     });
 
-    expect(mongoDocs.findOneCalls).toContainEqual({
-      collection: "users",
-      key: "u1",
-    });
+    expect(mongoDocs.findOneCalls).toHaveLength(0);
     expect(mongoDocs.lastFindFilter && "$or" in mongoDocs.lastFindFilter).toBe(true);
     expect(result.documents.map((doc) => doc.key)).toEqual(["u2"]);
-    expect(result.cursor).toBe("u2");
+    expect(result.cursor).toBe(
+      encodeQueryPageCursor(
+        "users",
+        {
+          index: "byEmail",
+          filter: { value: { $gte: "a@example.com" } },
+          sort: "asc",
+          limit: 1,
+        },
+        {
+          key: "u2",
+          createdAt: 2,
+          indexValue: "b@example.com",
+        },
+      ),
+    );
+  });
+
+  test("mongodb query paginates from opaque cursor after cursor row is deleted", async () => {
+    mongoDocs = new FakeMongoCollection([
+      makeEngineDoc("u2", 2, { byEmail: "b@example.com" }, { id: "u2" }),
+      makeEngineDoc("u3", 3, { byEmail: "c@example.com" }, { id: "u3" }),
+    ]);
+
+    const engine = mongoDbEngine({
+      database: new FakeMongoDatabase(mongoDocs, mongoMeta),
+    });
+    const cursor = encodeQueryPageCursor(
+      "users",
+      {
+        index: "byEmail",
+        filter: { value: { $gte: "a@example.com" } },
+        sort: "asc",
+      },
+      {
+        key: "u1",
+        createdAt: 1,
+        indexValue: "a@example.com",
+      },
+    );
+
+    const result = await engine.query("users", {
+      index: "byEmail",
+      filter: { value: { $gte: "a@example.com" } },
+      sort: "asc",
+      cursor,
+      limit: 1,
+    });
+
+    expect(result.documents.map((doc) => doc.key)).toEqual(["u2"]);
+  });
+
+  test("mongodb query rejects raw key cursors for native pagination", async () => {
+    const engine = mongoDbEngine({
+      database: new FakeMongoDatabase(mongoDocs, mongoMeta),
+    });
+
+    expect(
+      engine.query("users", {
+        index: "byEmail",
+        filter: { value: { $gte: "a@example.com" } },
+        sort: "asc",
+        cursor: "u1",
+        limit: 1,
+      }),
+    ).rejects.toThrow(/cursor/i);
   });
 
   test("mongodb query pushes combined between/range filters to backend", async () => {
@@ -672,7 +763,22 @@ describe("non-SQL query pushdown", () => {
     });
 
     expect(first.documents.map((doc) => doc.key)).toEqual(["u2"]);
-    expect(first.cursor).toBe("u2");
+    expect(first.cursor).toBe(
+      encodeQueryPageCursor(
+        "users",
+        {
+          index: "byEmail",
+          filter: { value: { $between: ["a@example.com", "c@example.com"], $gt: "a@example.com" } },
+          sort: "asc",
+          limit: 1,
+        },
+        {
+          key: "u2",
+          createdAt: 2,
+          indexValue: "b@example.com",
+        },
+      ),
+    );
     expect(second.documents.map((doc) => doc.key)).toEqual(["u3"]);
     expect(second.cursor).toBeNull();
   });

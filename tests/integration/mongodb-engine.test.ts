@@ -19,6 +19,7 @@ import {
   type ComparableVersion,
 } from "../../src";
 import { mongoDbEngine, type MongoDbQueryEngine } from "../../src/engines/mongodb";
+import { encodeQueryPageCursor } from "../../src/engines/query-cursor";
 import { runQueryEngineConformanceSuite } from "./conformance-suite";
 import {
   createCollectionNameFactory,
@@ -475,7 +476,22 @@ describe("mongoDbEngine integration", () => {
     });
 
     expect(first.documents.map((item) => item.key)).toEqual(["u1", "u3"]);
-    expect(first.cursor).toBe("u3");
+    expect(first.cursor).toBe(
+      encodeQueryPageCursor(
+        collection,
+        {
+          index: "byRole",
+          filter: { value: { $begins: "member#" } },
+          sort: "asc",
+          limit: 2,
+        },
+        {
+          key: "u3",
+          createdAt: 3,
+          indexValue: "member#b",
+        },
+      ),
+    );
     expect(second.documents.map((item) => item.key)).toEqual(["u2"]);
     expect(second.cursor).toBeNull();
   });
@@ -531,31 +547,85 @@ describe("mongoDbEngine integration", () => {
       limit: 1.9,
     });
 
-    const unknownCursor = await engine.query(collection, {
-      index: "byRole",
-      filter: { value: { $begins: "member#" } },
-      sort: "asc",
-      cursor: "unknown",
-      limit: 2,
-    });
-
-    const lastCursor = await engine.query(collection, {
-      index: "byRole",
-      filter: { value: { $begins: "member#" } },
-      sort: "asc",
-      cursor: "u3",
-      limit: 2,
-    });
-
     expect(limitZero.documents).toHaveLength(0);
     expect(limitZero.cursor).toBeNull();
     expect(noLimit.documents).toHaveLength(3);
     expect(noLimit.cursor).toBeNull();
     expect(fractional.documents).toHaveLength(1);
-    expect(fractional.cursor).toBe("u1");
-    expect(unknownCursor.documents.map((item) => item.key)).toEqual(["u1", "u2"]);
-    expect(lastCursor.documents).toHaveLength(0);
-    expect(lastCursor.cursor).toBeNull();
+    expect(fractional.cursor).toBe(
+      encodeQueryPageCursor(
+        collection,
+        {
+          index: "byRole",
+          filter: { value: { $begins: "member#" } },
+          sort: "asc",
+          limit: 1.9,
+        },
+        {
+          key: "u1",
+          createdAt: 1,
+          indexValue: "member#a",
+        },
+      ),
+    );
+  });
+
+  test("query rejects raw key cursors and mismatched query cursors", async () => {
+    await engine.put(collection, "u1", { id: "u1" }, { byRole: "member#a" });
+    await engine.put(collection, "u2", { id: "u2" }, { byRole: "member#b" });
+
+    const first = await engine.query(collection, {
+      index: "byRole",
+      filter: { value: { $begins: "member#" } },
+      sort: "asc",
+      limit: 1,
+    });
+
+    expect(
+      engine.query(collection, {
+        index: "byRole",
+        filter: { value: { $begins: "member#" } },
+        sort: "asc",
+        cursor: "u1",
+        limit: 1,
+      }),
+    ).rejects.toThrow(/cursor/i);
+
+    expect(
+      engine.query(collection, {
+        index: "byRole",
+        filter: { value: { $begins: "admin#" } },
+        sort: "asc",
+        cursor: first.cursor ?? undefined,
+        limit: 1,
+      }),
+    ).rejects.toThrow(/cursor/i);
+  });
+
+  test("query pagination remains stable when the cursor row is deleted", async () => {
+    await engine.put(collection, "u1", { id: "u1" }, { byRole: "member#a" });
+    await engine.put(collection, "u2", { id: "u2" }, { byRole: "member#b" });
+    await engine.put(collection, "u3", { id: "u3" }, { byRole: "member#c" });
+
+    const first = await engine.query(collection, {
+      index: "byRole",
+      filter: { value: { $begins: "member#" } },
+      sort: "asc",
+      limit: 1,
+    });
+
+    await engine.delete(collection, "u1");
+
+    const second = await engine.query(collection, {
+      index: "byRole",
+      filter: { value: { $begins: "member#" } },
+      sort: "asc",
+      cursor: first.cursor ?? undefined,
+      limit: 2,
+    });
+
+    expect(second.documents.map((item) => item.key)).toEqual(["u2", "u3"]);
+    expect(second.cursor).toBeNull();
   });
 
   test("migration lock/checkpoint/status semantics", async () => {
