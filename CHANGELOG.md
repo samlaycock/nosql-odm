@@ -1,5 +1,19 @@
 # nosql-odm
 
+## 0.11.0
+
+### Minor Changes
+
+- 5bb44fc: Require MongoDB query fallback collection scans to be explicitly enabled with
+  `allowFallbackCollectionScans`, while keeping `rejectUnsupportedQueries` as an
+  optional stricter guard when scan fallback is enabled.
+
+### Patch Changes
+
+- dab0ceb: Strengthen shared query cursor conformance coverage for opaque payloads,
+  query-bound reuse checks, and deleted-row resume behavior across adapters.
+- 3aba1ff: Fix MongoDB query pagination to use opaque, query-bound cursors across native and fallback execution paths.
+
 ## 0.10.0
 
 ### Minor Changes
