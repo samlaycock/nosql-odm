@@ -9,6 +9,57 @@ interface BulkWriteCall {
   options: Record<string, unknown> | undefined;
 }
 
+class ArrayMongoCursor {
+  private sortedRecords: unknown[];
+  private limitValue: number | null = null;
+
+  constructor(records: unknown[]) {
+    this.sortedRecords = records;
+  }
+
+  sort(sort: Record<string, 1 | -1>) {
+    const entries = Object.entries(sort);
+
+    this.sortedRecords = [...this.sortedRecords].sort((left, right) => {
+      for (const [path, direction] of entries) {
+        const leftValue = readDottedValue(left, path);
+        const rightValue = readDottedValue(right, path);
+
+        if (leftValue === rightValue) {
+          continue;
+        }
+
+        if (leftValue === undefined || leftValue === null) {
+          return direction === 1 ? -1 : 1;
+        }
+
+        if (rightValue === undefined || rightValue === null) {
+          return direction === 1 ? 1 : -1;
+        }
+
+        return leftValue < rightValue ? -direction : direction;
+      }
+
+      return 0;
+    });
+
+    return this;
+  }
+
+  limit(value: number) {
+    this.limitValue = value;
+    return this;
+  }
+
+  async toArray(): Promise<unknown[]> {
+    if (this.limitValue === null) {
+      return [...this.sortedRecords];
+    }
+
+    return this.sortedRecords.slice(0, this.limitValue);
+  }
+}
+
 class EmptyMongoCursor {
   sort(_sort: Record<string, 1 | -1>) {
     return this;
@@ -21,6 +72,69 @@ class EmptyMongoCursor {
   async toArray(): Promise<unknown[]> {
     return [];
   }
+}
+
+function readDottedValue(value: unknown, path: string): unknown {
+  const parts = path.split(".");
+  let current = value;
+
+  for (const part of parts) {
+    if (!current || typeof current !== "object") {
+      return undefined;
+    }
+
+    current = (current as Record<string, unknown>)[part];
+  }
+
+  return current;
+}
+
+function matchesFilter(record: Record<string, unknown>, filter: Record<string, unknown>): boolean {
+  for (const [field, expected] of Object.entries(filter)) {
+    if (field === "$and") {
+      if (!Array.isArray(expected) || expected.some((item) => !matchesNestedFilter(record, item))) {
+        return false;
+      }
+
+      continue;
+    }
+
+    if (field === "$or") {
+      if (
+        !Array.isArray(expected) ||
+        expected.every((item) => !matchesNestedFilter(record, item))
+      ) {
+        return false;
+      }
+
+      continue;
+    }
+
+    const actual = readDottedValue(record, field);
+
+    if (!matchesCondition(actual, expected)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function matchesNestedFilter(record: Record<string, unknown>, filter: unknown): boolean {
+  return !!filter && typeof filter === "object" && matchesFilter(record, filter as AnyRecord);
+}
+
+function matchesCondition(actual: unknown, expected: unknown): boolean {
+  if (!expected || typeof expected !== "object" || Array.isArray(expected)) {
+    return actual === expected;
+  }
+
+  if ("$in" in expected) {
+    const values = (expected as { $in?: unknown }).$in;
+    return Array.isArray(values) && values.includes(actual);
+  }
+
+  return false;
 }
 
 class FakeMongoDocumentsCollection {
@@ -131,6 +245,19 @@ class FakeMongoDocumentsCollection {
     _options?: Record<string, unknown>,
   ) {
     return null;
+  }
+}
+
+class FakeMongoDocumentsCollectionWithRecords extends FakeMongoDocumentsCollection {
+  readonly findCalls: Array<Record<string, unknown>> = [];
+
+  constructor(private readonly records: Array<Record<string, unknown>>) {
+    super();
+  }
+
+  override find(filter: Record<string, unknown>) {
+    this.findCalls.push(filter);
+    return new ArrayMongoCursor(this.records.filter((record) => matchesFilter(record, filter)));
   }
 }
 
@@ -339,5 +466,84 @@ describe("mongodb engine batch operations", () => {
     expect(documents.bulkWriteCalls).toHaveLength(1);
     expect(documents.bulkWriteCalls[0]?.operations).toHaveLength(150);
     expect(documents.deleteOneCalls).toHaveLength(0);
+  });
+
+  test("probeUnique batches values into one MongoDB lookup and groups matching keys", async () => {
+    const documents = new FakeMongoDocumentsCollectionWithRecords([
+      {
+        collection: "users",
+        key: "u1",
+        createdAt: 1,
+        writeVersion: 1,
+        doc: { id: "u1" },
+        indexes: { primary: "u1", byEmail: "sam@example.com" },
+        migrationTargetVersion: 0,
+        migrationVersionState: "current",
+        migrationIndexSignature: null,
+      },
+      {
+        collection: "users",
+        key: "u2",
+        createdAt: 2,
+        writeVersion: 1,
+        doc: { id: "u2" },
+        indexes: { primary: "u2", byEmail: "sam@example.com" },
+        migrationTargetVersion: 0,
+        migrationVersionState: "current",
+        migrationIndexSignature: null,
+      },
+      {
+        collection: "users",
+        key: "u3",
+        createdAt: 3,
+        writeVersion: 1,
+        doc: { id: "u3" },
+        indexes: { primary: "u3", byEmail: "jamie@example.com" },
+        migrationTargetVersion: 0,
+        migrationVersionState: "current",
+        migrationIndexSignature: null,
+      },
+      {
+        collection: "teams",
+        key: "t1",
+        createdAt: 4,
+        writeVersion: 1,
+        doc: { id: "t1" },
+        indexes: { primary: "t1", byEmail: "sam@example.com" },
+        migrationTargetVersion: 0,
+        migrationVersionState: "current",
+        migrationIndexSignature: null,
+      },
+    ]);
+    const metadata = new FakeMongoMetadataCollection();
+    const engine = mongoDbEngine({
+      database: new FakeMongoDatabase(documents, metadata),
+    });
+
+    const matches = await engine.probeUnique!("users", "byEmail", [
+      "sam@example.com",
+      "missing@example.com",
+      "jamie@example.com",
+      "sam@example.com",
+    ]);
+
+    expect(matches).toEqual([
+      {
+        value: "sam@example.com",
+        keys: ["u1", "u2"],
+      },
+      {
+        value: "jamie@example.com",
+        keys: ["u3"],
+      },
+    ]);
+    expect(documents.findCalls).toEqual([
+      {
+        collection: "users",
+        "indexes.byEmail": {
+          $in: ["sam@example.com", "missing@example.com", "jamie@example.com"],
+        },
+      },
+    ]);
   });
 });

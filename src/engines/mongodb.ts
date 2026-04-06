@@ -22,6 +22,7 @@ import {
   type QueryEngine,
   type QueryParams,
   type ResolvedIndexKeys,
+  type UniqueProbeMatch,
 } from "./types";
 
 const DEFAULT_DOCUMENTS_COLLECTION = "nosql_odm_documents";
@@ -375,6 +376,65 @@ export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine
       const matched = matchDocuments(records, params);
 
       return paginateWithWriteTokens(collection, matched, params);
+    },
+
+    async probeUnique(collection, indexName, values) {
+      await ready;
+
+      const uniqueValues = uniqueStrings(values);
+
+      if (uniqueValues.length === 0) {
+        return [];
+      }
+
+      const raws = await documentsCollection
+        .find({
+          collection,
+          [`indexes.${indexName}`]: {
+            $in: uniqueValues,
+          },
+        })
+        .toArray();
+
+      const keysByValue = new Map<string, string[]>();
+
+      for (const value of uniqueValues) {
+        keysByValue.set(value, []);
+      }
+
+      for (const raw of raws) {
+        const record = parseStoredDocumentRecord(raw);
+        const value = record.indexes[indexName];
+
+        if (typeof value !== "string") {
+          continue;
+        }
+
+        const keys = keysByValue.get(value);
+
+        if (!keys) {
+          continue;
+        }
+
+        keys.push(record.key);
+      }
+
+      const matches: UniqueProbeMatch[] = [];
+
+      for (const value of uniqueValues) {
+        const keys = keysByValue.get(value);
+
+        if (!keys || keys.length === 0) {
+          continue;
+        }
+
+        matches.push({
+          value,
+          keys,
+        });
+      }
+
+      return matches;
     },
 
     async batchGet(collection, keys) {
