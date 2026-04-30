@@ -6,7 +6,7 @@ import {
   waitUntilTableExists,
   waitUntilTableNotExists,
 } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, PutCommand } from "@aws-sdk/lib-dynamodb";
+import { DynamoDBDocumentClient, PutCommand, QueryCommand } from "@aws-sdk/lib-dynamodb";
 import {
   afterAll,
   beforeAll,
@@ -91,6 +91,34 @@ async function waitForDynamoDbReady(): Promise<void> {
   );
 }
 
+function encodeDynamoComparable(value: string): string {
+  return Buffer.from(value, "utf8").toString("hex");
+}
+
+async function queryIndexRows(
+  collection: string,
+  indexName: string,
+  prefix: string,
+): Promise<unknown[]> {
+  const response = (await documentClient.send(
+    new QueryCommand({
+      TableName: tableName,
+      IndexName: "query_idx",
+      KeyConditionExpression: "#queryPk = :queryPk AND begins_with(#querySk, :querySkPrefix)",
+      ExpressionAttributeNames: {
+        "#queryPk": "queryPk",
+        "#querySk": "querySk",
+      },
+      ExpressionAttributeValues: {
+        ":queryPk": `QIDX#COL#${collection}#IDX#${encodeDynamoComparable(indexName)}`,
+        ":querySkPrefix": encodeDynamoComparable(prefix),
+      },
+    }),
+  )) as { Items?: unknown[] };
+
+  return response.Items ?? [];
+}
+
 async function createTableForTests(): Promise<void> {
   try {
     await baseClient.send(
@@ -99,6 +127,8 @@ async function createTableForTests(): Promise<void> {
         AttributeDefinitions: [
           { AttributeName: "pk", AttributeType: "S" },
           { AttributeName: "sk", AttributeType: "S" },
+          { AttributeName: "queryPk", AttributeType: "S" },
+          { AttributeName: "querySk", AttributeType: "S" },
           { AttributeName: "migrationOutdatedPk", AttributeType: "S" },
           { AttributeName: "migrationOutdatedSk", AttributeType: "S" },
           { AttributeName: "migrationSyncPk", AttributeType: "S" },
@@ -109,6 +139,16 @@ async function createTableForTests(): Promise<void> {
           { AttributeName: "sk", KeyType: "RANGE" },
         ],
         GlobalSecondaryIndexes: [
+          {
+            IndexName: "query_idx",
+            KeySchema: [
+              { AttributeName: "queryPk", KeyType: "HASH" },
+              { AttributeName: "querySk", KeyType: "RANGE" },
+            ],
+            Projection: {
+              ProjectionType: "ALL",
+            },
+          },
           {
             IndexName: "migration_outdated_idx",
             KeySchema: [
@@ -249,6 +289,24 @@ describe("dynamoDbEngine integration", () => {
       id: "u1",
       name: "Samuel",
     });
+  });
+
+  test("update rewrites query index rows when an indexed value changes", async () => {
+    await engine.create(
+      collection,
+      "u1",
+      { id: "u1", email: "old@example.com" },
+      { byEmail: "old@example.com" },
+    );
+    await engine.update(
+      collection,
+      "u1",
+      { id: "u1", email: "new@example.com" },
+      { byEmail: "new@example.com" },
+    );
+
+    expect(await queryIndexRows(collection, "byEmail", "old@example.com")).toHaveLength(0);
+    expect(await queryIndexRows(collection, "byEmail", "new@example.com")).toHaveLength(1);
   });
 
   test("update throws not-found error when key does not exist", async () => {

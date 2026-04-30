@@ -379,6 +379,12 @@ class FakeDynamoClient {
       return {};
     }
 
+    if (typeof response.name === "string" && typeof response.message === "string") {
+      const error = new Error(response.message) as Error & { name: string };
+      error.name = response.name;
+      throw error;
+    }
+
     return response;
   }
 }
@@ -399,6 +405,30 @@ function makeDynamoDocItem(
     writeVersion: 1,
     doc,
     indexes,
+  };
+}
+
+function encodeDynamoComparable(value: string): string {
+  return Buffer.from(value, "utf8").toString("hex");
+}
+
+function makeDynamoQueryIndexItem(
+  key: string,
+  createdAt: number,
+  indexName: string,
+  indexValue: string,
+) {
+  return {
+    pk: "COL#users",
+    sk: `QIDX#${encodeDynamoComparable(indexName)}#${encodeDynamoComparable(key)}`,
+    itemType: "query_index",
+    collection: "users",
+    key,
+    indexName,
+    indexValue,
+    createdAt,
+    queryPk: `QIDX#COL#users#IDX#${encodeDynamoComparable(indexName)}`,
+    querySk: `${encodeDynamoComparable(indexValue)}#${String(createdAt).padStart(16, "0")}#${encodeDynamoComparable(key)}`,
   };
 }
 
@@ -968,8 +998,50 @@ describe("non-SQL query pushdown", () => {
     expect(db.documentGetCalls).toBe(0);
   });
 
-  test("dynamodb query adds a filter expression for index filters", async () => {
+  test("dynamodb query uses a secondary lookup item query instead of FilterExpression scans", async () => {
     const client = new FakeDynamoClient([
+      {
+        Items: [makeDynamoQueryIndexItem("u2", 1, "byEmail", "alex@example.com")],
+      },
+      {
+        Responses: {
+          tbl: [makeDynamoDocItem("u2", 1, { byEmail: "alex@example.com" }, { id: "u2" })],
+        },
+      },
+    ]);
+    const engine = dynamoDbEngine({
+      client,
+      tableName: "tbl",
+    });
+
+    const result = await engine.query("users", {
+      index: "byEmail",
+      filter: { value: { $begins: "a" } },
+    });
+
+    expect(client.inputs).toHaveLength(2);
+    expect(client.inputs[0]).toMatchObject({
+      IndexName: "query_idx",
+      KeyConditionExpression: "#queryPk = :queryPk AND begins_with(#querySk, :querySkPrefix)",
+      ExpressionAttributeNames: {
+        "#queryPk": "queryPk",
+        "#querySk": "querySk",
+      },
+      ExpressionAttributeValues: {
+        ":queryPk": `QIDX#COL#users#IDX#${encodeDynamoComparable("byEmail")}`,
+        ":querySkPrefix": encodeDynamoComparable("a"),
+      },
+    });
+    expect(client.inputs[0]).not.toHaveProperty("FilterExpression");
+    expect(result.documents.map((doc) => doc.key)).toEqual(["u2"]);
+  });
+
+  test("dynamodb query falls back to collection filtering when the secondary lookup index is unavailable", async () => {
+    const client = new FakeDynamoClient([
+      {
+        name: "ValidationException",
+        message: "The table does not have the specified index: query_idx",
+      },
       {
         Items: [
           makeDynamoDocItem("u1", 2, { byEmail: "sam@example.com" }, { id: "u1" }),
@@ -987,8 +1059,8 @@ describe("non-SQL query pushdown", () => {
       filter: { value: { $begins: "a" } },
     });
 
-    expect(client.inputs).toHaveLength(1);
-    expect(client.inputs[0]).toMatchObject({
+    expect(client.inputs).toHaveLength(2);
+    expect(client.inputs[1]).toMatchObject({
       FilterExpression: "begins_with(#indexes.#indexName, :f_begins)",
       ExpressionAttributeNames: {
         "#indexes": "indexes",

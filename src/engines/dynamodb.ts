@@ -10,6 +10,7 @@ import {
   type BatchGetCommandInput,
   type BatchWriteCommandInput,
   type QueryCommandInput,
+  type TransactWriteCommandInput,
 } from "@aws-sdk/lib-dynamodb";
 
 import { DefaultMigrator } from "../migrator";
@@ -37,9 +38,11 @@ const META_PARTITION_KEY = "META";
 const OUTDATED_PAGE_LIMIT = 100;
 const METADATA_SYNC_CHUNK_SIZE = 100;
 const ITEM_TYPE_DOC = "doc";
+const ITEM_TYPE_QUERY_INDEX = "query_index";
 const ITEM_TYPE_LOCK = "lock";
 const ITEM_TYPE_CHECKPOINT = "checkpoint";
 const ITEM_TYPE_MIGRATION_METADATA = "migration_metadata";
+const QUERY_INDEX = "query_idx";
 const MIGRATION_OUTDATED_INDEX = "migration_outdated_idx";
 const MIGRATION_SYNC_INDEX = "migration_sync_idx";
 const MIGRATION_OUTDATED_KEY_PREFIX = "SIG#";
@@ -54,6 +57,7 @@ export interface DynamoDbEngineOptions {
   tableName: string;
   hashKeyName?: string;
   sortKeyName?: string;
+  queryIndexName?: string;
   migrationOutdatedIndexName?: string;
   migrationSyncIndexName?: string;
 }
@@ -63,6 +67,7 @@ export interface DynamoDbQueryEngine extends QueryEngine<never> {}
 interface DynamoKeyConfig {
   hashKeyName: string;
   sortKeyName: string;
+  queryIndexName: string;
   migrationOutdatedIndexName: string;
   migrationSyncIndexName: string;
 }
@@ -82,6 +87,19 @@ interface StoredDocumentItem {
   writeVersion: number;
   doc: Record<string, unknown>;
   indexes: ResolvedIndexKeys;
+}
+
+interface QueryIndexItem {
+  pk: string;
+  sk: string;
+  itemType: typeof ITEM_TYPE_QUERY_INDEX;
+  collection: string;
+  key: string;
+  indexName: string;
+  indexValue: string;
+  createdAt: number;
+  queryPk: string;
+  querySk: string;
 }
 
 interface LockItem {
@@ -132,10 +150,16 @@ interface OutdatedCursorState {
 type BatchWriteRequest = NonNullable<
   NonNullable<BatchWriteCommandInput["RequestItems"]>[string]
 >[number];
+type TransactWriteItem = NonNullable<TransactWriteCommandInput["TransactItems"]>[number];
 
 function normalizeKeyConfig(options: DynamoDbEngineOptions): DynamoKeyConfig {
   const hashKeyName = normalizeNonEmptyString(options.hashKeyName, "pk", "hashKeyName");
   const sortKeyName = normalizeNonEmptyString(options.sortKeyName, "sk", "sortKeyName");
+  const queryIndexName = normalizeNonEmptyString(
+    options.queryIndexName,
+    QUERY_INDEX,
+    "queryIndexName",
+  );
   const migrationOutdatedIndexName = normalizeNonEmptyString(
     options.migrationOutdatedIndexName,
     MIGRATION_OUTDATED_INDEX,
@@ -154,6 +178,7 @@ function normalizeKeyConfig(options: DynamoDbEngineOptions): DynamoKeyConfig {
   return {
     hashKeyName,
     sortKeyName,
+    queryIndexName,
     migrationOutdatedIndexName,
     migrationSyncIndexName,
   };
@@ -251,14 +276,24 @@ export function dynamoDbEngine(options: DynamoDbEngineOptions): DynamoDbQueryEng
     async create(collection, key, doc, indexes, _options, migrationMetadata) {
       const createdAt = await nextSequence(client, tableName, keyConfig, collection);
       const item = createDocumentItem(collection, key, createdAt, 1, doc, indexes);
+      const queryIndexItems = createQueryIndexItems(collection, key, createdAt, indexes);
       const metadata =
         normalizeMigrationMetadata(migrationMetadata) ?? deriveLegacyMetadataFromDocument(doc);
       const metadataItem = createMigrationMetadataItem(collection, key, metadata);
 
       try {
-        await putDocumentAndMetadata(client, tableName, keyConfig, item, metadataItem, {
-          requireDocumentToNotExist: true,
-        });
+        await putDocumentAndMetadata(
+          client,
+          tableName,
+          keyConfig,
+          item,
+          metadataItem,
+          queryIndexItems,
+          [],
+          {
+            requireDocumentToNotExist: true,
+          },
+        );
       } catch (error) {
         if (isConditionalCheckFailed(error) || isTransactionConditionalCheckFailed(error)) {
           throw new EngineDocumentAlreadyExistsError(collection, key);
@@ -274,11 +309,20 @@ export function dynamoDbEngine(options: DynamoDbEngineOptions): DynamoDbQueryEng
         existing?.createdAt ?? (await nextSequence(client, tableName, keyConfig, collection));
       const writeVersion = (existing?.writeVersion ?? 0) + 1;
       const item = createDocumentItem(collection, key, createdAt, writeVersion, doc, indexes);
+      const queryIndexItems = createQueryIndexItems(collection, key, createdAt, indexes);
       const metadata =
         normalizeMigrationMetadata(migrationMetadata) ?? deriveLegacyMetadataFromDocument(doc);
       const metadataItem = createMigrationMetadataItem(collection, key, metadata);
 
-      await putDocumentAndMetadata(client, tableName, keyConfig, item, metadataItem);
+      await putDocumentAndMetadata(
+        client,
+        tableName,
+        keyConfig,
+        item,
+        metadataItem,
+        queryIndexItems,
+        diffRemovedIndexNames(existing?.indexes, indexes),
+      );
     },
 
     async update(collection, key, doc, indexes, _options, migrationMetadata) {
@@ -296,14 +340,24 @@ export function dynamoDbEngine(options: DynamoDbEngineOptions): DynamoDbQueryEng
         doc,
         indexes,
       );
+      const queryIndexItems = createQueryIndexItems(collection, key, existing.createdAt, indexes);
       const metadata =
         normalizeMigrationMetadata(migrationMetadata) ?? deriveLegacyMetadataFromDocument(doc);
       const metadataItem = createMigrationMetadataItem(collection, key, metadata);
 
       try {
-        await putDocumentAndMetadata(client, tableName, keyConfig, item, metadataItem, {
-          requireDocumentToExist: true,
-        });
+        await putDocumentAndMetadata(
+          client,
+          tableName,
+          keyConfig,
+          item,
+          metadataItem,
+          queryIndexItems,
+          diffRemovedIndexNames(existing.indexes, indexes),
+          {
+            requireDocumentToExist: true,
+          },
+        );
       } catch (error) {
         if (isConditionalCheckFailed(error) || isTransactionConditionalCheckFailed(error)) {
           throw new EngineDocumentNotFoundError(collection, key);
@@ -314,7 +368,15 @@ export function dynamoDbEngine(options: DynamoDbEngineOptions): DynamoDbQueryEng
     },
 
     async delete(collection, key) {
-      await deleteDocumentAndMetadata(client, tableName, keyConfig, collection, key);
+      const existing = await getDocumentItem(client, tableName, keyConfig, collection, key);
+      await deleteDocumentAndMetadata(
+        client,
+        tableName,
+        keyConfig,
+        collection,
+        key,
+        existing ? Object.keys(existing.indexes) : [],
+      );
     },
 
     async query(collection, params) {
@@ -379,6 +441,8 @@ export function dynamoDbEngine(options: DynamoDbEngineOptions): DynamoDbQueryEng
       const writes: Array<{
         docItem: StoredDocumentItem;
         metadataItem: MigrationMetadataItem;
+        queryIndexItems: QueryIndexItem[];
+        removedIndexNames: string[];
       }> = [];
 
       for (const item of items) {
@@ -401,6 +465,8 @@ export function dynamoDbEngine(options: DynamoDbEngineOptions): DynamoDbQueryEng
             item.indexes,
           ),
           metadataItem: createMigrationMetadataItem(collection, item.key, metadata),
+          queryIndexItems: createQueryIndexItems(collection, item.key, createdAt, item.indexes),
+          removedIndexNames: diffRemovedIndexNames(existingRecord?.indexes, item.indexes),
         });
       }
 
@@ -435,11 +501,26 @@ export function dynamoDbEngine(options: DynamoDbEngineOptions): DynamoDbQueryEng
             item.doc,
             item.indexes,
           );
+          const queryIndexItems = createQueryIndexItems(
+            collection,
+            item.key,
+            existingRecord.createdAt,
+            item.indexes,
+          );
 
           try {
-            await putDocumentAndMetadata(client, tableName, keyConfig, docItem, metadataItem, {
-              expectedWriteVersion,
-            });
+            await putDocumentAndMetadata(
+              client,
+              tableName,
+              keyConfig,
+              docItem,
+              metadataItem,
+              queryIndexItems,
+              diffRemovedIndexNames(existingRecord.indexes, item.indexes),
+              {
+                expectedWriteVersion,
+              },
+            );
             persistedKeys.push(item.key);
           } catch (error) {
             if (isConditionalCheckFailed(error) || isTransactionConditionalCheckFailed(error)) {
@@ -465,7 +546,15 @@ export function dynamoDbEngine(options: DynamoDbEngineOptions): DynamoDbQueryEng
           item.doc,
           item.indexes,
         );
-        await putDocumentAndMetadata(client, tableName, keyConfig, docItem, metadataItem);
+        await putDocumentAndMetadata(
+          client,
+          tableName,
+          keyConfig,
+          docItem,
+          metadataItem,
+          createQueryIndexItems(collection, item.key, createdAt, item.indexes),
+          diffRemovedIndexNames(existingRecord?.indexes, item.indexes),
+        );
         persistedKeys.push(item.key);
       }
 
@@ -476,7 +565,15 @@ export function dynamoDbEngine(options: DynamoDbEngineOptions): DynamoDbQueryEng
     },
 
     async batchDelete(collection, keys) {
-      await deleteDocumentAndMetadataBatch(client, tableName, keyConfig, collection, keys);
+      const existing = await batchGetDocuments(client, tableName, keyConfig, collection, keys);
+      await deleteDocumentAndMetadataBatch(
+        client,
+        tableName,
+        keyConfig,
+        collection,
+        keys,
+        existing,
+      );
     },
 
     migration: {
@@ -689,6 +786,18 @@ function metadataSortKey(key: string): string {
   return `META#${key}`;
 }
 
+function queryIndexItemSortKey(indexName: string, key: string): string {
+  return `QIDX#${encodeComparableComponent(indexName)}#${encodeComparableComponent(key)}`;
+}
+
+function queryIndexPartitionKey(collection: string, indexName: string): string {
+  return `QIDX#COL#${collection}#IDX#${encodeComparableComponent(indexName)}`;
+}
+
+function queryIndexSortKey(indexValue: string, createdAt: number, key: string): string {
+  return `${encodeComparableComponent(indexValue)}#${padCreatedAt(createdAt)}#${encodeComparableComponent(key)}`;
+}
+
 function migrationOutdatedPartitionKey(
   collection: string,
   targetVersion: number,
@@ -699,6 +808,14 @@ function migrationOutdatedPartitionKey(
 
 function migrationSyncPartitionKey(collection: string): string {
   return `MIGSYNC#${collection}`;
+}
+
+function encodeComparableComponent(value: string): string {
+  return Buffer.from(value, "utf8").toString("hex");
+}
+
+function padCreatedAt(value: number): string {
+  return String(value).padStart(16, "0");
 }
 
 function parseDocumentItem(value: unknown, keyConfig: DynamoKeyConfig): StoredDocumentItem {
@@ -754,6 +871,52 @@ function parseDocumentItem(value: unknown, keyConfig: DynamoKeyConfig): StoredDo
     writeVersion,
     doc: doc as Record<string, unknown>,
     indexes: resolvedIndexes,
+  };
+}
+
+function parseQueryIndexItem(value: unknown, keyConfig: DynamoKeyConfig): QueryIndexItem {
+  if (!isRecord(value)) {
+    throw new Error("DynamoDB returned an invalid query index item");
+  }
+
+  const pk = value[keyConfig.hashKeyName];
+  const sk = value[keyConfig.sortKeyName];
+  const itemType = value.itemType;
+  const collection = value.collection;
+  const key = value.key;
+  const indexName = value.indexName;
+  const indexValue = value.indexValue;
+  const createdAt = value.createdAt;
+  const queryPk = value.queryPk;
+  const querySk = value.querySk;
+
+  if (
+    typeof pk !== "string" ||
+    typeof sk !== "string" ||
+    itemType !== ITEM_TYPE_QUERY_INDEX ||
+    typeof collection !== "string" ||
+    typeof key !== "string" ||
+    typeof indexName !== "string" ||
+    typeof indexValue !== "string" ||
+    typeof createdAt !== "number" ||
+    !Number.isFinite(createdAt) ||
+    typeof queryPk !== "string" ||
+    typeof querySk !== "string"
+  ) {
+    throw new Error("DynamoDB returned an invalid query index item");
+  }
+
+  return {
+    pk,
+    sk,
+    itemType,
+    collection,
+    key,
+    indexName,
+    indexValue,
+    createdAt,
+    queryPk,
+    querySk,
   };
 }
 
@@ -928,6 +1091,38 @@ function createDocumentItem(
   };
 }
 
+function createQueryIndexItems(
+  collection: string,
+  key: string,
+  createdAt: number,
+  indexes: ResolvedIndexKeys,
+): QueryIndexItem[] {
+  return Object.entries(indexes).map(([indexName, indexValue]) =>
+    createQueryIndexItem(collection, key, createdAt, indexName, indexValue),
+  );
+}
+
+function createQueryIndexItem(
+  collection: string,
+  key: string,
+  createdAt: number,
+  indexName: string,
+  indexValue: string,
+): QueryIndexItem {
+  return {
+    pk: collectionPartitionKey(collection),
+    sk: queryIndexItemSortKey(indexName, key),
+    itemType: ITEM_TYPE_QUERY_INDEX,
+    collection,
+    key,
+    indexName,
+    indexValue,
+    createdAt,
+    queryPk: queryIndexPartitionKey(collection, indexName),
+    querySk: queryIndexSortKey(indexValue, createdAt, key),
+  };
+}
+
 function createMigrationMetadataItem(
   collection: string,
   key: string,
@@ -1064,12 +1259,102 @@ async function listDocumentsByQuery(
     return null;
   }
 
+  const queryCondition = buildDynamoQueryIndexCondition(
+    collection,
+    params.index,
+    params.filter.value,
+  );
+
+  if (!queryCondition) {
+    return null;
+  }
+
+  try {
+    const matches: QueryIndexItem[] = [];
+    let cursor: Record<string, unknown> | undefined;
+
+    do {
+      const response = (await client.send(
+        new QueryCommand({
+          TableName: tableName,
+          IndexName: keyConfig.queryIndexName,
+          KeyConditionExpression: queryCondition.expression,
+          ExpressionAttributeNames: queryCondition.expressionAttributeNames,
+          ExpressionAttributeValues: queryCondition.expressionAttributeValues,
+          ExclusiveStartKey: cursor,
+        }),
+      )) as {
+        Items?: unknown[];
+        LastEvaluatedKey?: Record<string, unknown>;
+      };
+
+      for (const item of response.Items ?? []) {
+        matches.push(parseQueryIndexItem(item, keyConfig));
+      }
+
+      cursor = response.LastEvaluatedKey;
+    } while (cursor);
+
+    const documents = await batchGetDocuments(
+      client,
+      tableName,
+      keyConfig,
+      collection,
+      matches.map((item) => item.key),
+    );
+    const records: StoredDocumentItem[] = [];
+
+    for (const match of matches) {
+      const record = documents.get(match.key);
+
+      if (!record || record.indexes[match.indexName] !== match.indexValue) {
+        continue;
+      }
+
+      records.push(record);
+    }
+
+    if (!params.sort) {
+      records.sort((a, b) => {
+        if (a.createdAt !== b.createdAt) {
+          return a.createdAt - b.createdAt;
+        }
+
+        return a.key.localeCompare(b.key);
+      });
+    }
+
+    return records;
+  } catch (error) {
+    if (!isMissingDynamoIndexError(error, keyConfig.queryIndexName)) {
+      throw error;
+    }
+  }
+
   const filterExpression = buildDynamoFilterExpression(params.filter.value);
 
   if (!filterExpression) {
     return null;
   }
 
+  return listDocumentsByScanFilter(
+    client,
+    tableName,
+    keyConfig,
+    collection,
+    params.index,
+    filterExpression,
+  );
+}
+
+async function listDocumentsByScanFilter(
+  client: DynamoDbDocumentClientLike,
+  tableName: string,
+  keyConfig: DynamoKeyConfig,
+  collection: string,
+  indexName: string,
+  filterExpression: DynamoFilterExpression,
+): Promise<StoredDocumentItem[]> {
   const pk = collectionPartitionKey(collection);
   const records: StoredDocumentItem[] = [];
   let cursor: Record<string, unknown> | undefined;
@@ -1083,7 +1368,7 @@ async function listDocumentsByQuery(
         "#pk": keyConfig.hashKeyName,
         "#sk": keyConfig.sortKeyName,
         "#indexes": "indexes",
-        "#indexName": params.index,
+        "#indexName": indexName,
         ...filterExpression.expressionAttributeNames,
       },
       ExpressionAttributeValues: {
@@ -1121,6 +1406,159 @@ interface DynamoFilterExpression {
   expression: string;
   expressionAttributeNames: Record<string, string>;
   expressionAttributeValues: Record<string, unknown>;
+}
+
+interface DynamoQueryIndexCondition {
+  expression: string;
+  expressionAttributeNames: Record<string, string>;
+  expressionAttributeValues: Record<string, unknown>;
+}
+
+function buildDynamoQueryIndexCondition(
+  collection: string,
+  indexName: string,
+  filter: string | number | FieldCondition,
+): DynamoQueryIndexCondition | null {
+  const queryPk = queryIndexPartitionKey(collection, indexName);
+  const encodedFieldValue = (value: string | number): string =>
+    encodeComparableComponent(String(value));
+
+  if (typeof filter === "string" || typeof filter === "number") {
+    return {
+      expression: "#queryPk = :queryPk AND begins_with(#querySk, :querySkPrefix)",
+      expressionAttributeNames: {
+        "#queryPk": "queryPk",
+        "#querySk": "querySk",
+      },
+      expressionAttributeValues: {
+        ":queryPk": queryPk,
+        ":querySkPrefix": `${encodedFieldValue(filter)}#`,
+      },
+    };
+  }
+
+  const keys = Object.keys(filter);
+
+  if (keys.some((key) => !DYNAMO_SUPPORTED_FILTER_KEYS.has(key))) {
+    return null;
+  }
+
+  const hasEq = filter.$eq !== undefined;
+  const hasBegins = filter.$begins !== undefined;
+  const hasBetween = filter.$between !== undefined;
+  const hasRange =
+    filter.$gt !== undefined ||
+    filter.$gte !== undefined ||
+    filter.$lt !== undefined ||
+    filter.$lte !== undefined;
+
+  if (hasEq && (hasBegins || hasBetween || hasRange)) {
+    return null;
+  }
+
+  if (hasBegins && (hasEq || hasBetween || hasRange)) {
+    return null;
+  }
+
+  if (hasBetween && (hasEq || hasBegins || hasRange)) {
+    return null;
+  }
+
+  if (!hasEq && !hasBegins && !hasBetween && !hasRange) {
+    return null;
+  }
+
+  const expressionAttributeNames = {
+    "#queryPk": "queryPk",
+    "#querySk": "querySk",
+  };
+
+  if (hasEq) {
+    return {
+      expression: "#queryPk = :queryPk AND begins_with(#querySk, :querySkPrefix)",
+      expressionAttributeNames,
+      expressionAttributeValues: {
+        ":queryPk": queryPk,
+        ":querySkPrefix": `${encodedFieldValue(filter.$eq as string | number)}#`,
+      },
+    };
+  }
+
+  if (hasBegins) {
+    const beginsValue = filter.$begins;
+
+    if (beginsValue === undefined) {
+      return null;
+    }
+
+    return {
+      expression: "#queryPk = :queryPk AND begins_with(#querySk, :querySkPrefix)",
+      expressionAttributeNames,
+      expressionAttributeValues: {
+        ":queryPk": queryPk,
+        ":querySkPrefix": encodedFieldValue(beginsValue),
+      },
+    };
+  }
+
+  if (hasBetween) {
+    const [low, high] = filter.$between as [string | number, string | number];
+
+    return {
+      expression: "#queryPk = :queryPk AND #querySk BETWEEN :querySkLow AND :querySkHigh",
+      expressionAttributeNames,
+      expressionAttributeValues: {
+        ":queryPk": queryPk,
+        ":querySkLow": encodedFieldValue(low),
+        ":querySkHigh": `${encodedFieldValue(high)}$`,
+      },
+    };
+  }
+
+  const lowerBound =
+    filter.$gt !== undefined
+      ? `${encodedFieldValue(filter.$gt as string | number)}$`
+      : filter.$gte !== undefined
+        ? encodedFieldValue(filter.$gte as string | number)
+        : undefined;
+  const upperBound =
+    filter.$lt !== undefined
+      ? encodedFieldValue(filter.$lt as string | number)
+      : filter.$lte !== undefined
+        ? `${encodedFieldValue(filter.$lte as string | number)}$`
+        : undefined;
+
+  if (lowerBound !== undefined && upperBound !== undefined) {
+    return {
+      expression: "#queryPk = :queryPk AND #querySk BETWEEN :querySkLow AND :querySkHigh",
+      expressionAttributeNames,
+      expressionAttributeValues: {
+        ":queryPk": queryPk,
+        ":querySkLow": lowerBound,
+        ":querySkHigh": upperBound,
+      },
+    };
+  }
+
+  if (lowerBound !== undefined) {
+    return {
+      expression: "#queryPk = :queryPk AND #querySk >= :querySkLow",
+      expressionAttributeNames,
+      expressionAttributeValues: {
+        ":queryPk": queryPk,
+        ":querySkLow": lowerBound,
+      },
+    };
+  }
+
+  return {
+    expression: "#queryPk = :queryPk AND #querySk <= :querySkHigh",
+    expressionAttributeNames,
+    expressionAttributeValues: {
+      ":queryPk": queryPk,
+      ":querySkHigh": upperBound,
+    },
+  };
 }
 
 function buildDynamoFilterExpression(
@@ -1340,6 +1778,8 @@ async function putDocumentAndMetadata(
   keyConfig: DynamoKeyConfig,
   docItem: StoredDocumentItem,
   metadataItem: MigrationMetadataItem,
+  queryIndexItems: QueryIndexItem[],
+  removedIndexNames: string[],
   options?: PutDocumentAndMetadataOptions,
 ): Promise<void> {
   const expressionAttributeNames: Record<string, string> = {};
@@ -1362,31 +1802,45 @@ async function putDocumentAndMetadata(
     conditionExpression = `${conditionExpression ? `${conditionExpression} AND ` : ""}#writeVersion = :expectedWriteVersion`;
   }
 
-  await client.send(
-    new TransactWriteCommand({
-      TransactItems: [
-        {
-          Put: {
-            TableName: tableName,
-            Item: serializeItemForStorage(docItem, keyConfig),
-            ...(conditionExpression ? { ConditionExpression: conditionExpression } : {}),
-            ...(conditionExpression && Object.keys(expressionAttributeNames).length > 0
-              ? { ExpressionAttributeNames: expressionAttributeNames }
-              : {}),
-            ...(conditionExpression && Object.keys(expressionAttributeValues).length > 0
-              ? { ExpressionAttributeValues: expressionAttributeValues }
-              : {}),
-          },
-        },
-        {
-          Put: {
-            TableName: tableName,
-            Item: serializeItemForStorage(metadataItem, keyConfig),
-          },
-        },
-      ],
-    }),
-  );
+  const transactItems: TransactWriteItem[] = [
+    {
+      Put: {
+        TableName: tableName,
+        Item: serializeItemForStorage(docItem, keyConfig),
+        ...(conditionExpression ? { ConditionExpression: conditionExpression } : {}),
+        ...(conditionExpression && Object.keys(expressionAttributeNames).length > 0
+          ? { ExpressionAttributeNames: expressionAttributeNames }
+          : {}),
+        ...(conditionExpression && Object.keys(expressionAttributeValues).length > 0
+          ? { ExpressionAttributeValues: expressionAttributeValues }
+          : {}),
+      },
+    },
+    {
+      Put: {
+        TableName: tableName,
+        Item: serializeItemForStorage(metadataItem, keyConfig),
+      },
+    },
+    ...queryIndexItems.map((item) => ({
+      Put: {
+        TableName: tableName,
+        Item: serializeItemForStorage(item, keyConfig),
+      },
+    })),
+    ...removedIndexNames.map((indexName) => ({
+      Delete: {
+        TableName: tableName,
+        Key: toDynamoPrimaryKey(
+          keyConfig,
+          collectionPartitionKey(docItem.collection),
+          queryIndexItemSortKey(indexName, docItem.key),
+        ),
+      },
+    })),
+  ];
+
+  await client.send(new TransactWriteCommand({ TransactItems: transactItems }));
 }
 
 async function putDocumentAndMetadataBatch(
@@ -1396,36 +1850,54 @@ async function putDocumentAndMetadataBatch(
   writes: Array<{
     docItem: StoredDocumentItem;
     metadataItem: MigrationMetadataItem;
+    queryIndexItems: QueryIndexItem[];
+    removedIndexNames: string[];
   }>,
 ): Promise<void> {
-  for (const chunk of chunkArray(writes, 12)) {
-    const transactItems: Array<{
-      Put: {
-        TableName: string;
-        Item: Record<string, unknown>;
-      };
-    }> = [];
+  let transactItems: TransactWriteItem[] = [];
 
-    for (const entry of chunk) {
-      transactItems.push({
+  for (const entry of writes) {
+    const entryItems: TransactWriteItem[] = [
+      {
         Put: {
           TableName: tableName,
           Item: serializeItemForStorage(entry.docItem, keyConfig),
         },
-      });
-      transactItems.push({
+      },
+      {
         Put: {
           TableName: tableName,
           Item: serializeItemForStorage(entry.metadataItem, keyConfig),
         },
-      });
+      },
+      ...entry.queryIndexItems.map((item) => ({
+        Put: {
+          TableName: tableName,
+          Item: serializeItemForStorage(item, keyConfig),
+        },
+      })),
+      ...entry.removedIndexNames.map((indexName) => ({
+        Delete: {
+          TableName: tableName,
+          Key: toDynamoPrimaryKey(
+            keyConfig,
+            collectionPartitionKey(entry.docItem.collection),
+            queryIndexItemSortKey(indexName, entry.docItem.key),
+          ),
+        },
+      })),
+    ];
+
+    if (transactItems.length > 0 && transactItems.length + entryItems.length > 100) {
+      await client.send(new TransactWriteCommand({ TransactItems: transactItems }));
+      transactItems = [];
     }
 
-    await client.send(
-      new TransactWriteCommand({
-        TransactItems: transactItems,
-      }),
-    );
+    transactItems.push(...entryItems);
+  }
+
+  if (transactItems.length > 0) {
+    await client.send(new TransactWriteCommand({ TransactItems: transactItems }));
   }
 }
 
@@ -1435,6 +1907,7 @@ async function deleteDocumentAndMetadata(
   keyConfig: DynamoKeyConfig,
   collection: string,
   key: string,
+  indexNames: readonly string[],
 ): Promise<void> {
   await client.send(
     new TransactWriteCommand({
@@ -1459,6 +1932,16 @@ async function deleteDocumentAndMetadata(
             ),
           },
         },
+        ...indexNames.map((indexName) => ({
+          Delete: {
+            TableName: tableName,
+            Key: toDynamoPrimaryKey(
+              keyConfig,
+              collectionPartitionKey(collection),
+              queryIndexItemSortKey(indexName, key),
+            ),
+          },
+        })),
       ],
     }),
   );
@@ -1470,21 +1953,15 @@ async function deleteDocumentAndMetadataBatch(
   keyConfig: DynamoKeyConfig,
   collection: string,
   keys: string[],
+  existing: Map<string, StoredDocumentItem>,
 ): Promise<void> {
   const uniqueKeys = uniqueStrings(keys);
 
-  for (const chunk of chunkArray(uniqueKeys, 12)) {
-    const transactItems: Array<{
-      Delete: {
-        TableName: string;
-        Key: {
-          [key: string]: string;
-        };
-      };
-    }> = [];
+  let transactItems: TransactWriteItem[] = [];
 
-    for (const key of chunk) {
-      transactItems.push({
+  for (const key of uniqueKeys) {
+    const entryItems: TransactWriteItem[] = [
+      {
         Delete: {
           TableName: tableName,
           Key: toDynamoPrimaryKey(
@@ -1493,8 +1970,8 @@ async function deleteDocumentAndMetadataBatch(
             documentSortKey(key),
           ),
         },
-      });
-      transactItems.push({
+      },
+      {
         Delete: {
           TableName: tableName,
           Key: toDynamoPrimaryKey(
@@ -1503,14 +1980,29 @@ async function deleteDocumentAndMetadataBatch(
             metadataSortKey(key),
           ),
         },
-      });
+      },
+      ...Object.keys(existing.get(key)?.indexes ?? {}).map((indexName) => ({
+        Delete: {
+          TableName: tableName,
+          Key: toDynamoPrimaryKey(
+            keyConfig,
+            collectionPartitionKey(collection),
+            queryIndexItemSortKey(indexName, key),
+          ),
+        },
+      })),
+    ];
+
+    if (transactItems.length > 0 && transactItems.length + entryItems.length > 100) {
+      await client.send(new TransactWriteCommand({ TransactItems: transactItems }));
+      transactItems = [];
     }
 
-    await client.send(
-      new TransactWriteCommand({
-        TransactItems: transactItems,
-      }),
-    );
+    transactItems.push(...entryItems);
+  }
+
+  if (transactItems.length > 0) {
+    await client.send(new TransactWriteCommand({ TransactItems: transactItems }));
   }
 }
 
@@ -2374,6 +2866,11 @@ function isTransactionConditionalCheckFailed(error: unknown): boolean {
   );
 }
 
+function isMissingDynamoIndexError(error: unknown, indexName: string): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes("does not have the specified index") && message.includes(indexName);
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -2404,6 +2901,17 @@ function uniqueDynamoKeys(keys: DynamoPrimaryKey[]): DynamoPrimaryKey[] {
   }
 
   return unique;
+}
+
+function diffRemovedIndexNames(
+  previous: ResolvedIndexKeys | undefined,
+  next: ResolvedIndexKeys,
+): string[] {
+  if (!previous) {
+    return [];
+  }
+
+  return Object.keys(previous).filter((name) => next[name] === undefined);
 }
 
 function uniqueStrings(values: string[]): string[] {
