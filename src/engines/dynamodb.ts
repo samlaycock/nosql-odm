@@ -33,6 +33,7 @@ import {
 
 const MAX_BATCH_WRITE = 25;
 const MAX_BATCH_GET = 100;
+const MAX_TRANSACT_WRITE = 100;
 const BATCH_RETRY_LIMIT = 10;
 const META_PARTITION_KEY = "META";
 const OUTDATED_PAGE_LIMIT = 100;
@@ -1496,6 +1497,8 @@ function buildDynamoQueryIndexCondition(
       expressionAttributeNames,
       expressionAttributeValues: {
         ":queryPk": queryPk,
+        // Prefix queries intentionally omit the value separator so values that share the same
+        // leading characters remain contiguous in the query index sort key.
         ":querySkPrefix": encodedFieldValue(beginsValue),
       },
     };
@@ -1840,6 +1843,10 @@ async function putDocumentAndMetadata(
     })),
   ];
 
+  assertTransactWriteItemCount(
+    transactItems,
+    `DynamoDB document write for "${docItem.collection}/${docItem.key}"`,
+  );
   await client.send(new TransactWriteCommand({ TransactItems: transactItems }));
 }
 
@@ -1888,7 +1895,12 @@ async function putDocumentAndMetadataBatch(
       })),
     ];
 
-    if (transactItems.length > 0 && transactItems.length + entryItems.length > 100) {
+    assertTransactWriteItemCount(
+      entryItems,
+      `DynamoDB batch document write for "${entry.docItem.collection}/${entry.docItem.key}"`,
+    );
+
+    if (transactItems.length + entryItems.length > MAX_TRANSACT_WRITE) {
       await client.send(new TransactWriteCommand({ TransactItems: transactItems }));
       transactItems = [];
     }
@@ -1909,42 +1921,44 @@ async function deleteDocumentAndMetadata(
   key: string,
   indexNames: readonly string[],
 ): Promise<void> {
-  await client.send(
-    new TransactWriteCommand({
-      TransactItems: [
-        {
-          Delete: {
-            TableName: tableName,
-            Key: toDynamoPrimaryKey(
-              keyConfig,
-              collectionPartitionKey(collection),
-              documentSortKey(key),
-            ),
-          },
-        },
-        {
-          Delete: {
-            TableName: tableName,
-            Key: toDynamoPrimaryKey(
-              keyConfig,
-              collectionPartitionKey(collection),
-              metadataSortKey(key),
-            ),
-          },
-        },
-        ...indexNames.map((indexName) => ({
-          Delete: {
-            TableName: tableName,
-            Key: toDynamoPrimaryKey(
-              keyConfig,
-              collectionPartitionKey(collection),
-              queryIndexItemSortKey(indexName, key),
-            ),
-          },
-        })),
-      ],
-    }),
+  const transactItems: TransactWriteItem[] = [
+    {
+      Delete: {
+        TableName: tableName,
+        Key: toDynamoPrimaryKey(
+          keyConfig,
+          collectionPartitionKey(collection),
+          documentSortKey(key),
+        ),
+      },
+    },
+    {
+      Delete: {
+        TableName: tableName,
+        Key: toDynamoPrimaryKey(
+          keyConfig,
+          collectionPartitionKey(collection),
+          metadataSortKey(key),
+        ),
+      },
+    },
+    ...indexNames.map((indexName) => ({
+      Delete: {
+        TableName: tableName,
+        Key: toDynamoPrimaryKey(
+          keyConfig,
+          collectionPartitionKey(collection),
+          queryIndexItemSortKey(indexName, key),
+        ),
+      },
+    })),
+  ];
+
+  assertTransactWriteItemCount(
+    transactItems,
+    `DynamoDB document delete for "${collection}/${key}"`,
   );
+  await client.send(new TransactWriteCommand({ TransactItems: transactItems }));
 }
 
 async function deleteDocumentAndMetadataBatch(
@@ -1993,7 +2007,12 @@ async function deleteDocumentAndMetadataBatch(
       })),
     ];
 
-    if (transactItems.length > 0 && transactItems.length + entryItems.length > 100) {
+    assertTransactWriteItemCount(
+      entryItems,
+      `DynamoDB batch document delete for "${collection}/${key}"`,
+    );
+
+    if (transactItems.length + entryItems.length > MAX_TRANSACT_WRITE) {
       await client.send(new TransactWriteCommand({ TransactItems: transactItems }));
       transactItems = [];
     }
@@ -2868,7 +2887,28 @@ function isTransactionConditionalCheckFailed(error: unknown): boolean {
 
 function isMissingDynamoIndexError(error: unknown, indexName: string): boolean {
   const message = error instanceof Error ? error.message : String(error);
-  return message.includes("does not have the specified index") && message.includes(indexName);
+  const name =
+    isRecord(error) && typeof error.name === "string"
+      ? error.name
+      : isRecord(error) && typeof error.code === "string"
+        ? error.code
+        : error instanceof Error && "name" in error && typeof error.name === "string"
+          ? error.name
+          : "";
+  return name === "ValidationException" && message.includes(indexName);
+}
+
+function assertTransactWriteItemCount(
+  transactItems: readonly TransactWriteItem[],
+  operation: string,
+): void {
+  if (transactItems.length <= MAX_TRANSACT_WRITE) {
+    return;
+  }
+
+  throw new Error(
+    `${operation} exceeds DynamoDB's ${String(MAX_TRANSACT_WRITE)}-item transaction limit`,
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
