@@ -1,6 +1,10 @@
 import { DefaultMigrator } from "../migrator";
 import { getPreparedSerializedDocument, prepareDocumentForStorage } from "./document-preparation";
-import { encodeQueryPageCursor, resolveQueryPageStartIndex } from "./query-cursor";
+import {
+  encodeQueryPageCursor,
+  resolveQueryPageCursorPosition,
+  resolveQueryPageStartIndex,
+} from "./query-cursor";
 import {
   type BatchSetResult,
   EngineDocumentAlreadyExistsError,
@@ -22,6 +26,8 @@ import {
 const DEFAULT_KEY_PREFIX = "nosql_odm";
 const OUTDATED_PAGE_LIMIT = 100;
 const OUTDATED_SYNC_CHUNK_SIZE = 100;
+const INDEX_MEMBER_CREATED_AT_WIDTH = 20;
+const INDEX_QUERY_CHUNK_SIZE = 64;
 const NULL_INDEX_SIGNATURE = "";
 const NULL_INDEX_SIGNATURE_TOKEN = "__null__";
 
@@ -40,6 +46,14 @@ end
 
 local function uniqueOwnerKey(prefix, collection, indexName, indexValue)
   return prefix .. ":unique:" .. collection .. ":" .. cjson.encode({indexName, indexValue})
+end
+
+local function indexSetKey(prefix, collection, indexName)
+  return prefix .. ":index:" .. collection .. ":" .. indexName
+end
+
+local function encodeIndexMember(indexValue, createdAt, key)
+  return tostring(indexValue) .. "\\0" .. string.format("%020d", tonumber(createdAt)) .. "\\0" .. key
 end
 
 local function decodeIndexRecord(raw)
@@ -63,6 +77,18 @@ local function releaseUniqueIndexes(prefix, collection, key, uniqueIndexes)
     if currentOwner == key then
       redis.call("DEL", ownerKey)
     end
+  end
+end
+
+local function removeIndexEntries(prefix, collection, key, indexes, createdAt)
+  for indexName, indexValue in pairs(indexes) do
+    redis.call("ZREM", indexSetKey(prefix, collection, indexName), encodeIndexMember(indexValue, createdAt, key))
+  end
+end
+
+local function assignIndexEntries(prefix, collection, key, indexes, createdAt)
+  for indexName, indexValue in pairs(indexes) do
+    redis.call("ZADD", indexSetKey(prefix, collection, indexName), 0, encodeIndexMember(indexValue, createdAt, key))
   end
 end
 
@@ -176,8 +202,12 @@ if not createdAt then
 end
 
 removePreviousIndexes(prefix, collection, key, KEYS[3])
+if exists then
+  removeIndexEntries(prefix, collection, key, decodeIndexRecord(redis.call("HGET", KEYS[1], "indexes")), createdAt)
+end
 releaseUniqueIndexes(prefix, collection, key, previousUniqueIndexes)
 assignUniqueIndexes(prefix, collection, key, nextUniqueIndexes)
+assignIndexEntries(prefix, collection, key, decodeIndexRecord(indexesJson), createdAt)
 
 local nextWriteVersion = 1
 if exists then
@@ -228,6 +258,14 @@ local function uniqueOwnerKey(prefix, collection, indexName, indexValue)
   return prefix .. ":unique:" .. collection .. ":" .. cjson.encode({indexName, indexValue})
 end
 
+local function indexSetKey(prefix, collection, indexName)
+  return prefix .. ":index:" .. collection .. ":" .. indexName
+end
+
+local function encodeIndexMember(indexValue, createdAt, key)
+  return tostring(indexValue) .. "\\0" .. string.format("%020d", tonumber(createdAt)) .. "\\0" .. key
+end
+
 local function decodeIndexRecord(raw)
   if raw == false or raw == nil or raw == "" then
     return {}
@@ -255,6 +293,8 @@ end
 local prefix = ARGV[1]
 local collection = ARGV[2]
 local key = ARGV[3]
+local createdAt = redis.call("HGET", KEYS[1], "createdAt")
+local indexes = decodeIndexRecord(redis.call("HGET", KEYS[1], "indexes"))
 
 local oldTarget = redis.call("HGET", KEYS[1], "migrationTargetVersion")
 local oldState = redis.call("HGET", KEYS[1], "migrationVersionState")
@@ -270,6 +310,12 @@ releaseUniqueIndexes(
   key,
   decodeIndexRecord(redis.call("HGET", KEYS[1], "uniqueIndexes"))
 )
+
+if createdAt then
+  for indexName, indexValue in pairs(indexes) do
+    redis.call("ZREM", indexSetKey(prefix, collection, indexName), encodeIndexMember(indexValue, createdAt, key))
+  end
+end
 
 redis.call("DEL", KEYS[1])
 redis.call("ZREM", KEYS[2], key)
@@ -371,6 +417,51 @@ return redis.call("ZRANGEBYSCORE", KEYS[1], ARGV[1], ARGV[2], "LIMIT", 0, tonumb
 
 const FETCH_ZSET_PAGE_BY_SCORE_SCRIPT = `
 return redis.call("ZRANGEBYSCORE", KEYS[1], ARGV[1], "+inf", "WITHSCORES", "LIMIT", 0, tonumber(ARGV[2]))
+`;
+
+const FETCH_BATCH_DOCUMENTS_SCRIPT = `
+local function documentHashKey(prefix, collection, key)
+  return prefix .. ":doc:" .. collection .. ":" .. key
+end
+
+local results = {}
+
+for _, key in ipairs(ARGV) do
+  local values = redis.call(
+    "HMGET",
+    documentHashKey(KEYS[1], KEYS[2], key),
+    "createdAt",
+    "writeVersion",
+    "doc",
+    "indexes",
+    "migrationTargetVersion",
+    "migrationVersionState",
+    "migrationIndexSignature"
+  )
+
+  if values[1] ~= false and values[3] ~= false and values[4] ~= false then
+    table.insert(results, cjson.encode({
+      key = key,
+      createdAt = values[1],
+      writeVersion = values[2],
+      doc = values[3],
+      indexes = values[4],
+      migrationTargetVersion = values[5],
+      migrationVersionState = values[6],
+      migrationIndexSignature = values[7]
+    }))
+  end
+end
+
+return results
+`;
+
+const FETCH_INDEX_PAGE_SCRIPT = `
+if ARGV[1] == "desc" then
+  return redis.call("ZREVRANGEBYLEX", KEYS[1], ARGV[2], ARGV[3], "LIMIT", 0, tonumber(ARGV[4]))
+end
+
+return redis.call("ZRANGEBYLEX", KEYS[1], ARGV[2], ARGV[3], "LIMIT", 0, tonumber(ARGV[4]))
 `;
 
 const BUILD_MISMATCH_SET_SCRIPT = `
@@ -634,32 +725,37 @@ export function redisEngine(options: RedisEngineOptions): RedisQueryEngine {
     },
 
     async query(collection, params) {
-      const records = await listCollectionDocuments(client, keyPrefix, collection);
-      const matched = matchDocuments(records, params);
+      const range = params.index && params.filter ? buildIndexLexRange(params.filter.value) : null;
+
+      if (params.index && params.filter && params.sort && range) {
+        return querySortedIndex(client, keyPrefix, collection, params, range, false);
+      }
+
+      const matched = await findMatchingDocuments(client, keyPrefix, collection, params);
 
       return paginate(collection, matched, params);
     },
 
     async queryWithMetadata(collection, params) {
-      const records = await listCollectionDocuments(client, keyPrefix, collection);
-      const matched = matchDocuments(records, params);
+      const range = params.index && params.filter ? buildIndexLexRange(params.filter.value) : null;
+
+      if (params.index && params.filter && params.sort && range) {
+        return querySortedIndex(client, keyPrefix, collection, params, range, true);
+      }
+
+      const matched = await findMatchingDocuments(client, keyPrefix, collection, params);
 
       return paginateWithWriteTokens(collection, matched, params);
     },
 
     async batchGet(collection, keys) {
-      const fetched = new Map<string, StoredDocumentRecord>();
+      const fetched = await loadDocumentRecordMap(
+        client,
+        keyPrefix,
+        collection,
+        uniqueStrings(keys),
+      );
       const results: KeyedDocument[] = [];
-
-      for (const key of uniqueStrings(keys)) {
-        const record = await loadDocumentRecord(client, keyPrefix, collection, key);
-
-        if (!record) {
-          continue;
-        }
-
-        fetched.set(key, record);
-      }
 
       for (const key of keys) {
         const record = fetched.get(key);
@@ -678,18 +774,13 @@ export function redisEngine(options: RedisEngineOptions): RedisQueryEngine {
     },
 
     async batchGetWithMetadata(collection, keys) {
-      const fetched = new Map<string, StoredDocumentRecord>();
+      const fetched = await loadDocumentRecordMap(
+        client,
+        keyPrefix,
+        collection,
+        uniqueStrings(keys),
+      );
       const results: KeyedDocument[] = [];
-
-      for (const key of uniqueStrings(keys)) {
-        const record = await loadDocumentRecord(client, keyPrefix, collection, key);
-
-        if (!record) {
-          continue;
-        }
-
-        fetched.set(key, record);
-      }
 
       for (const key of keys) {
         const record = fetched.get(key);
@@ -1059,6 +1150,283 @@ async function loadDocumentRecord(
   }
 
   return parseStoredDocumentRecord(key, fields);
+}
+
+async function loadDocumentRecordMap(
+  client: RedisClientLike,
+  keyPrefix: string,
+  collection: string,
+  keys: string[],
+): Promise<Map<string, StoredDocumentRecord>> {
+  if (keys.length === 0) {
+    return new Map();
+  }
+
+  const raw = await evalScript(client, FETCH_BATCH_DOCUMENTS_SCRIPT, [keyPrefix, collection], keys);
+  const entries = parseBatchDocumentEntries(raw);
+  const records = new Map<string, StoredDocumentRecord>();
+
+  for (const entry of entries) {
+    records.set(
+      entry.key,
+      parseStoredDocumentRecord(entry.key, {
+        createdAt: entry.createdAt,
+        writeVersion: entry.writeVersion,
+        doc: entry.doc,
+        indexes: entry.indexes,
+        ...(entry.migrationTargetVersion === undefined
+          ? {}
+          : { migrationTargetVersion: entry.migrationTargetVersion }),
+        ...(entry.migrationVersionState === undefined
+          ? {}
+          : { migrationVersionState: entry.migrationVersionState }),
+        ...(entry.migrationIndexSignature === undefined
+          ? {}
+          : { migrationIndexSignature: entry.migrationIndexSignature }),
+      }),
+    );
+  }
+
+  return records;
+}
+
+async function findMatchingDocuments(
+  client: RedisClientLike,
+  keyPrefix: string,
+  collection: string,
+  params: QueryParams,
+): Promise<StoredDocumentRecord[]> {
+  if (!params.index || !params.filter) {
+    const records = await listCollectionDocuments(client, keyPrefix, collection);
+    return matchDocuments(records, params);
+  }
+
+  const range = buildIndexLexRange(params.filter.value);
+
+  if (!range) {
+    const records = await listCollectionDocuments(client, keyPrefix, collection);
+    return matchDocuments(records, params);
+  }
+
+  return listIndexedDocuments(client, keyPrefix, collection, params, range);
+}
+
+async function listIndexedDocuments(
+  client: RedisClientLike,
+  keyPrefix: string,
+  collection: string,
+  params: QueryParams,
+  range: IndexLexRange,
+): Promise<StoredDocumentRecord[]> {
+  const indexName = params.index!;
+  const members = await fetchAllIndexMembers(
+    client,
+    keyPrefix,
+    collection,
+    indexName,
+    range,
+    "asc",
+  );
+  const recordsByKey = await loadDocumentRecordMap(
+    client,
+    keyPrefix,
+    collection,
+    uniqueStrings(members.map((member) => decodeIndexMember(member).key)),
+  );
+  const matched: StoredDocumentRecord[] = [];
+
+  for (const member of members) {
+    const parsed = decodeIndexMember(member);
+    const record = recordsByKey.get(parsed.key);
+
+    if (!record) {
+      await removeDanglingIndexMember(client, keyPrefix, collection, indexName, member);
+      continue;
+    }
+
+    const currentIndexValue = record.indexes[indexName];
+    if (
+      currentIndexValue !== parsed.indexValue ||
+      !matchesFilter(currentIndexValue, params.filter!.value)
+    ) {
+      await removeDanglingIndexMember(client, keyPrefix, collection, indexName, member);
+      continue;
+    }
+
+    matched.push(record);
+  }
+
+  matched.sort((a, b) => {
+    if (a.createdAt !== b.createdAt) {
+      return a.createdAt - b.createdAt;
+    }
+
+    return a.key.localeCompare(b.key);
+  });
+
+  return matched;
+}
+
+async function querySortedIndex(
+  client: RedisClientLike,
+  keyPrefix: string,
+  collection: string,
+  params: QueryParams,
+  range: IndexLexRange,
+  includeWriteTokens: boolean,
+): Promise<EngineQueryResult> {
+  const indexName = params.index!;
+  const limit = normalizeLimit(params.limit);
+
+  if (limit === 0) {
+    resolveQueryPageCursorPosition(collection, params);
+    return {
+      documents: [],
+      cursor: null,
+    };
+  }
+
+  if (limit === null) {
+    const members = await fetchAllIndexMembers(
+      client,
+      keyPrefix,
+      collection,
+      indexName,
+      range,
+      params.sort!,
+    );
+    const records = await loadRecordsFromIndexMembers(
+      client,
+      keyPrefix,
+      collection,
+      indexName,
+      params,
+      members,
+    );
+
+    return {
+      documents: records.map((record) => ({
+        key: record.key,
+        doc: structuredClone(record.doc),
+        ...(includeWriteTokens ? { writeToken: String(record.writeVersion) } : {}),
+      })),
+      cursor: null,
+    };
+  }
+
+  const cursorPosition = resolveQueryPageCursorPosition(collection, params);
+  const collected: StoredDocumentRecord[] = [];
+  let cursorMember =
+    cursorPosition?.kind === "sorted-index"
+      ? encodeIndexMember(
+          cursorPosition.indexValue,
+          cursorPosition.createdAt ?? 0,
+          cursorPosition.key,
+        )
+      : null;
+
+  while (collected.length < limit + 1) {
+    const requestSize = Math.max(limit + 1 - collected.length, INDEX_QUERY_CHUNK_SIZE);
+    const batch = await fetchIndexMembersPage(
+      client,
+      keyPrefix,
+      collection,
+      indexName,
+      range,
+      params.sort!,
+      cursorMember,
+      requestSize,
+    );
+
+    if (batch.length === 0) {
+      break;
+    }
+
+    const valid = await loadRecordsFromIndexMembers(
+      client,
+      keyPrefix,
+      collection,
+      indexName,
+      params,
+      batch,
+    );
+
+    for (const record of valid) {
+      collected.push(record);
+
+      if (collected.length >= limit + 1) {
+        break;
+      }
+    }
+
+    cursorMember = batch[batch.length - 1] ?? null;
+
+    if (batch.length < requestSize) {
+      break;
+    }
+  }
+
+  const page = collected.slice(0, limit);
+  const hasMore = collected.length > limit;
+
+  return {
+    documents: page.map((record) => ({
+      key: record.key,
+      doc: structuredClone(record.doc),
+      ...(includeWriteTokens ? { writeToken: String(record.writeVersion) } : {}),
+    })),
+    cursor:
+      hasMore && page.length > 0
+        ? encodeQueryPageCursor(collection, params, {
+            key: page[page.length - 1]!.key,
+            createdAt: page[page.length - 1]!.createdAt,
+            indexValue: page[page.length - 1]!.indexes[indexName] ?? "",
+          })
+        : null,
+  };
+}
+
+async function loadRecordsFromIndexMembers(
+  client: RedisClientLike,
+  keyPrefix: string,
+  collection: string,
+  indexName: string,
+  params: QueryParams,
+  members: string[],
+): Promise<StoredDocumentRecord[]> {
+  const decoded = members.map((member) => ({
+    member,
+    parsed: decodeIndexMember(member),
+  }));
+  const recordsByKey = await loadDocumentRecordMap(
+    client,
+    keyPrefix,
+    collection,
+    uniqueStrings(decoded.map(({ parsed }) => parsed.key)),
+  );
+  const records: StoredDocumentRecord[] = [];
+
+  for (const { member, parsed } of decoded) {
+    const record = recordsByKey.get(parsed.key);
+
+    if (!record) {
+      await removeDanglingIndexMember(client, keyPrefix, collection, indexName, member);
+      continue;
+    }
+
+    const currentIndexValue = record.indexes[indexName];
+    if (
+      currentIndexValue !== parsed.indexValue ||
+      !matchesFilter(currentIndexValue, params.filter!.value)
+    ) {
+      await removeDanglingIndexMember(client, keyPrefix, collection, indexName, member);
+      continue;
+    }
+
+    records.push(record);
+  }
+
+  return records;
 }
 
 async function syncMigrationMetadataForCriteria(
@@ -1734,6 +2102,257 @@ function parseUpsertResult(
   throw new Error("Redis returned an invalid upsert result");
 }
 
+interface IndexLexRange {
+  min: string;
+  max: string;
+}
+
+interface DecodedIndexMember {
+  indexValue: string;
+  createdAt: number;
+  key: string;
+}
+
+interface BatchDocumentEntry {
+  key: string;
+  createdAt: string;
+  writeVersion: string;
+  doc: string;
+  indexes: string;
+  migrationTargetVersion?: string;
+  migrationVersionState?: string;
+  migrationIndexSignature?: string;
+}
+
+function buildIndexLexRange(filter: string | number | FieldCondition): IndexLexRange | null {
+  if (typeof filter === "string" || typeof filter === "number") {
+    return buildEqualityLexRange(String(filter));
+  }
+
+  if (filter.$eq !== undefined) {
+    const value = normalizeIndexRangeValue(filter.$eq);
+    return value === null ? null : buildEqualityLexRange(value);
+  }
+
+  if (
+    filter.$begins !== undefined &&
+    filter.$gt === undefined &&
+    filter.$gte === undefined &&
+    filter.$lt === undefined &&
+    filter.$lte === undefined &&
+    filter.$between === undefined
+  ) {
+    return {
+      min: `[${filter.$begins}`,
+      max: `[${filter.$begins}\xff`,
+    };
+  }
+
+  if (filter.$between !== undefined) {
+    const low = normalizeIndexRangeValue(filter.$between[0]);
+    const high = normalizeIndexRangeValue(filter.$between[1]);
+
+    if (low === null || high === null) {
+      return null;
+    }
+
+    return {
+      min: `[${low}\0`,
+      max: `[${high}\0\xff`,
+    };
+  }
+
+  if (
+    filter.$gt === undefined &&
+    filter.$gte === undefined &&
+    filter.$lt === undefined &&
+    filter.$lte === undefined
+  ) {
+    return null;
+  }
+
+  const gt = normalizeIndexRangeValue(filter.$gt);
+  const gte = normalizeIndexRangeValue(filter.$gte);
+  const lt = normalizeIndexRangeValue(filter.$lt);
+  const lte = normalizeIndexRangeValue(filter.$lte);
+
+  if (
+    (filter.$gt !== undefined && gt === null) ||
+    (filter.$gte !== undefined && gte === null) ||
+    (filter.$lt !== undefined && lt === null) ||
+    (filter.$lte !== undefined && lte === null)
+  ) {
+    return null;
+  }
+
+  return {
+    min: gt !== null ? `(${gt}\0\xff` : gte !== null ? `[${gte}\0` : "-",
+    max: lt !== null ? `(${lt}\0` : lte !== null ? `[${lte}\0\xff` : "+",
+  };
+}
+
+function buildEqualityLexRange(value: string): IndexLexRange {
+  return {
+    min: `[${value}\0`,
+    max: `[${value}\0\xff`,
+  };
+}
+
+function normalizeIndexRangeValue(value: unknown): string | null {
+  if (typeof value === "string" || typeof value === "number") {
+    return String(value);
+  }
+
+  return null;
+}
+
+async function fetchAllIndexMembers(
+  client: RedisClientLike,
+  keyPrefix: string,
+  collection: string,
+  indexName: string,
+  range: IndexLexRange,
+  sort: "asc" | "desc",
+): Promise<string[]> {
+  const members: string[] = [];
+  let cursorMember: string | null = null;
+
+  while (true) {
+    const batch = await fetchIndexMembersPage(
+      client,
+      keyPrefix,
+      collection,
+      indexName,
+      range,
+      sort,
+      cursorMember,
+      INDEX_QUERY_CHUNK_SIZE,
+    );
+
+    if (batch.length === 0) {
+      return members;
+    }
+
+    members.push(...batch);
+    cursorMember = batch[batch.length - 1] ?? null;
+
+    if (batch.length < INDEX_QUERY_CHUNK_SIZE) {
+      return members;
+    }
+  }
+}
+
+async function fetchIndexMembersPage(
+  client: RedisClientLike,
+  keyPrefix: string,
+  collection: string,
+  indexName: string,
+  range: IndexLexRange,
+  sort: "asc" | "desc",
+  cursorMember: string | null,
+  count: number,
+): Promise<string[]> {
+  const raw = await evalScript(
+    client,
+    FETCH_INDEX_PAGE_SCRIPT,
+    [indexSetKey(keyPrefix, collection, indexName)],
+    [
+      sort,
+      sort === "desc"
+        ? cursorMember
+          ? `(${cursorMember}`
+          : range.max
+        : cursorMember
+          ? `(${cursorMember}`
+          : range.min,
+      sort === "desc" ? range.min : range.max,
+      String(count),
+    ],
+  );
+
+  return parseStringArray(raw, "indexed query member list");
+}
+
+async function removeDanglingIndexMember(
+  client: RedisClientLike,
+  keyPrefix: string,
+  collection: string,
+  indexName: string,
+  member: string,
+): Promise<void> {
+  await client.zRem(indexSetKey(keyPrefix, collection, indexName), member);
+}
+
+function encodeIndexMember(indexValue: string, createdAt: number, key: string): string {
+  return `${indexValue}\0${String(createdAt).padStart(INDEX_MEMBER_CREATED_AT_WIDTH, "0")}\0${key}`;
+}
+
+function decodeIndexMember(member: string): DecodedIndexMember {
+  const firstSeparator = member.indexOf("\0");
+  const secondSeparator = firstSeparator === -1 ? -1 : member.indexOf("\0", firstSeparator + 1);
+
+  if (firstSeparator === -1 || secondSeparator === -1) {
+    throw new Error("Redis returned an invalid indexed query member");
+  }
+
+  return {
+    indexValue: member.slice(0, firstSeparator),
+    createdAt: parseInteger(
+      member.slice(firstSeparator + 1, secondSeparator),
+      "Redis returned an invalid indexed query member",
+    ),
+    key: member.slice(secondSeparator + 1),
+  };
+}
+
+function parseBatchDocumentEntries(value: unknown): BatchDocumentEntry[] {
+  const rawEntries = parseStringArray(value, "batch document list");
+  const entries: BatchDocumentEntry[] = [];
+
+  for (const entry of rawEntries) {
+    let parsed: unknown;
+
+    try {
+      parsed = JSON.parse(entry);
+    } catch {
+      throw new Error("Redis returned an invalid batch document list");
+    }
+
+    if (!isRecord(parsed)) {
+      throw new Error("Redis returned an invalid batch document list");
+    }
+
+    if (
+      typeof parsed.key !== "string" ||
+      typeof parsed.createdAt !== "string" ||
+      typeof parsed.writeVersion !== "string" ||
+      typeof parsed.doc !== "string" ||
+      typeof parsed.indexes !== "string"
+    ) {
+      throw new Error("Redis returned an invalid batch document list");
+    }
+
+    entries.push({
+      key: parsed.key,
+      createdAt: parsed.createdAt,
+      writeVersion: parsed.writeVersion,
+      doc: parsed.doc,
+      indexes: parsed.indexes,
+      ...(typeof parsed.migrationTargetVersion === "string"
+        ? { migrationTargetVersion: parsed.migrationTargetVersion }
+        : {}),
+      ...(typeof parsed.migrationVersionState === "string"
+        ? { migrationVersionState: parsed.migrationVersionState }
+        : {}),
+      ...(typeof parsed.migrationIndexSignature === "string"
+        ? { migrationIndexSignature: parsed.migrationIndexSignature }
+        : {}),
+    });
+  }
+
+  return entries;
+}
+
 function matchDocuments(
   records: StoredDocumentRecord[],
   params: QueryParams,
@@ -2177,6 +2796,10 @@ function collectionOrderKey(prefix: string, collection: string): string {
 
 function collectionSequenceKey(prefix: string, collection: string): string {
   return `${prefix}:sequence:${collection}`;
+}
+
+function indexSetKey(prefix: string, collection: string, indexName: string): string {
+  return `${prefix}:index:${collection}:${indexName}`;
 }
 
 function migrationTargetVersionSetKey(prefix: string, collection: string): string {

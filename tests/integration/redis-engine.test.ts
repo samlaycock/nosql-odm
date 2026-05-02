@@ -24,6 +24,7 @@ const isCi = process.env.CI === "true";
 const connectAttemptsRaw = Number(process.env.REDIS_CONNECT_ATTEMPTS ?? (isCi ? "180" : "60"));
 const connectDelayMsRaw = Number(process.env.REDIS_CONNECT_DELAY_MS ?? (isCi ? "1500" : "1000"));
 const keyPrefix = process.env.REDIS_TEST_PREFIX ?? createTestResourceName("nosql_odm_test");
+const INDEX_MEMBER_CREATED_AT_WIDTH = 20;
 
 type RedisClient = ReturnType<typeof createClient>;
 
@@ -50,12 +51,20 @@ function collectionOrderKey(prefix: string, collectionName: string): string {
   return `${prefix}:order:${collectionName}`;
 }
 
+function indexSetKey(prefix: string, collectionName: string, indexName: string): string {
+  return `${prefix}:index:${collectionName}:${indexName}`;
+}
+
 function migrationLockKey(prefix: string, collectionName: string): string {
   return `${prefix}:migration:lock:${collectionName}`;
 }
 
 function migrationCheckpointKey(prefix: string, collectionName: string): string {
   return `${prefix}:migration:checkpoint:${collectionName}`;
+}
+
+function encodeIndexMember(indexValue: string, createdAt: number, key: string): string {
+  return `${indexValue}\0${String(createdAt).padStart(INDEX_MEMBER_CREATED_AT_WIDTH, "0")}\0${key}`;
 }
 
 async function sleep(ms: number): Promise<void> {
@@ -438,6 +447,36 @@ describe("redisEngine integration", () => {
     expect(range.documents.map((item) => item.key)).toEqual(["u2"]);
     expect(between.documents.map((item) => item.key)).toEqual(["u2", "u3"]);
     expect(scan.documents).toHaveLength(3);
+  });
+
+  test("indexed queries work without consulting collection order entries", async () => {
+    await engine.put(collection, "u1", { id: "u1" }, { byRole: "member#a" });
+    await engine.put(collection, "u2", { id: "u2" }, { byRole: "member#b" });
+    await client.del(collectionOrderKey(keyPrefix, collection));
+
+    const results = await engine.query(collection, {
+      index: "byRole",
+      filter: { value: { $begins: "member#" } },
+      sort: "asc",
+    });
+
+    expect(results.documents.map((item) => item.key)).toEqual(["u1", "u2"]);
+  });
+
+  test("update and delete keep Redis index zsets in sync", async () => {
+    await engine.put(collection, "u1", { id: "u1" }, { byRole: "member#a" });
+
+    const original = await client.zRange(indexSetKey(keyPrefix, collection, "byRole"), 0, -1);
+    expect(original).toEqual([encodeIndexMember("member#a", 1, "u1")]);
+
+    await engine.update(collection, "u1", { id: "u1" }, { byRole: "member#b" });
+
+    const updated = await client.zRange(indexSetKey(keyPrefix, collection, "byRole"), 0, -1);
+    expect(updated).toEqual([encodeIndexMember("member#b", 1, "u1")]);
+
+    await engine.delete(collection, "u1");
+
+    expect(await client.zRange(indexSetKey(keyPrefix, collection, "byRole"), 0, -1)).toEqual([]);
   });
 
   test("query pagination edge cases", async () => {
