@@ -17,6 +17,7 @@ class MockRedisClient {
   batchFetchCalls = 0;
   indexPageCalls = 0;
   hashReads = 0;
+  syncMarkerWrites = 0;
 
   async get(key: string): Promise<unknown> {
     return this.strings.get(key) ?? null;
@@ -93,6 +94,14 @@ class MockRedisClient {
     if (script.includes("HMGET") && script.includes("documentHashKey(KEYS[1], KEYS[2], key)")) {
       this.batchFetchCalls += 1;
       return this.fetchBatchDocuments(options.keys, options.arguments);
+    }
+
+    if (script.includes('redis.call("ZADD", KEYS[1], 0, ARGV[i]')) {
+      return this.addIndexEntries(options.keys[0]!, options.arguments);
+    }
+
+    if (script.includes('redis.call("SET", KEYS[1], ARGV[1])')) {
+      return this.setStringIfMissing(options.keys[0]!, options.arguments[0]!);
     }
 
     if (script.includes("ZREVRANGEBYLEX") && script.includes("ZRANGEBYLEX")) {
@@ -206,6 +215,15 @@ class MockRedisClient {
         continue;
       }
 
+      if (
+        record.createdAt === undefined ||
+        record.writeVersion === undefined ||
+        record.doc === undefined ||
+        record.indexes === undefined
+      ) {
+        continue;
+      }
+
       results.push(
         JSON.stringify({
           key,
@@ -234,6 +252,24 @@ class MockRedisClient {
     );
     const ordered = sort === "desc" ? filtered.reverse() : filtered;
     return ordered.slice(0, count);
+  }
+
+  private addIndexEntries(key: string, args: string[]): number {
+    for (let i = 0; i < args.length; i += 3) {
+      this.zAdd(key, 0, encodeIndexMember(args[i]!, Number(args[i + 1]!), args[i + 2]!));
+    }
+
+    return 1;
+  }
+
+  private setStringIfMissing(key: string, value: string): number {
+    if (!this.strings.has(key)) {
+      this.strings.set(key, value);
+      this.syncMarkerWrites += 1;
+      return 1;
+    }
+
+    return 0;
   }
 
   private zAdd(key: string, score: number, member: string): void {
@@ -278,8 +314,13 @@ describe("redisEngine", () => {
     await engine.put("users", "u1", { id: "u1" }, { byRole: "member#a" });
     await engine.put("users", "u2", { id: "u2" }, { byRole: "member#b" });
 
-    client.zRangeCalls.length = 0;
+    await engine.query("users", {
+      index: "byRole",
+      filter: { value: { $begins: "member#" } },
+      sort: "asc",
+    });
 
+    client.zRangeCalls.length = 0;
     const results = await engine.query("users", {
       index: "byRole",
       filter: { value: { $begins: "member#" } },
@@ -289,6 +330,45 @@ describe("redisEngine", () => {
     expect(results.documents.map((item) => item.key)).toEqual(["u1", "u2"]);
     expect(client.indexPageCalls).toBeGreaterThan(0);
     expect(client.zRangeCalls).not.toContain(collectionOrderKey("test", "users"));
+  });
+
+  test("sorted indexed query backfills legacy documents before using the index set", async () => {
+    client.hashes.set(documentHashKey("test", "users", "u1"), {
+      createdAt: "1",
+      writeVersion: "1",
+      doc: JSON.stringify({ id: "u1" }),
+      indexes: JSON.stringify({ byRole: "member#a" }),
+      uniqueIndexes: "{}",
+      migrationTargetVersion: "0",
+      migrationVersionState: "unknown",
+      migrationIndexSignature: "",
+      migrationIndexSignatureToken: "__null__",
+    });
+    client.zsets.set(collectionOrderKey("test", "users"), new Map([["u1", 1]]));
+
+    const results = await engine.query("users", {
+      index: "byRole",
+      filter: { value: { $begins: "member#" } },
+      sort: "asc",
+    });
+
+    expect(results.documents.map((item) => item.key)).toEqual(["u1"]);
+    expect([...client.zsets.get(indexSetKey("test", "users", "byRole"))!.keys()]).toEqual([
+      encodeIndexMember("member#a", 1, "u1"),
+    ]);
+    expect(client.strings.get(collectionIndexSyncKey("test", "users"))).toBe("1");
+  });
+
+  test("batchGet skips malformed records missing writeVersion", async () => {
+    client.hashes.set(documentHashKey("test", "users", "u1"), {
+      createdAt: "1",
+      doc: JSON.stringify({ id: "u1" }),
+      indexes: JSON.stringify({ primary: "u1" }),
+    });
+
+    const results = await engine.batchGet("users", ["u1"]);
+
+    expect(results).toEqual([]);
   });
 
   test("update and delete keep index zsets in sync", async () => {
@@ -317,6 +397,10 @@ function collectionOrderKey(prefix: string, collection: string): string {
 
 function indexSetKey(prefix: string, collection: string, indexName: string): string {
   return `${prefix}:index:${collection}:${indexName}`;
+}
+
+function collectionIndexSyncKey(prefix: string, collection: string): string {
+  return `${prefix}:index-sync:${collection}`;
 }
 
 function encodeIndexMember(indexValue: string, createdAt: number, key: string): string {
