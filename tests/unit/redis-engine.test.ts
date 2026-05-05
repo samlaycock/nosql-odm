@@ -359,6 +359,41 @@ describe("redisEngine", () => {
     expect(client.strings.get(collectionIndexSyncKey("test", "users"))).toBe("1");
   });
 
+  test("sorted indexed pagination keeps advancing from the last collected valid member", async () => {
+    await engine.put("users", "u1", { id: "u1" }, { byRole: "member#a" });
+    await engine.put("users", "u2", { id: "u2" }, { byRole: "member#b" });
+    await engine.put("users", "u3", { id: "u3" }, { byRole: "member#c" });
+
+    client.zsets
+      .get(indexSetKey("test", "users", "byRole"))!
+      .set(encodeIndexMember("member#z", 999, "ghost"), 0);
+
+    const page1 = await engine.query("users", {
+      index: "byRole",
+      filter: { value: { $begins: "member#" } },
+      sort: "asc",
+      limit: 1,
+    });
+    const page2 = await engine.query("users", {
+      index: "byRole",
+      filter: { value: { $begins: "member#" } },
+      sort: "asc",
+      limit: 1,
+      cursor: page1.cursor ?? undefined,
+    });
+    const page3 = await engine.query("users", {
+      index: "byRole",
+      filter: { value: { $begins: "member#" } },
+      sort: "asc",
+      limit: 1,
+      cursor: page2.cursor ?? undefined,
+    });
+
+    expect(page1.documents.map((item) => item.key)).toEqual(["u1"]);
+    expect(page2.documents.map((item) => item.key)).toEqual(["u2"]);
+    expect(page3.documents.map((item) => item.key)).toEqual(["u3"]);
+  });
+
   test("batchGet skips malformed records missing writeVersion", async () => {
     client.hashes.set(documentHashKey("test", "users", "u1"), {
       createdAt: "1",

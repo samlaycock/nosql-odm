@@ -1326,7 +1326,7 @@ async function querySortedIndex(
     );
 
     return {
-      documents: records.map((record) => ({
+      documents: records.map(({ record }) => ({
         key: record.key,
         doc: structuredClone(record.doc),
         ...(includeWriteTokens ? { writeToken: String(record.writeVersion) } : {}),
@@ -1336,7 +1336,7 @@ async function querySortedIndex(
   }
 
   const cursorPosition = resolveQueryPageCursorPosition(collection, params);
-  const collected: StoredDocumentRecord[] = [];
+  const collected: IndexedRecordMatch[] = [];
   let cursorMember =
     cursorPosition?.kind === "sorted-index"
       ? encodeIndexMember(
@@ -1372,15 +1372,18 @@ async function querySortedIndex(
       batch,
     );
 
-    for (const record of valid) {
-      collected.push(record);
+    let lastCollectedMember: string | null = null;
+
+    for (const match of valid) {
+      collected.push(match);
+      lastCollectedMember = match.member;
 
       if (collected.length >= limit + 1) {
         break;
       }
     }
 
-    cursorMember = batch[batch.length - 1] ?? null;
+    cursorMember = lastCollectedMember ?? batch[batch.length - 1] ?? null;
 
     if (batch.length < requestSize) {
       break;
@@ -1391,7 +1394,7 @@ async function querySortedIndex(
   const hasMore = collected.length > limit;
 
   return {
-    documents: page.map((record) => ({
+    documents: page.map(({ record }) => ({
       key: record.key,
       doc: structuredClone(record.doc),
       ...(includeWriteTokens ? { writeToken: String(record.writeVersion) } : {}),
@@ -1399,9 +1402,9 @@ async function querySortedIndex(
     cursor:
       hasMore && page.length > 0
         ? encodeQueryPageCursor(collection, params, {
-            key: page[page.length - 1]!.key,
-            createdAt: page[page.length - 1]!.createdAt,
-            indexValue: page[page.length - 1]!.indexes[indexName] ?? "",
+            key: page[page.length - 1]!.record.key,
+            createdAt: page[page.length - 1]!.record.createdAt,
+            indexValue: page[page.length - 1]!.record.indexes[indexName] ?? "",
           })
         : null,
   };
@@ -1414,7 +1417,7 @@ async function loadRecordsFromIndexMembers(
   indexName: string,
   params: QueryParams,
   members: string[],
-): Promise<StoredDocumentRecord[]> {
+): Promise<IndexedRecordMatch[]> {
   const decoded = members.map((member) => ({
     member,
     parsed: decodeIndexMember(member),
@@ -1425,7 +1428,7 @@ async function loadRecordsFromIndexMembers(
     collection,
     uniqueStrings(decoded.map(({ parsed }) => parsed.key)),
   );
-  const records: StoredDocumentRecord[] = [];
+  const records: IndexedRecordMatch[] = [];
 
   for (const { member, parsed } of decoded) {
     const record = recordsByKey.get(parsed.key);
@@ -1444,7 +1447,10 @@ async function loadRecordsFromIndexMembers(
       continue;
     }
 
-    records.push(record);
+    records.push({
+      member,
+      record,
+    });
   }
 
   return records;
@@ -2173,6 +2179,11 @@ interface BatchDocumentEntry {
   migrationTargetVersion?: string;
   migrationVersionState?: string;
   migrationIndexSignature?: string;
+}
+
+interface IndexedRecordMatch {
+  member: string;
+  record: StoredDocumentRecord;
 }
 
 function buildIndexLexRange(filter: string | number | FieldCondition): IndexLexRange | null {
