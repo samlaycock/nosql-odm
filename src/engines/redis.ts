@@ -439,7 +439,7 @@ for _, key in ipairs(ARGV) do
     "migrationIndexSignature"
   )
 
-  if values[1] ~= false and values[3] ~= false and values[4] ~= false then
+  if values[1] ~= false and values[2] ~= false and values[3] ~= false and values[4] ~= false then
     table.insert(results, cjson.encode({
       key = key,
       createdAt = values[1],
@@ -462,6 +462,23 @@ if ARGV[1] == "desc" then
 end
 
 return redis.call("ZRANGEBYLEX", KEYS[1], ARGV[2], ARGV[3], "LIMIT", 0, tonumber(ARGV[4]))
+`;
+
+const ADD_INDEX_ENTRIES_SCRIPT = `
+for i = 1, #ARGV, 3 do
+  redis.call("ZADD", KEYS[1], 0, ARGV[i] .. "\\0" .. string.format("%020d", tonumber(ARGV[i + 1])) .. "\\0" .. ARGV[i + 2])
+end
+
+return 1
+`;
+
+const SET_STRING_IF_MISSING_SCRIPT = `
+if redis.call("EXISTS", KEYS[1]) == 0 then
+  redis.call("SET", KEYS[1], ARGV[1])
+  return 1
+end
+
+return 0
 `;
 
 const BUILD_MISMATCH_SET_SCRIPT = `
@@ -1201,6 +1218,8 @@ async function findMatchingDocuments(
     return matchDocuments(records, params);
   }
 
+  await ensureCollectionIndexesSynced(client, keyPrefix, collection);
+
   const range = buildIndexLexRange(params.filter.value);
 
   if (!range) {
@@ -1277,6 +1296,8 @@ async function querySortedIndex(
 ): Promise<EngineQueryResult> {
   const indexName = params.index!;
   const limit = normalizeLimit(params.limit);
+
+  await ensureCollectionIndexesSynced(client, keyPrefix, collection);
 
   if (limit === 0) {
     resolveQueryPageCursorPosition(collection, params);
@@ -1427,6 +1448,36 @@ async function loadRecordsFromIndexMembers(
   }
 
   return records;
+}
+
+async function ensureCollectionIndexesSynced(
+  client: RedisClientLike,
+  keyPrefix: string,
+  collection: string,
+): Promise<void> {
+  const markerKey = collectionIndexSyncKey(keyPrefix, collection);
+  const synced = await client.get(markerKey);
+
+  if (synced === "1") {
+    return;
+  }
+
+  const records = await listCollectionDocuments(client, keyPrefix, collection);
+
+  for (const record of records) {
+    const indexEntries = Object.entries(record.indexes);
+
+    for (const [indexName, indexValue] of indexEntries) {
+      await evalScript(
+        client,
+        ADD_INDEX_ENTRIES_SCRIPT,
+        [indexSetKey(keyPrefix, collection, indexName)],
+        [indexValue, String(record.createdAt), record.key],
+      );
+    }
+  }
+
+  await evalScript(client, SET_STRING_IF_MISSING_SCRIPT, [markerKey], ["1"]);
 }
 
 async function syncMigrationMetadataForCriteria(
@@ -2800,6 +2851,10 @@ function collectionSequenceKey(prefix: string, collection: string): string {
 
 function indexSetKey(prefix: string, collection: string, indexName: string): string {
   return `${prefix}:index:${collection}:${indexName}`;
+}
+
+function collectionIndexSyncKey(prefix: string, collection: string): string {
+  return `${prefix}:index-sync:${collection}`;
 }
 
 function migrationTargetVersionSetKey(prefix: string, collection: string): string {
