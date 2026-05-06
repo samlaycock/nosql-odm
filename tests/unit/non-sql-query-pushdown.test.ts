@@ -269,6 +269,8 @@ interface FakeFirestoreDocSnapshot {
 }
 
 class FakeFirestoreQuery {
+  private shouldThrowOnGet = false;
+
   constructor(
     protected readonly docs: AnyRecord[],
     protected readonly whereCalls: Array<{ field: string; op: string; value: unknown }>,
@@ -307,12 +309,30 @@ class FakeFirestoreQuery {
     return new FakeFirestoreQuery(filtered, this.whereCalls, this.onGet);
   }
 
+  orderBy(_fieldPath: string, _directionStr?: "asc" | "desc") {
+    this.shouldThrowOnGet = true;
+    return this;
+  }
+
+  startAfter(..._fieldValues: unknown[]) {
+    return this;
+  }
+
   limit(_limit: number) {
     return this;
   }
 
   async get() {
     this.onGet();
+
+    if (this.shouldThrowOnGet) {
+      const error = new Error("FAILED_PRECONDITION: The query requires an index") as Error & {
+        name: string;
+      };
+      error.name = "FAILED_PRECONDITION";
+      throw error;
+    }
+
     const snapshots: FakeFirestoreDocSnapshot[] = this.docs.map((doc) => ({
       exists: true,
       id: String(doc.key),
@@ -996,6 +1016,27 @@ describe("non-SQL query pushdown", () => {
       }),
     ).rejects.toThrow(/cursor/i);
     expect(db.documentGetCalls).toBe(0);
+  });
+
+  test("firestore query falls back when native pushdown requires an index", async () => {
+    const db = new FakeFirestoreDatabase([
+      makeEngineDoc("u1", 1, { byEmail: "a@example.com" }, { id: "u1" }),
+      makeEngineDoc("u2", 2, { byEmail: "b@example.com" }, { id: "u2" }),
+      makeEngineDoc("u3", 3, { byEmail: "a@example.com" }, { id: "u3" }),
+    ]);
+    const engine = firestoreEngine({
+      database: db as unknown as Parameters<typeof firestoreEngine>[0]["database"],
+    });
+
+    const result = await engine.query("users", {
+      index: "byEmail",
+      filter: { value: "a@example.com" },
+      limit: 2,
+    });
+
+    expect(result.documents.map((doc) => doc.key)).toEqual(["u1", "u3"]);
+    expect(result.cursor).toBeNull();
+    expect(db.documentGetCalls).toBe(2);
   });
 
   test("dynamodb query uses a secondary lookup item query instead of FilterExpression scans", async () => {
