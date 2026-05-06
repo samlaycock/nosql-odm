@@ -107,6 +107,15 @@ export interface MongoDbEngineOptions {
    * fallback path.
    */
   onQueryFallbackScan?: (event: MongoDbQueryFallbackScanEvent) => void;
+  /**
+   * Index names to provision compound MongoDB indexes for. For each name, two
+   * compound indexes are created on the documents collection:
+   *   { collection, indexes.<name>, createdAt, key } ascending
+   *   { collection, indexes.<name>, createdAt, key } descending on indexes.<name>
+   * These indexes back the native query plans produced by sorted and paginated
+   * queries that filter on the named index field.
+   */
+  queryIndexes?: string[];
 }
 
 export interface MongoDbQueryEngine extends QueryEngine<never> {}
@@ -174,7 +183,7 @@ export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine
     options.metadataCollection ?? DEFAULT_METADATA_COLLECTION,
   );
 
-  const ready = ensureSchema(documentsCollection, metadataCollection);
+  const ready = ensureSchema(documentsCollection, metadataCollection, options.queryIndexes ?? []);
 
   const engine: MongoDbQueryEngine = {
     capabilities: {
@@ -910,6 +919,7 @@ export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine
 async function ensureSchema(
   documentsCollection: MongoCollectionLike,
   metadataCollection: MongoCollectionLike,
+  queryIndexes: string[],
 ): Promise<void> {
   await documentsCollection.createIndex(
     {
@@ -960,6 +970,24 @@ async function ensureSchema(
       unique: true,
     },
   );
+
+  for (const name of queryIndexes) {
+    const indexField = `indexes.${name}` as const;
+
+    await documentsCollection.createIndex({
+      collection: 1,
+      [indexField]: 1,
+      createdAt: 1,
+      key: 1,
+    });
+
+    await documentsCollection.createIndex({
+      collection: 1,
+      [indexField]: -1,
+      createdAt: 1,
+      key: 1,
+    });
+  }
 }
 
 async function nextCreatedAt(
