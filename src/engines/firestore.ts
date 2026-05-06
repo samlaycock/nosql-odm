@@ -4,6 +4,7 @@ import { DefaultMigrator } from "../migrator";
 import { getPreparedClone, prepareDocumentForStorage } from "./document-preparation";
 import {
   encodeQueryPageCursor,
+  resolveQueryPageCursorPosition,
   resolveQueryPageStartIndex,
   validateQueryPageCursor,
 } from "./query-cursor";
@@ -53,6 +54,8 @@ interface FirestoreDocumentReferenceLike {
 
 interface FirestoreQueryLike {
   where(fieldPath: string, opStr: string, value: unknown): FirestoreQueryLike;
+  orderBy(fieldPath: string, directionStr?: "asc" | "desc"): FirestoreQueryLike;
+  startAfter(...fieldValues: unknown[]): FirestoreQueryLike;
   limit(limit: number): FirestoreQueryLike;
   get(): Promise<unknown>;
 }
@@ -77,6 +80,7 @@ interface FirestoreTransactionLike {
 
 interface FirestoreLike {
   collection(path: string): FirestoreCollectionLike;
+  getAll?(...refs: unknown[]): Promise<unknown[]>;
   runTransaction<T>(
     updateFunction: (transaction: FirestoreTransactionLike) => Promise<T>,
   ): Promise<T>;
@@ -334,6 +338,14 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
 
     async query(collection, params) {
       validateQueryPageCursor(collection, params);
+      const paged =
+        (await queryCollectionDocumentsPage(documentsCollection, collection, params, false)) ??
+        null;
+
+      if (paged) {
+        return paged;
+      }
+
       const records =
         (await listCollectionDocumentsByQuery(documentsCollection, collection, params)) ??
         (await listCollectionDocuments(documentsCollection, collection));
@@ -344,6 +356,13 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
 
     async queryWithMetadata(collection, params) {
       validateQueryPageCursor(collection, params);
+      const paged =
+        (await queryCollectionDocumentsPage(documentsCollection, collection, params, true)) ?? null;
+
+      if (paged) {
+        return paged;
+      }
+
       const records =
         (await listCollectionDocumentsByQuery(documentsCollection, collection, params)) ??
         (await listCollectionDocuments(documentsCollection, collection));
@@ -353,94 +372,11 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
     },
 
     async batchGet(collection, keys) {
-      const uniqueKeys = uniqueStrings(keys);
-      const fetchedEntries = await Promise.all(
-        uniqueKeys.map(async (key) => {
-          const raw = await documentRef(documentsCollection, collection, key).get();
-          const snapshot = parseDocumentSnapshot(raw, "document record");
-
-          if (!snapshot.exists) {
-            return null;
-          }
-
-          const record = parseStoredDocumentRecord(snapshotData(snapshot, "document record"));
-
-          return [key, record] as const;
-        }),
-      );
-
-      const fetched = new Map<string, StoredDocumentRecord>();
-
-      for (const entry of fetchedEntries) {
-        if (!entry) {
-          continue;
-        }
-
-        fetched.set(entry[0], entry[1]);
-      }
-
-      const results: KeyedDocument[] = [];
-
-      for (const key of keys) {
-        const record = fetched.get(key);
-
-        if (!record) {
-          continue;
-        }
-
-        results.push({
-          key,
-          doc: structuredClone(record.doc),
-        });
-      }
-
-      return results;
+      return batchGetDocuments(database, documentsCollection, collection, keys, false);
     },
 
     async batchGetWithMetadata(collection, keys) {
-      const uniqueKeys = uniqueStrings(keys);
-      const fetchedEntries = await Promise.all(
-        uniqueKeys.map(async (key) => {
-          const raw = await documentRef(documentsCollection, collection, key).get();
-          const snapshot = parseDocumentSnapshot(raw, "document record");
-
-          if (!snapshot.exists) {
-            return null;
-          }
-
-          const record = parseStoredDocumentRecord(snapshotData(snapshot, "document record"));
-
-          return [key, record] as const;
-        }),
-      );
-
-      const fetched = new Map<string, StoredDocumentRecord>();
-
-      for (const entry of fetchedEntries) {
-        if (!entry) {
-          continue;
-        }
-
-        fetched.set(entry[0], entry[1]);
-      }
-
-      const results: KeyedDocument[] = [];
-
-      for (const key of keys) {
-        const record = fetched.get(key);
-
-        if (!record) {
-          continue;
-        }
-
-        results.push({
-          key,
-          doc: structuredClone(record.doc),
-          writeToken: String(record.writeVersion),
-        });
-      }
-
-      return results;
+      return batchGetDocuments(database, documentsCollection, collection, keys, true);
     },
 
     async batchSet(collection, items) {
@@ -915,6 +851,214 @@ async function listCollectionDocumentsByQuery(
   });
 
   return records;
+}
+
+async function batchGetDocuments(
+  database: FirestoreLike,
+  documentsCollection: FirestoreCollectionLike,
+  collection: string,
+  keys: string[],
+  includeWriteTokens: boolean,
+): Promise<KeyedDocument[]> {
+  const uniqueKeys = uniqueStrings(keys);
+  const refs = uniqueKeys.map((key) => documentRef(documentsCollection, collection, key));
+  const snapshotsRaw = database.getAll
+    ? await database.getAll(...refs)
+    : await Promise.all(refs.map(async (ref) => ref.get()));
+  const fetched = new Map<string, StoredDocumentRecord>();
+
+  for (let i = 0; i < uniqueKeys.length; i++) {
+    const key = uniqueKeys[i];
+    const raw = snapshotsRaw[i];
+
+    if (key === undefined || raw === undefined) {
+      continue;
+    }
+
+    const snapshot = parseDocumentSnapshot(raw, "document record");
+
+    if (!snapshot.exists) {
+      continue;
+    }
+
+    fetched.set(key, parseStoredDocumentRecord(snapshotData(snapshot, "document record")));
+  }
+
+  const results: KeyedDocument[] = [];
+
+  for (const key of keys) {
+    const record = fetched.get(key);
+
+    if (!record) {
+      continue;
+    }
+
+    results.push(
+      includeWriteTokens
+        ? {
+            key,
+            doc: structuredClone(record.doc),
+            writeToken: String(record.writeVersion),
+          }
+        : {
+            key,
+            doc: structuredClone(record.doc),
+          },
+    );
+  }
+
+  return results;
+}
+
+async function queryCollectionDocumentsPage(
+  documentsCollection: FirestoreCollectionLike,
+  collection: string,
+  params: QueryParams,
+  includeWriteTokens: boolean,
+): Promise<EngineQueryResult | null> {
+  const plan = buildFirestoreQueryPlan(documentsCollection, collection, params);
+
+  if (!plan) {
+    return null;
+  }
+
+  let query = plan.query;
+  const pageSize = normalizeLimit(params.limit);
+  const fetchLimit = pageSize === null ? null : pageSize + 1;
+
+  if (fetchLimit !== null) {
+    query = query.limit(fetchLimit);
+  }
+
+  const raw = await query.get();
+  const snapshot = parseQuerySnapshot(raw, "document record");
+  const records = snapshot.docs.map((doc) =>
+    parseStoredDocumentRecord(snapshotData(doc, "document record")),
+  );
+  const hasMore = fetchLimit !== null && pageSize !== null && records.length > pageSize;
+  const pageRecords = hasMore && pageSize !== null ? records.slice(0, pageSize) : records;
+
+  return buildFirestoreQueryPageResult(
+    collection,
+    params,
+    pageRecords,
+    hasMore,
+    includeWriteTokens,
+  );
+}
+
+function buildFirestoreQueryPlan(
+  documentsCollection: FirestoreCollectionLike,
+  collection: string,
+  params: QueryParams,
+): { query: FirestoreQueryLike } | null {
+  const cursorPosition = resolveQueryPageCursorPosition(collection, params);
+
+  if (!params.index || !params.filter) {
+    if (params.sort) {
+      return null;
+    }
+
+    let query: FirestoreQueryLike = documentsCollection.where("collection", "==", collection);
+    query = query.orderBy("createdAt", "asc").orderBy("key", "asc");
+
+    if (cursorPosition) {
+      if (cursorPosition.kind !== "scan") {
+        return null;
+      }
+
+      query = query.startAfter(cursorPosition.createdAt, cursorPosition.key);
+    }
+
+    return { query };
+  }
+
+  const filters = buildFirestoreWhereFilters(params.filter.value);
+
+  if (!filters) {
+    return null;
+  }
+
+  const hasInequality = filters.some((filter) => filter.op !== "==");
+
+  if (!params.sort && hasInequality) {
+    return null;
+  }
+
+  const indexField = `indexes.${params.index}`;
+  let query: FirestoreQueryLike = documentsCollection.where("collection", "==", collection);
+
+  for (const filter of filters) {
+    query = query.where(indexField, filter.op, filter.value);
+  }
+
+  if (params.sort) {
+    query = query
+      .orderBy(indexField, params.sort)
+      .orderBy("createdAt", "asc")
+      .orderBy("key", "asc");
+
+    if (cursorPosition) {
+      if (cursorPosition.kind !== "sorted-index" || cursorPosition.createdAt === undefined) {
+        return null;
+      }
+
+      query = query.startAfter(
+        cursorPosition.indexValue,
+        cursorPosition.createdAt,
+        cursorPosition.key,
+      );
+    }
+
+    return { query };
+  }
+
+  query = query.orderBy("createdAt", "asc").orderBy("key", "asc");
+
+  if (cursorPosition) {
+    if (cursorPosition.kind !== "scan") {
+      return null;
+    }
+
+    query = query.startAfter(cursorPosition.createdAt, cursorPosition.key);
+  }
+
+  return { query };
+}
+
+function buildFirestoreQueryPageResult(
+  collection: string,
+  params: QueryParams,
+  records: StoredDocumentRecord[],
+  hasMore: boolean,
+  includeWriteTokens: boolean,
+): EngineQueryResult {
+  const cursor =
+    hasMore && records.length > 0
+      ? encodeQueryPageCursor(collection, params, {
+          key: records[records.length - 1]!.key,
+          createdAt: records[records.length - 1]!.createdAt,
+          indexValue: params.index
+            ? (records[records.length - 1]!.indexes[params.index] ?? "")
+            : undefined,
+        })
+      : null;
+
+  return {
+    documents: records.map((record) =>
+      includeWriteTokens
+        ? {
+            key: record.key,
+            doc: structuredClone(record.doc),
+            writeToken: String(record.writeVersion),
+          }
+        : {
+            key: record.key,
+            doc: structuredClone(record.doc),
+          },
+    ),
+    cursor,
+  };
 }
 
 interface FirestoreWhereClause {

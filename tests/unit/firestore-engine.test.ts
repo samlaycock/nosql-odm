@@ -13,11 +13,30 @@ interface FakeWhereClause {
   readonly value: unknown;
 }
 
+interface FakeOrderByClause {
+  readonly fieldPath: string;
+  readonly direction: "asc" | "desc";
+}
+
+interface FakeQueryState {
+  readonly filters: readonly FakeWhereClause[];
+  readonly orderBy: readonly FakeOrderByClause[];
+  readonly startAfter: readonly unknown[];
+  readonly limit: number | null;
+}
+
+interface FakeFirestoreInstrumentation {
+  readonly documentGetCalls: string[];
+  readonly getAllCalls: string[][];
+  readonly queryReads: FakeQueryState[];
+}
+
 class FakeFirestoreDocumentReference {
   readonly id: string;
 
   constructor(
     private readonly store: Map<string, FakeFirestoreRecord>,
+    private readonly instrumentation: FakeFirestoreInstrumentation,
     id: string,
   ) {
     this.id = id;
@@ -57,6 +76,7 @@ class FakeFirestoreDocumentReference {
   }
 
   async get() {
+    this.instrumentation.documentGetCalls.push(this.id);
     return this.readSnapshot();
   }
 
@@ -72,44 +92,106 @@ class FakeFirestoreDocumentReference {
 class FakeFirestoreQuery {
   constructor(
     protected readonly store: Map<string, FakeFirestoreRecord>,
-    private readonly filters: readonly FakeWhereClause[] = [],
+    protected readonly instrumentation: FakeFirestoreInstrumentation,
+    private readonly state: FakeQueryState = {
+      filters: [],
+      orderBy: [],
+      startAfter: [],
+      limit: null,
+    },
   ) {}
 
   where(fieldPath: string, opStr: string, value: unknown) {
-    return new FakeFirestoreQuery(this.store, [
-      ...this.filters,
-      {
-        fieldPath,
-        opStr,
-        value,
-      },
-    ]);
+    return new FakeFirestoreQuery(this.store, this.instrumentation, {
+      ...this.state,
+      filters: [
+        ...this.state.filters,
+        {
+          fieldPath,
+          opStr,
+          value,
+        },
+      ],
+    });
   }
 
-  limit(_limit: number) {
-    return this;
+  orderBy(fieldPath: string, direction: "asc" | "desc" = "asc") {
+    return new FakeFirestoreQuery(this.store, this.instrumentation, {
+      ...this.state,
+      orderBy: [
+        ...this.state.orderBy,
+        {
+          fieldPath,
+          direction,
+        },
+      ],
+    });
+  }
+
+  startAfter(...values: unknown[]) {
+    return new FakeFirestoreQuery(this.store, this.instrumentation, {
+      ...this.state,
+      startAfter: [...values],
+    });
+  }
+
+  limit(limit: number) {
+    return new FakeFirestoreQuery(this.store, this.instrumentation, {
+      ...this.state,
+      limit,
+    });
   }
 
   async get() {
-    const docs = [...this.store.entries()]
-      .filter(([, record]) => this.filters.every((filter) => matchesWhereClause(record, filter)))
-      .map(([id, record]) => ({
-        exists: true,
-        id,
-        data: () => structuredClone(record),
-      }));
+    this.instrumentation.queryReads.push({
+      filters: [...this.state.filters],
+      orderBy: [...this.state.orderBy],
+      startAfter: [...this.state.startAfter],
+      limit: this.state.limit,
+    });
+
+    let entries = [...this.store.entries()].filter(([, record]) =>
+      this.state.filters.every((filter) => matchesWhereClause(record, filter)),
+    );
+
+    if (this.state.orderBy.length > 0) {
+      entries = [...entries].sort((left, right) =>
+        compareQueryEntries(left, right, this.state.orderBy),
+      );
+    }
+
+    if (this.state.startAfter.length > 0) {
+      const startAfterIndex = entries.findIndex((entry) =>
+        queryEntryMatchesCursorValues(entry, this.state.orderBy, this.state.startAfter),
+      );
+
+      entries = startAfterIndex === -1 ? [] : entries.slice(startAfterIndex + 1);
+    }
+
+    if (this.state.limit !== null) {
+      entries = entries.slice(0, this.state.limit);
+    }
+
+    const docs = entries.map(([id, record]) => ({
+      exists: true,
+      id,
+      data: () => structuredClone(record),
+    }));
 
     return { docs };
   }
 }
 
 class FakeFirestoreCollection extends FakeFirestoreQuery {
-  constructor(store: Map<string, FakeFirestoreRecord>) {
-    super(store);
+  constructor(
+    store: Map<string, FakeFirestoreRecord>,
+    instrumentation: FakeFirestoreInstrumentation,
+  ) {
+    super(store, instrumentation);
   }
 
   doc(id: string = crypto.randomUUID()) {
-    return new FakeFirestoreDocumentReference(this.store, id);
+    return new FakeFirestoreDocumentReference(this.store, this.instrumentation, id);
   }
 }
 
@@ -157,9 +239,20 @@ class FakeFirestoreTransaction {
 
 class FakeFirestoreDatabase {
   private readonly stores = new Map<string, Map<string, FakeFirestoreRecord>>();
+  readonly instrumentation: FakeFirestoreInstrumentation = {
+    documentGetCalls: [],
+    getAllCalls: [],
+    queryReads: [],
+  };
 
   collection(path: string) {
-    return new FakeFirestoreCollection(this.getStore(path));
+    return new FakeFirestoreCollection(this.getStore(path), this.instrumentation);
+  }
+
+  async getAll(...refs: unknown[]) {
+    const resolvedRefs = refs.map((ref) => getFakeRef(ref));
+    this.instrumentation.getAllCalls.push(resolvedRefs.map((ref) => ref.id));
+    return resolvedRefs.map((ref) => ref.readSnapshot());
   }
 
   async runTransaction<T>(updateFunction: (transaction: FakeFirestoreTransaction) => Promise<T>) {
@@ -249,13 +342,135 @@ function compareUnknown(left: unknown, right: unknown): number {
   return String(left).localeCompare(String(right));
 }
 
-describe("firestoreEngine unique constraints", () => {
-  function createEngine(database: FakeFirestoreDatabase = new FakeFirestoreDatabase()) {
-    return firestoreEngine({
-      database: database as unknown as Parameters<typeof firestoreEngine>[0]["database"],
-    });
+function createEngine(database: FakeFirestoreDatabase = new FakeFirestoreDatabase()) {
+  return firestoreEngine({
+    database: database as unknown as Parameters<typeof firestoreEngine>[0]["database"],
+  });
+}
+
+function compareQueryEntries(
+  left: readonly [string, FakeFirestoreRecord],
+  right: readonly [string, FakeFirestoreRecord],
+  orderBy: readonly FakeOrderByClause[],
+): number {
+  for (const clause of orderBy) {
+    const leftValue = readFieldValue(left[1], clause.fieldPath);
+    const rightValue = readFieldValue(right[1], clause.fieldPath);
+    const base = compareUnknown(leftValue, rightValue);
+
+    if (base !== 0) {
+      return clause.direction === "desc" ? -base : base;
+    }
   }
 
+  return left[0].localeCompare(right[0]);
+}
+
+function queryEntryMatchesCursorValues(
+  entry: readonly [string, FakeFirestoreRecord],
+  orderBy: readonly FakeOrderByClause[],
+  cursorValues: readonly unknown[],
+): boolean {
+  if (cursorValues.length !== orderBy.length) {
+    return false;
+  }
+
+  return orderBy.every(
+    (clause, index) => readFieldValue(entry[1], clause.fieldPath) === cursorValues[index],
+  );
+}
+
+describe("firestoreEngine query execution", () => {
+  test("batchGet uses getAll to read unique keys and preserves request order", async () => {
+    const database = new FakeFirestoreDatabase();
+    const engine = createEngine(database);
+
+    await engine.batchSet("users", [
+      { key: "u1", doc: { id: "u1", name: "A" }, indexes: { primary: "u1" } },
+      { key: "u2", doc: { id: "u2", name: "B" }, indexes: { primary: "u2" } },
+    ]);
+
+    const results = await engine.batchGet("users", ["u2", "u1", "u2", "missing"]);
+
+    expect(results.map((entry) => entry.key)).toEqual(["u2", "u1", "u2"]);
+    expect(database.instrumentation.getAllCalls).toEqual([
+      ["doc:users:u2", "doc:users:u1", "doc:users:missing"],
+    ]);
+    expect(database.instrumentation.documentGetCalls).toEqual([]);
+  });
+
+  test("query pushes sorted pagination into Firestore when the query is expressible", async () => {
+    const database = new FakeFirestoreDatabase();
+    const engine = createEngine(database);
+
+    await engine.batchSet("users", [
+      {
+        key: "u1",
+        doc: { id: "u1", createdAt: "2025-01-01" },
+        indexes: { byCreatedAt: "2025-01-01" },
+      },
+      {
+        key: "u2",
+        doc: { id: "u2", createdAt: "2025-02-01" },
+        indexes: { byCreatedAt: "2025-02-01" },
+      },
+      {
+        key: "u3",
+        doc: { id: "u3", createdAt: "2025-03-01" },
+        indexes: { byCreatedAt: "2025-03-01" },
+      },
+    ]);
+
+    const firstPage = await engine.query("users", {
+      index: "byCreatedAt",
+      filter: { value: { $begins: "2025-" } },
+      sort: "desc",
+      limit: 2,
+    });
+
+    expect(firstPage.documents.map((entry) => entry.key)).toEqual(["u3", "u2"]);
+    expect(database.instrumentation.queryReads.at(-1)).toEqual({
+      filters: [
+        { fieldPath: "collection", opStr: "==", value: "users" },
+        { fieldPath: "indexes.byCreatedAt", opStr: ">=", value: "2025-" },
+        { fieldPath: "indexes.byCreatedAt", opStr: "<=", value: "2025-\uf8ff" },
+      ],
+      orderBy: [
+        { fieldPath: "indexes.byCreatedAt", direction: "desc" },
+        { fieldPath: "createdAt", direction: "asc" },
+        { fieldPath: "key", direction: "asc" },
+      ],
+      startAfter: [],
+      limit: 3,
+    });
+
+    const secondPage = await engine.query("users", {
+      index: "byCreatedAt",
+      filter: { value: { $begins: "2025-" } },
+      sort: "desc",
+      limit: 2,
+      cursor: firstPage.cursor ?? undefined,
+    });
+
+    expect(secondPage.documents.map((entry) => entry.key)).toEqual(["u1"]);
+    expect(database.instrumentation.queryReads.at(-1)).toEqual({
+      filters: [
+        { fieldPath: "collection", opStr: "==", value: "users" },
+        { fieldPath: "indexes.byCreatedAt", opStr: ">=", value: "2025-" },
+        { fieldPath: "indexes.byCreatedAt", opStr: "<=", value: "2025-\uf8ff" },
+      ],
+      orderBy: [
+        { fieldPath: "indexes.byCreatedAt", direction: "desc" },
+        { fieldPath: "createdAt", direction: "asc" },
+        { fieldPath: "key", direction: "asc" },
+      ],
+      startAfter: ["2025-02-01", 2, "u2"],
+      limit: 3,
+    });
+  });
+});
+
+describe("firestoreEngine unique constraints", () => {
   test("create rejects duplicate unique index ownership", async () => {
     const engine = createEngine();
 
