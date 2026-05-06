@@ -941,7 +941,18 @@ async function queryCollectionDocumentsPage(
     query = query.limit(fetchLimit);
   }
 
-  const raw = await query.get();
+  let raw: unknown;
+
+  try {
+    raw = await query.get();
+  } catch (error) {
+    if (isFirestoreMissingIndexError(error)) {
+      return null;
+    }
+
+    throw error;
+  }
+
   const snapshot = parseQuerySnapshot(raw, "document record");
   const records = snapshot.docs.map((doc) =>
     parseStoredDocumentRecord(snapshotData(doc, "document record")),
@@ -2335,6 +2346,22 @@ function chunkRefs<T>(values: T[], size: number): T[][] {
   }
 
   return chunks;
+}
+
+function isFirestoreMissingIndexError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  const message = error.message.toLowerCase();
+  const name = error.name.toLowerCase();
+
+  return (
+    message.includes("requires an index") ||
+    message.includes("the query requires an index") ||
+    message.includes("failed_precondition") ||
+    name === "failed_precondition"
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
