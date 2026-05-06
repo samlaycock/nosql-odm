@@ -28,6 +28,7 @@ import {
 
 const DEFAULT_DOCUMENTS_COLLECTION = "nosql_odm_documents";
 const DEFAULT_METADATA_COLLECTION = "nosql_odm_metadata";
+const FIRESTORE_GET_ALL_MAX_REFS = 300;
 const OUTDATED_PAGE_LIMIT = 100;
 const OUTDATED_SYNC_CHUNK_SIZE = 100;
 
@@ -862,26 +863,36 @@ async function batchGetDocuments(
 ): Promise<KeyedDocument[]> {
   const uniqueKeys = uniqueStrings(keys);
   const refs = uniqueKeys.map((key) => documentRef(documentsCollection, collection, key));
-  const snapshotsRaw = database.getAll
-    ? await database.getAll(...refs)
-    : await Promise.all(refs.map(async (ref) => ref.get()));
   const fetched = new Map<string, StoredDocumentRecord>();
 
-  for (let i = 0; i < uniqueKeys.length; i++) {
-    const key = uniqueKeys[i];
-    const raw = snapshotsRaw[i];
+  if (database.getAll) {
+    for (const refChunk of chunkRefs(refs, FIRESTORE_GET_ALL_MAX_REFS)) {
+      const snapshotsRaw = await database.getAll(...refChunk);
 
-    if (key === undefined || raw === undefined) {
-      continue;
+      for (const raw of snapshotsRaw) {
+        const snapshot = parseDocumentSnapshot(raw, "document record");
+
+        if (!snapshot.exists) {
+          continue;
+        }
+
+        const record = parseStoredDocumentRecord(snapshotData(snapshot, "document record"));
+        fetched.set(record.key, record);
+      }
     }
+  } else {
+    const snapshotsRaw = await Promise.all(refs.map(async (ref) => ref.get()));
 
-    const snapshot = parseDocumentSnapshot(raw, "document record");
+    for (const raw of snapshotsRaw) {
+      const snapshot = parseDocumentSnapshot(raw, "document record");
 
-    if (!snapshot.exists) {
-      continue;
+      if (!snapshot.exists) {
+        continue;
+      }
+
+      const record = parseStoredDocumentRecord(snapshotData(snapshot, "document record"));
+      fetched.set(record.key, record);
     }
-
-    fetched.set(key, parseStoredDocumentRecord(snapshotData(snapshot, "document record")));
   }
 
   const results: KeyedDocument[] = [];
@@ -2314,6 +2325,16 @@ function uniqueStrings(values: string[]): string[] {
   }
 
   return unique;
+}
+
+function chunkRefs<T>(values: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+
+  for (let i = 0; i < values.length; i += size) {
+    chunks.push(values.slice(i, i + size));
+  }
+
+  return chunks;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -275,6 +275,13 @@ class FakeFirestoreDatabase {
   }
 }
 
+class ReorderingGetAllFirestoreDatabase extends FakeFirestoreDatabase {
+  override async getAll(...refs: unknown[]) {
+    const snapshots = await super.getAll(...refs);
+    return [...snapshots].reverse();
+  }
+}
+
 class RejectingGetAllFirestoreTransaction extends FakeFirestoreTransaction {
   override getAll(..._refs: unknown[]) {
     return Promise.reject(new Error("getAll should not be called")) as ReturnType<
@@ -399,6 +406,32 @@ describe("firestoreEngine query execution", () => {
     expect(database.instrumentation.documentGetCalls).toEqual([]);
   });
 
+  test("batchGet chunks large getAll reads and does not rely on snapshot order", async () => {
+    const database = new ReorderingGetAllFirestoreDatabase();
+    const engine = createEngine(database);
+    const items = Array.from({ length: 305 }, (_, index) => ({
+      key: `u${String(index + 1)}`,
+      doc: { id: `u${String(index + 1)}` },
+      indexes: { primary: `u${String(index + 1)}` },
+    }));
+    const requestKeys = items.map((item) => item.key);
+
+    await engine.batchSet("users", items);
+
+    const results = await engine.batchGet("users", requestKeys);
+
+    expect(database.instrumentation.getAllCalls).toHaveLength(2);
+    expect(database.instrumentation.getAllCalls[0]).toHaveLength(300);
+    expect(database.instrumentation.getAllCalls[1]).toEqual([
+      "doc:users:u301",
+      "doc:users:u302",
+      "doc:users:u303",
+      "doc:users:u304",
+      "doc:users:u305",
+    ]);
+    expect(results.map((entry) => entry.key)).toEqual(requestKeys);
+  });
+
   test("query pushes sorted pagination into Firestore when the query is expressible", async () => {
     const database = new FakeFirestoreDatabase();
     const engine = createEngine(database);
@@ -465,6 +498,75 @@ describe("firestoreEngine query execution", () => {
         { fieldPath: "key", direction: "asc" },
       ],
       startAfter: ["2025-02-01", 2, "u2"],
+      limit: 3,
+    });
+  });
+
+  test("query pushes equality-only pagination into Firestore with scan cursors", async () => {
+    const database = new FakeFirestoreDatabase();
+    const engine = createEngine(database);
+
+    await engine.batchSet("users", [
+      {
+        key: "u1",
+        doc: { id: "u1", status: "active" },
+        indexes: { status: "active" },
+      },
+      {
+        key: "u2",
+        doc: { id: "u2", status: "inactive" },
+        indexes: { status: "inactive" },
+      },
+      {
+        key: "u3",
+        doc: { id: "u3", status: "active" },
+        indexes: { status: "active" },
+      },
+      {
+        key: "u4",
+        doc: { id: "u4", status: "active" },
+        indexes: { status: "active" },
+      },
+    ]);
+
+    const firstPage = await engine.query("users", {
+      index: "status",
+      filter: { value: "active" },
+      limit: 2,
+    });
+
+    expect(firstPage.documents.map((entry) => entry.key)).toEqual(["u1", "u3"]);
+    expect(database.instrumentation.queryReads.at(-1)).toEqual({
+      filters: [
+        { fieldPath: "collection", opStr: "==", value: "users" },
+        { fieldPath: "indexes.status", opStr: "==", value: "active" },
+      ],
+      orderBy: [
+        { fieldPath: "createdAt", direction: "asc" },
+        { fieldPath: "key", direction: "asc" },
+      ],
+      startAfter: [],
+      limit: 3,
+    });
+
+    const secondPage = await engine.query("users", {
+      index: "status",
+      filter: { value: "active" },
+      limit: 2,
+      cursor: firstPage.cursor ?? undefined,
+    });
+
+    expect(secondPage.documents.map((entry) => entry.key)).toEqual(["u4"]);
+    expect(database.instrumentation.queryReads.at(-1)).toEqual({
+      filters: [
+        { fieldPath: "collection", opStr: "==", value: "users" },
+        { fieldPath: "indexes.status", opStr: "==", value: "active" },
+      ],
+      orderBy: [
+        { fieldPath: "createdAt", direction: "asc" },
+        { fieldPath: "key", direction: "asc" },
+      ],
+      startAfter: [3, "u3"],
       limit: 3,
     });
   });
