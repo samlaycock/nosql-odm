@@ -397,6 +397,30 @@ describe("batchSet()", () => {
 
     expect(stored.nested.value).toBe(1);
   });
+
+  test("does not persist any documents when write preparation fails", async () => {
+    engine = memoryEngine({
+      onBeforePut(_collection, key) {
+        if (key === "b") {
+          throw new Error("write preparation failed");
+        }
+      },
+    });
+
+    try {
+      await engine.batchSet!("users", [
+        { key: "a", doc: { id: "a", name: "Alice" }, indexes: { primary: "a" } },
+        { key: "b", doc: { id: "b", name: "Bob" }, indexes: { primary: "b" } },
+      ]);
+      throw new Error("expected batchSet to fail");
+    } catch (error) {
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toBe("write preparation failed");
+    }
+
+    expect(await engine.get("users", "a")).toBeNull();
+    expect(await engine.get("users", "b")).toBeNull();
+  });
 });
 
 // ---------------------------------------------------------------------------
