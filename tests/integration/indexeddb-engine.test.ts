@@ -32,6 +32,7 @@ interface RawOpenRequest<TDatabase> extends RawRequest<TDatabase> {
 }
 
 interface RawObjectStore {
+  getAll(): RawRequest<unknown[]>;
   put(value: unknown): RawRequest<unknown>;
 }
 
@@ -61,6 +62,100 @@ function createEngine(): IndexedDbQueryEngine {
     databaseName: currentDatabaseName,
     factory: fakeIndexedDB as unknown as IndexedDbFactory,
   });
+}
+
+function createDocumentGetAllGuardFactory() {
+  let blockDocumentGetAll = false;
+
+  const wrapObjectStore = (storeName: string, store: unknown): unknown => {
+    if (storeName !== RAW_STORE_DOCUMENTS) {
+      return store;
+    }
+
+    return new Proxy(store as Record<string, unknown>, {
+      get(target, property, receiver) {
+        if (property !== "getAll") {
+          return Reflect.get(target, property, receiver);
+        }
+
+        return () => {
+          if (blockDocumentGetAll) {
+            throw new Error("documents.getAll() should not be used for indexed query execution");
+          }
+
+          return (Reflect.get(target, property, receiver) as () => unknown).call(target);
+        };
+      },
+    });
+  };
+
+  const wrapTransaction = (transaction: unknown): unknown => {
+    return new Proxy(transaction as Record<string, unknown>, {
+      get(target, property, receiver) {
+        if (property !== "objectStore") {
+          return Reflect.get(target, property, receiver);
+        }
+
+        return (storeName: string) => {
+          const objectStore = (
+            Reflect.get(target, property, receiver) as (name: string) => unknown
+          ).call(target, storeName);
+
+          return wrapObjectStore(storeName, objectStore);
+        };
+      },
+    });
+  };
+
+  const wrapDatabase = (database: unknown): unknown => {
+    return new Proxy(database as Record<string, unknown>, {
+      get(target, property, receiver) {
+        if (property !== "transaction") {
+          return Reflect.get(target, property, receiver);
+        }
+
+        return (storeNames: string | string[], mode?: "readonly" | "readwrite") => {
+          const transaction = (
+            Reflect.get(target, property, receiver) as (
+              names: string | string[],
+              mode?: "readonly" | "readwrite",
+            ) => unknown
+          ).call(target, storeNames, mode);
+
+          return wrapTransaction(transaction);
+        };
+      },
+    });
+  };
+
+  const factory = {
+    open(name: string, version?: number) {
+      const request = (fakeIndexedDB as unknown as IndexedDbFactory).open(name, version);
+
+      return new Proxy(request as unknown as Record<string, unknown>, {
+        get(target, property, receiver) {
+          if (property === "result") {
+            return wrapDatabase(Reflect.get(target, property, receiver));
+          }
+
+          return Reflect.get(target, property, receiver);
+        },
+        set(target, property, value, receiver) {
+          return Reflect.set(target, property, value, receiver);
+        },
+      }) as unknown as ReturnType<IndexedDbFactory["open"]>;
+    },
+    deleteDatabase(name: string) {
+      return (fakeIndexedDB as unknown as IndexedDbFactory).deleteDatabase(name);
+    },
+  } satisfies IndexedDbFactory;
+
+  return {
+    factory,
+    blockDocumentGetAll() {
+      blockDocumentGetAll = true;
+    },
+  };
 }
 
 beforeEach(() => {
@@ -347,6 +442,29 @@ describe("indexedDbEngine query behavior", () => {
     });
 
     expect(results.documents).toEqual([{ key: "u1", doc: { id: "u1" } }]);
+  });
+
+  test("query with index equality avoids collection document loads", async () => {
+    const guarded = createDocumentGetAllGuardFactory();
+    const indexedEngine = indexedDbEngine({
+      databaseName: `${databaseNameBase}_guarded_${Date.now()}`,
+      factory: guarded.factory,
+    });
+
+    try {
+      await indexedEngine.put("users", "u1", { id: "u1" }, { status: "active" });
+      await indexedEngine.put("users", "u2", { id: "u2" }, { status: "inactive" });
+      guarded.blockDocumentGetAll();
+
+      const results = await indexedEngine.query("users", {
+        index: "status",
+        filter: { value: "active" },
+      });
+
+      expect(results.documents).toEqual([{ key: "u1", doc: { id: "u1" } }]);
+    } finally {
+      await indexedEngine.deleteDatabase();
+    }
   });
 
   test("query supports comparison filters", async () => {
