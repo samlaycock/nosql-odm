@@ -1156,7 +1156,7 @@ describe("edge cases", () => {
     );
   });
 
-  test("dynamic index name returning empty string", () => {
+  test("throws when dynamic index name returns an empty string", () => {
     const m = model("item")
       .schema(1, z.object({ id: z.string() }))
       .index("empty_v1", {
@@ -1165,9 +1165,44 @@ describe("edge cases", () => {
       })
       .build();
 
-    const keys = m.resolveIndexKeys({ id: "abc" });
+    expect(() => m.resolveIndexKeys({ id: "abc" })).toThrow(
+      'Model "item" dynamic index key "empty_v1" dynamic index name must resolve to a non-empty string',
+    );
+  });
 
-    expect(keys).toEqual({ "": "val" });
+  test.each([
+    [undefined, "undefined"],
+    [null, "null"],
+    [123, "number"],
+    [true, "boolean"],
+    [{}, "object"],
+    [[], "array"],
+  ])("throws when dynamic index name returns %s", (resolved, label) => {
+    const m = model("item")
+      .schema(1, z.object({ id: z.string() }))
+      .index("bad_name_v1", {
+        name: () => resolved as never,
+        value: () => "val",
+      })
+      .build();
+
+    expect(() => m.resolveIndexKeys({ id: "abc" })).toThrow(
+      `Model "item" dynamic index key "bad_name_v1" dynamic index name must resolve to a non-empty string, got ${label}`,
+    );
+  });
+
+  test("throws when dynamic index name contains the reserved index separator", () => {
+    const m = model("item")
+      .schema(1, z.object({ id: z.string() }))
+      .index("bad_separator_v1", {
+        name: () => "tenant\u0000user",
+        value: () => "val",
+      })
+      .build();
+
+    expect(() => m.resolveIndexKeys({ id: "abc" })).toThrow(
+      'Model "item" dynamic index key "bad_separator_v1" dynamic index name must not contain the reserved index separator',
+    );
   });
 
   test("dynamic index name: unique flag is preserved", () => {

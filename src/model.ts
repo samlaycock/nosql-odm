@@ -411,8 +411,16 @@ export class ModelDefinition<
       // For static-name indexes, the resolved name equals the key.
       // For dynamic-name indexes, the resolved name is computed from document data,
       // and becomes the engine-level index identifier for this document.
-      const resolvedName = typeof index.name === "function" ? index.name(data) : index.name;
       const sourceIdentifier = this.describeIndexIdentifier(index);
+      const resolvedName =
+        typeof index.name === "function"
+          ? resolveDynamicIndexName(
+              index.name as (data: T) => unknown,
+              data,
+              this.name,
+              sourceIdentifier,
+            )
+          : index.name;
       const existingSource = resolvedSources.get(resolvedName);
 
       if (existingSource) {
@@ -804,6 +812,35 @@ function resolveIndexValue<T>(
   }
 
   return String(fieldValue as string | number | boolean | bigint | symbol);
+}
+
+function resolveDynamicIndexName<T>(
+  name: (data: T) => unknown,
+  data: T,
+  modelName: string,
+  indexIdentifier: string,
+): string {
+  const resolved = name(data);
+
+  if (typeof resolved !== "string") {
+    throw new Error(
+      `Model "${modelName}" ${indexIdentifier} dynamic index name must resolve to a non-empty string, got ${formatIndexValueType(resolved)}`,
+    );
+  }
+
+  if (resolved.length === 0) {
+    throw new Error(
+      `Model "${modelName}" ${indexIdentifier} dynamic index name must resolve to a non-empty string`,
+    );
+  }
+
+  if (resolved.includes("\u0000")) {
+    throw new Error(
+      `Model "${modelName}" ${indexIdentifier} dynamic index name must not contain the reserved index separator`,
+    );
+  }
+
+  return resolved;
 }
 
 function formatIndexValueType(value: unknown): string {
