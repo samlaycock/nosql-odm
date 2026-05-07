@@ -680,6 +680,16 @@ describe("createStore()", () => {
       });
     }).toThrow(/uniqueConstraintPrecheck\.concurrency/i);
   });
+
+  test("throws when batchSetPreparation.concurrency is invalid", () => {
+    expect(() => {
+      createStore(engine, [buildUserV1()], {
+        batchSetPreparation: {
+          concurrency: 0,
+        },
+      });
+    }).toThrow(/batchSetPreparation\.concurrency/i);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -861,6 +871,52 @@ describe("unique indexes", () => {
     expect(results.map((doc) => doc.id)).toEqual(["u1", "u2", "u3"]);
     expect(tracker.completedKeys).toEqual(["u3", "u2", "u1"]);
     expect(tracker.maxInFlight).toBeGreaterThan(1);
+  });
+
+  test("bounds batchSet document preparation concurrency", async () => {
+    const tracker: BatchValidationTracker = {
+      inFlight: 0,
+      maxInFlight: 0,
+      completedKeys: [],
+    };
+    const itemCount = 40;
+    const store = createStore(
+      engine,
+      [
+        buildBatchValidationTrackedUserV1(
+          tracker,
+          Object.fromEntries(
+            Array.from({ length: itemCount }, (_, index) => [`u${String(index + 1)}`, 1]),
+          ),
+        ),
+      ],
+      {
+        batchSetPreparation: {
+          concurrency: 3,
+        },
+      },
+    );
+
+    const results = await store.user.batchSet(
+      Array.from({ length: itemCount }, (_, index) => {
+        const id = `u${String(index + 1)}`;
+
+        return {
+          key: id,
+          data: {
+            id,
+            name: `User ${String(index + 1)}`,
+            email: `${id}@example.com`,
+          },
+        };
+      }),
+    );
+
+    expect(results.map((doc) => doc.id)).toEqual(
+      Array.from({ length: itemCount }, (_, index) => `u${String(index + 1)}`),
+    );
+    expect(tracker.completedKeys).toHaveLength(itemCount);
+    expect(tracker.maxInFlight).toBe(3);
   });
 
   test("batchSet reports the first validation error by input order when failures race", async () => {

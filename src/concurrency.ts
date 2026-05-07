@@ -65,6 +65,53 @@ export async function mapWithConcurrencyLimit<TInput, TOutput>(
   return results;
 }
 
+export async function mapSettledWithConcurrencyLimit<TInput, TOutput>(
+  items: readonly TInput[],
+  limit: number,
+  map: (item: TInput, index: number) => Promise<TOutput>,
+): Promise<PromiseSettledResult<TOutput>[]> {
+  if (items.length === 0) {
+    return [];
+  }
+
+  const results = Array.from({
+    length: items.length,
+  }) as PromiseSettledResult<TOutput>[];
+  const state = {
+    nextIndex: 0,
+  };
+
+  const runner = async (): Promise<void> => {
+    while (true) {
+      const index = state.nextIndex;
+
+      if (index >= items.length) {
+        return;
+      }
+
+      state.nextIndex = index + 1;
+
+      try {
+        results[index] = {
+          status: "fulfilled",
+          value: await map(items[index] as TInput, index),
+        };
+      } catch (reason) {
+        results[index] = {
+          status: "rejected",
+          reason,
+        };
+      }
+    }
+  };
+
+  await Promise.all(
+    Array.from({ length: Math.min(normalizeConcurrency(limit), items.length) }, () => runner()),
+  );
+
+  return results;
+}
+
 export async function forEachWithConcurrencyLimit<TInput>(
   items: readonly TInput[],
   limit: number,
