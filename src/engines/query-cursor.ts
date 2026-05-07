@@ -44,7 +44,7 @@ export function encodeQueryPageCursor(
     position: buildCursorPosition(params, position),
   };
 
-  return Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+  return encodeBase64Url(JSON.stringify(payload));
 }
 
 export function resolveQueryPageStartIndex<TRecord>(
@@ -197,7 +197,7 @@ function decodeQueryPageCursor(encoded: string): QueryCursorPayload {
   let parsed: unknown;
 
   try {
-    parsed = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+    parsed = JSON.parse(decodeBase64Url(encoded));
   } catch {
     throw new Error("Invalid query cursor");
   }
@@ -309,4 +309,24 @@ function stableSerialize(value: unknown): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+function encodeBase64Url(value: string): string {
+  const bytes = new TextEncoder().encode(value);
+  const binary = Array.from(bytes, (byte) => String.fromCharCode(byte)).join("");
+
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+}
+
+function decodeBase64Url(value: string): string {
+  const base64 = value.replaceAll("-", "+").replaceAll("_", "/");
+  const padded = base64.padEnd(base64.length + ((4 - (base64.length % 4)) % 4), "=");
+  const binary = atob(padded);
+  const bytes = new Uint8Array(binary.length);
+
+  for (const [index, char] of Array.from(binary).entries()) {
+    bytes[index] = char.charCodeAt(0);
+  }
+
+  return new TextDecoder().decode(bytes);
 }
