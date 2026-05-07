@@ -342,7 +342,12 @@ export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine
 
       if (nativePlan.kind === "native") {
         const native = await queryDocumentsNative(documentsCollection, nativePlan.plan, params);
-        return nativeToQueryResult(native.records, native.cursor, false);
+        return withMongoQueryDiagnostics(
+          nativeToQueryResult(native.records, native.cursor, false),
+          params,
+          "native_pushdown",
+          "native_pushdown",
+        );
       }
 
       handleMongoQueryFallback({
@@ -358,7 +363,12 @@ export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine
       const records = await listCollectionDocuments(documentsCollection, collection);
       const matched = matchDocuments(records, params);
 
-      return paginate(collection, matched, params);
+      return withMongoQueryDiagnostics(
+        paginate(collection, matched, params),
+        params,
+        "fallback_scan",
+        nativePlan.reason,
+      );
     },
 
     async queryWithMetadata(collection, params) {
@@ -368,7 +378,12 @@ export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine
 
       if (nativePlan.kind === "native") {
         const native = await queryDocumentsNative(documentsCollection, nativePlan.plan, params);
-        return nativeToQueryResult(native.records, native.cursor, true);
+        return withMongoQueryDiagnostics(
+          nativeToQueryResult(native.records, native.cursor, true),
+          params,
+          "native_pushdown",
+          "native_pushdown",
+        );
       }
 
       handleMongoQueryFallback({
@@ -384,7 +399,12 @@ export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine
       const records = await listCollectionDocuments(documentsCollection, collection);
       const matched = matchDocuments(records, params);
 
-      return paginateWithWriteTokens(collection, matched, params);
+      return withMongoQueryDiagnostics(
+        paginateWithWriteTokens(collection, matched, params),
+        params,
+        "fallback_scan",
+        nativePlan.reason,
+      );
     },
 
     async probeUnique(collection, indexName, values) {
@@ -1470,6 +1490,22 @@ function nativeToQueryResult(
       ...(includeWriteTokens ? { writeToken: String(record.writeVersion) } : {}),
     })),
     cursor,
+  };
+}
+
+function withMongoQueryDiagnostics(
+  result: EngineQueryResult,
+  params: QueryParams,
+  mode: "native_pushdown" | "fallback_scan",
+  reason: "native_pushdown" | MongoDbQueryFallbackReason,
+): EngineQueryResult {
+  return {
+    ...result,
+    diagnostics: {
+      mode,
+      reason,
+      ...(params.index ? { index: params.index } : {}),
+    },
   };
 }
 

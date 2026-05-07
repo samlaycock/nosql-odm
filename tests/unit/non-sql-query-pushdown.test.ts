@@ -821,6 +821,11 @@ describe("non-SQL query pushdown", () => {
     });
 
     expect(result.documents.map((doc) => doc.key)).toEqual(["u1", "u2", "u3"]);
+    expect(result.diagnostics).toEqual({
+      mode: "fallback_scan",
+      reason: "unsupported_filter",
+      index: "byEmail",
+    });
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({
       collection: "users",
@@ -842,6 +847,10 @@ describe("non-SQL query pushdown", () => {
     const result = await engine.query("users", {});
 
     expect(result.documents.map((doc) => doc.key)).toEqual(["u1", "u2", "u3"]);
+    expect(result.diagnostics).toEqual({
+      mode: "fallback_scan",
+      reason: "full_scan",
+    });
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({
       collection: "users",
@@ -908,6 +917,11 @@ describe("non-SQL query pushdown", () => {
       filter: { value: { $foo: "bar" } as unknown as Record<string, unknown> },
     });
 
+    expect(result.diagnostics).toEqual({
+      mode: "fallback_scan",
+      reason: "unsupported_filter",
+      index: "byEmail",
+    });
     expect(result.documents[0]).toMatchObject({
       key: "u1",
       writeToken: "1",

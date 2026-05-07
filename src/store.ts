@@ -20,6 +20,9 @@ import {
   type WhereFilter,
   type MigrationCriteria,
   type MigrationStatus,
+  type EngineQueryDiagnostics,
+  type QueryDiagnosticReason,
+  type QueryExecutionMode,
 } from "./engines/types";
 import { ERROR_CODES, NosqlOdmError } from "./errors";
 import {
@@ -90,6 +93,18 @@ export interface ProjectionSkippedEvent {
 
 export interface ProjectionHooks {
   onProjectionSkipped?(event: ProjectionSkippedEvent): void | Promise<void>;
+}
+
+export interface QueryDiagnosticEvent {
+  readonly model: string;
+  readonly params: QueryParams;
+  readonly mode: QueryExecutionMode;
+  readonly reason: QueryDiagnosticReason;
+  readonly index?: string;
+}
+
+export interface QueryDiagnosticsHooks {
+  onQueryDiagnostic?(event: QueryDiagnosticEvent): void | Promise<void>;
 }
 
 type AnyString = string & {};
@@ -337,6 +352,7 @@ export interface CreateStoreOptions<TOptions = Record<string, unknown>> {
   migrator?: Migrator<TOptions>;
   migrationHooks?: MigrationHooks;
   projectionHooks?: ProjectionHooks;
+  queryDiagnostics?: QueryDiagnosticsHooks;
   /**
    * Enables the store-managed unique-constraint guard path.
    *
@@ -495,6 +511,7 @@ class BoundModelImpl<
   private engine: QueryEngine<TOptions>;
   private migrator: Migrator<TOptions> | null;
   private projectionHooks: ProjectionHooks | undefined;
+  private queryDiagnostics: QueryDiagnosticsHooks | undefined;
   private uniqueConstraintPrecheckConcurrency: number;
   private uniqueConstraintLockOptions: ResolvedUniqueConstraintLockOptions;
   private useStoreManagedUniqueConstraintGuard: boolean;
@@ -504,6 +521,7 @@ class BoundModelImpl<
     engine: QueryEngine<TOptions>,
     migrator: Migrator<TOptions> | null,
     projectionHooks?: ProjectionHooks,
+    queryDiagnostics?: QueryDiagnosticsHooks,
     uniqueConstraintLockOptions?: ResolvedUniqueConstraintLockOptions,
     uniqueConstraintPrecheckConcurrency = DEFAULT_UNIQUE_CONSTRAINT_PRECHECK_CONCURRENCY,
     useStoreManagedUniqueConstraintGuard = false,
@@ -512,6 +530,7 @@ class BoundModelImpl<
     this.engine = engine;
     this.migrator = migrator;
     this.projectionHooks = projectionHooks;
+    this.queryDiagnostics = queryDiagnostics;
     this.uniqueConstraintLockOptions =
       uniqueConstraintLockOptions ?? resolveUniqueConstraintLockOptions();
     this.uniqueConstraintPrecheckConcurrency = uniqueConstraintPrecheckConcurrency;
@@ -551,6 +570,7 @@ class BoundModelImpl<
     const raw = this.engine.queryWithMetadata
       ? await this.engine.queryWithMetadata(this.model.name, resolved, options)
       : await this.engine.query(this.model.name, resolved, options);
+    await this.emitQueryDiagnostic(resolved, raw.diagnostics);
     const { results, writebacks } = await this.projectReadResults(raw.documents, "query");
     const documents = results.map((result) => result.value);
 
@@ -744,6 +764,27 @@ class BoundModelImpl<
     await this.writebackMany(writebacks, "batchGet", options);
 
     return results;
+  }
+
+  private async emitQueryDiagnostic(
+    params: QueryParams,
+    diagnostics: EngineQueryDiagnostics | undefined,
+  ): Promise<void> {
+    if (!diagnostics) {
+      return;
+    }
+
+    try {
+      await this.queryDiagnostics?.onQueryDiagnostic?.({
+        model: this.model.name,
+        params: structuredClone(params),
+        mode: diagnostics.mode,
+        reason: diagnostics.reason,
+        ...(diagnostics.index ? { index: diagnostics.index } : {}),
+      });
+    } catch (error) {
+      console.error("[nosql-odm] queryDiagnostics.onQueryDiagnostic threw", error);
+    }
   }
 
   async batchSet(items: BatchSetInputItem<T>[], options?: TOptions): Promise<T[]> {
@@ -1898,6 +1939,7 @@ export function createStore<
         engine,
         migrator,
         options?.projectionHooks,
+        options?.queryDiagnostics,
         uniqueConstraintLockOptions,
         uniqueConstraintPrecheckConcurrency,
         useStoreManagedUniqueConstraintGuard,
