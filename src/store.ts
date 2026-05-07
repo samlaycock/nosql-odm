@@ -1,6 +1,10 @@
 import type { ProjectionSkipReason } from "./model";
 
-import { forEachWithConcurrencyLimit, mapWithConcurrencyLimit } from "./concurrency";
+import {
+  forEachWithConcurrencyLimit,
+  mapSettledWithConcurrencyLimit,
+  mapWithConcurrencyLimit,
+} from "./concurrency";
 import {
   type PreparedDocument,
   validateJsonCompatibleDocument,
@@ -342,6 +346,11 @@ export interface UniqueConstraintPrecheckOptions {
   concurrency?: number;
 }
 
+export interface BatchSetPreparationOptions {
+  /** Maximum number of batchSet items to validate and prepare in parallel. */
+  concurrency?: number;
+}
+
 export interface UniqueConstraintLockOptions {
   /** Lock TTL in milliseconds for unique-constraint guards. */
   ttlMs?: number;
@@ -371,6 +380,7 @@ export interface CreateStoreOptions<TOptions = Record<string, unknown>> {
    */
   allowStoreManagedUniqueConstraints?: boolean;
   uniqueConstraintPrecheck?: UniqueConstraintPrecheckOptions;
+  batchSetPreparation?: BatchSetPreparationOptions;
   uniqueConstraintLock?: UniqueConstraintLockOptions;
 }
 
@@ -459,24 +469,41 @@ function resolveUniqueConstraintLockOptions(
 }
 
 const DEFAULT_UNIQUE_CONSTRAINT_PRECHECK_CONCURRENCY = 8;
+const DEFAULT_BATCH_SET_PREPARATION_CONCURRENCY = 32;
 const READ_PROJECTION_CONCURRENCY = 8;
+
+function resolveConcurrencyOption(
+  concurrency: number | null | undefined,
+  optionName: string,
+  defaultValue: number,
+): number {
+  if (concurrency === undefined || concurrency === null) {
+    return defaultValue;
+  }
+
+  if (!Number.isFinite(concurrency) || !Number.isInteger(concurrency) || concurrency < 1) {
+    throw new Error(`createStore option "${optionName}.concurrency" must be an integer >= 1`);
+  }
+
+  return concurrency;
+}
 
 function resolveUniqueConstraintPrecheckConcurrency(
   options?: UniqueConstraintPrecheckOptions,
 ): number {
-  const concurrency = options?.concurrency;
+  return resolveConcurrencyOption(
+    options?.concurrency,
+    "uniqueConstraintPrecheck",
+    DEFAULT_UNIQUE_CONSTRAINT_PRECHECK_CONCURRENCY,
+  );
+}
 
-  if (concurrency === undefined || concurrency === null) {
-    return DEFAULT_UNIQUE_CONSTRAINT_PRECHECK_CONCURRENCY;
-  }
-
-  if (!Number.isFinite(concurrency) || !Number.isInteger(concurrency) || concurrency < 1) {
-    throw new Error(
-      'createStore option "uniqueConstraintPrecheck.concurrency" must be an integer >= 1',
-    );
-  }
-
-  return concurrency;
+function resolveBatchSetPreparationConcurrency(options?: BatchSetPreparationOptions): number {
+  return resolveConcurrencyOption(
+    options?.concurrency,
+    "batchSetPreparation",
+    DEFAULT_BATCH_SET_PREPARATION_CONCURRENCY,
+  );
 }
 
 function findDuplicateBatchSetKeyConflicts<T>(
@@ -521,6 +548,7 @@ class BoundModelImpl<
   private projectionHooks: ProjectionHooks | undefined;
   private queryDiagnostics: QueryDiagnosticsHooks | undefined;
   private uniqueConstraintPrecheckConcurrency: number;
+  private batchSetPreparationConcurrency: number;
   private uniqueConstraintLockOptions: ResolvedUniqueConstraintLockOptions;
   private useStoreManagedUniqueConstraintGuard: boolean;
 
@@ -532,6 +560,7 @@ class BoundModelImpl<
     queryDiagnostics?: QueryDiagnosticsHooks,
     uniqueConstraintLockOptions?: ResolvedUniqueConstraintLockOptions,
     uniqueConstraintPrecheckConcurrency = DEFAULT_UNIQUE_CONSTRAINT_PRECHECK_CONCURRENCY,
+    batchSetPreparationConcurrency = DEFAULT_BATCH_SET_PREPARATION_CONCURRENCY,
     useStoreManagedUniqueConstraintGuard = false,
   ) {
     this.model = model;
@@ -542,6 +571,7 @@ class BoundModelImpl<
     this.uniqueConstraintLockOptions =
       uniqueConstraintLockOptions ?? resolveUniqueConstraintLockOptions();
     this.uniqueConstraintPrecheckConcurrency = uniqueConstraintPrecheckConcurrency;
+    this.batchSetPreparationConcurrency = batchSetPreparationConcurrency;
     this.useStoreManagedUniqueConstraintGuard = useStoreManagedUniqueConstraintGuard;
   }
 
@@ -802,8 +832,10 @@ class BoundModelImpl<
       throw new DuplicateBatchSetKeysError(this.model.name, duplicateKeyConflicts);
     }
 
-    const preparedResults = await Promise.allSettled(
-      items.map(async (item) => {
+    const preparedResults = await mapSettledWithConcurrencyLimit(
+      items,
+      this.batchSetPreparationConcurrency,
+      async (item) => {
         const validated = await this.model.validate(item.data);
 
         return {
@@ -814,7 +846,7 @@ class BoundModelImpl<
           uniqueIndexes: this.model.resolveUniqueIndexKeys(validated),
           migrationMetadata: this.currentMigrationMetadata(),
         };
-      }),
+      },
     );
     const prepared = preparedResults.map((result) => {
       if (result.status !== "fulfilled") {
@@ -1911,6 +1943,9 @@ export function createStore<
   const uniqueConstraintPrecheckConcurrency = resolveUniqueConstraintPrecheckConcurrency(
     options?.uniqueConstraintPrecheck,
   );
+  const batchSetPreparationConcurrency = resolveBatchSetPreparationConcurrency(
+    options?.batchSetPreparation,
+  );
   const allowStoreManagedUniqueConstraints = options?.allowStoreManagedUniqueConstraints === true;
   const boundModels = new Map<string, BoundModelImpl<any, TOptions, any, any>>();
 
@@ -1954,6 +1989,7 @@ export function createStore<
         options?.queryDiagnostics,
         uniqueConstraintLockOptions,
         uniqueConstraintPrecheckConcurrency,
+        batchSetPreparationConcurrency,
         useStoreManagedUniqueConstraintGuard,
       ),
     );
