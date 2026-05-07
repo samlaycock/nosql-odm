@@ -1,5 +1,37 @@
 # nosql-odm
 
+## 0.11.0
+
+### Minor Changes
+
+- 400411b: Add IndexedDB-backed query index entries so indexed queries can resolve matching document keys without loading the full collection document store.
+- 5bb44fc: Require MongoDB query fallback collection scans to be explicitly enabled with
+  `allowFallbackCollectionScans`, while keeping `rejectUnsupportedQueries` as an
+  optional stricter guard when scan fallback is enabled.
+- 2a40fc8: Add `queryIndexes` option to `mongoDbEngine` to provision compound MongoDB
+  indexes for named index fields used by native query plans. When provided, two
+  compound indexes are created per name — ascending and descending on
+  `indexes.<name>` — so that sorted, paginated, and filtered queries can use an
+  efficient index plan rather than relying on a collection scan.
+- 98d25b0: Add shared query diagnostics hooks for observing native pushdown and fallback scan execution paths.
+
+### Patch Changes
+
+- dab0ceb: Strengthen shared query cursor conformance coverage for opaque payloads,
+  query-bound reuse checks, and deleted-row resume behavior across adapters.
+- b74c3ab: Replace DynamoDB index-filter partition scans with query-index lookups when an
+  index-backed filter can be pushed down, while preserving scan fallback when the
+  secondary lookup index is unavailable.
+- de8af9a: Push expressible Firestore queries down into server-side ordering and cursor
+  pagination, and batch `batchGet` reads through `getAll` while preserving local
+  fallbacks for query shapes Firestore cannot represent safely.
+- 3aba1ff: Fix MongoDB query pagination to use opaque, query-bound cursors across native and fallback execution paths.
+- 9390427: Implement MongoDB `probeUnique()` so store-managed unique prechecks can batch
+  index ownership lookups instead of issuing one query per value.
+- 42af816: Push Redis indexed queries down into Redis lex-sorted index sets and batch
+  document reads through a single script call, while preserving scan fallback for
+  query shapes that cannot be pushed down safely.
+
 ## 0.10.0
 
 ### Minor Changes
