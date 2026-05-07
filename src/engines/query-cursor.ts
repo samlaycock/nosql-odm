@@ -322,11 +322,7 @@ function decodeBase64Url(value: string): string {
   const base64 = value.replaceAll("-", "+").replaceAll("_", "/");
   const padded = base64.padEnd(base64.length + ((4 - (base64.length % 4)) % 4), "=");
   const binary = atob(padded);
-  const bytes = new Uint8Array(binary.length);
-
-  for (const [index, char] of Array.from(binary).entries()) {
-    bytes[index] = char.charCodeAt(0);
-  }
+  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
 
   return new TextDecoder().decode(bytes);
 }
