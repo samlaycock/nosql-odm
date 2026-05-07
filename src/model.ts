@@ -784,6 +784,10 @@ function resolveIndexValue<T>(
   if (typeof value === "function") {
     const resolved = value(data);
 
+    if (resolved === undefined || resolved === null) {
+      return undefined;
+    }
+
     if (typeof resolved !== "string") {
       throw new Error(
         `Model "${modelName}" ${indexIdentifier} function index value must resolve to a string, got ${formatIndexValueType(resolved)}`,

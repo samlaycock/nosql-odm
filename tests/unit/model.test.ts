@@ -526,8 +526,6 @@ describe("indexes", () => {
       { label: "number", value: 42 },
       { label: "boolean", value: true },
       { label: "object", value: { tenantId: "acme" } },
-      { label: "null", value: null },
-      { label: "undefined", value: undefined },
     ] as const;
 
     for (const { label, value } of invalidValues) {
@@ -542,6 +540,22 @@ describe("indexes", () => {
       expect(() => m.resolveIndexKeys({ id: "u1", tenantId: "acme" })).toThrow(
         `Model "user" static index name "byTenant" function index value must resolve to a string, got ${label}`,
       );
+    }
+  });
+
+  test("skips nullish function index values", () => {
+    const nullishValues = [null, undefined] as const;
+
+    for (const value of nullishValues) {
+      const m = model("user")
+        .schema(1, z.object({ id: z.string(), tenantId: z.string() }))
+        .index({
+          name: "byTenant",
+          value: (() => value) as never,
+        })
+        .build();
+
+      expect(m.resolveIndexKeys({ id: "u1", tenantId: "acme" })).toEqual({});
     }
   });
 
