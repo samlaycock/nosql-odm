@@ -138,7 +138,7 @@ describe("migration crash recovery — single page", () => {
     // First attempt crashes mid-page
     await expectReject(store1.user.migrateAll(), SimulatedCrashError);
 
-    // 3 documents were migrated before the crash
+    // batchSet is atomic, so the failed page is rolled back.
     let migratedCount = 0;
     let staleCount = 0;
 
@@ -153,18 +153,18 @@ describe("migration crash recovery — single page", () => {
       }
     }
 
-    expect(migratedCount).toBe(3);
-    expect(staleCount).toBe(7);
+    expect(migratedCount).toBe(0);
+    expect(staleCount).toBe(10);
 
     // Remove the failure hook
     engine.setOptions({});
 
-    // Retry — should succeed and migrate the remaining 7
+    // Retry — should succeed and migrate the full page.
     const store2 = createStore(engine, [buildUserV2()]);
     const result = await store2.user.migrateAll();
 
     expect(result.status).toBe("completed");
-    expect(result.migrated).toBe(7);
+    expect(result.migrated).toBe(10);
 
     // All documents should now be v2
     for (let i = 0; i < 10; i++) {
@@ -245,8 +245,8 @@ describe("migration crash recovery — multi-page", () => {
       }
     }
 
-    // 110 docs migrated (100 from first page + 10 from second)
-    expect(migratedCount).toBe(110);
+    // The first page committed, but the failed second page was rolled back.
+    expect(migratedCount).toBe(100);
 
     // Checkpoint should have been saved after first page
     const checkpoint = await engine.migration.loadCheckpoint!("user");
@@ -259,10 +259,9 @@ describe("migration crash recovery — multi-page", () => {
     const result = await store2.user.migrateAll();
 
     expect(result.status).toBe("completed");
-    // Should only migrate the remaining 40 (50 on page 2, minus 10 already done)
-    // But since checkpoint resumes at page boundary, it re-scans page 2 (50 docs)
-    // and skips the 10 already migrated, migrating the remaining 40
-    expect(result.migrated).toBe(40);
+    // Checkpoint resumes after the committed first page, so the full second
+    // page is migrated on retry.
+    expect(result.migrated).toBe(50);
 
     // All should be v2 now
     for (let i = 0; i < 150; i++) {
@@ -309,7 +308,7 @@ describe("migration crash recovery — multi-page", () => {
       }
     }
 
-    expect(migratedCount).toBe(205);
+    expect(migratedCount).toBe(100);
 
     // Retry
     engine.setOptions({});
@@ -318,7 +317,7 @@ describe("migration crash recovery — multi-page", () => {
     const result = await store2.user.migrateAll();
 
     expect(result.status).toBe("completed");
-    expect(result.migrated).toBe(45); // 50 on page 3, minus 5 already done
+    expect(result.migrated).toBe(150);
 
     // All migrated
     for (let i = 0; i < 250; i++) {
@@ -379,7 +378,7 @@ describe("migration recovery — multiple sequential crashes", () => {
     const store3 = createStore(engine, [buildUserV2()]);
     await expectReject(store3.user.migrateAll(), SimulatedCrashError);
 
-    // Some progress has been made — at least some docs should be migrated
+    // Every crash rolls back its page, so no document-level progress is visible.
     let migratedSoFar = 0;
 
     for (let i = 0; i < 20; i++) {
@@ -389,8 +388,7 @@ describe("migration recovery — multiple sequential crashes", () => {
       if (raw.__v === 2) migratedSoFar++;
     }
 
-    expect(migratedSoFar).toBeGreaterThan(0);
-    expect(migratedSoFar).toBeLessThan(20);
+    expect(migratedSoFar).toBe(0);
 
     // Final attempt: no crash
     engine.setOptions({});
@@ -455,18 +453,11 @@ describe("migration idempotency", () => {
     await expectReject(store1.user.migrateAll(), SimulatedCrashError);
 
     // Track which IDs get written on retry and whether they were stale
-    const retryMigratedIds: string[] = [];
-    const retryReindexedIds: string[] = [];
+    const retryWrittenIds: string[] = [];
     engine.setOptions({
-      onBeforePut(collection, id, doc) {
+      onBeforePut(collection, id) {
         if (collection === "user") {
-          const d = doc as Record<string, unknown>;
-          // If __v < 2 before being written, it was a migration; otherwise index recompute
-          if ((d as any).__v === 2) {
-            retryReindexedIds.push(id);
-          } else {
-            retryMigratedIds.push(id);
-          }
+          retryWrittenIds.push(id);
         }
       },
     });
@@ -474,12 +465,12 @@ describe("migration idempotency", () => {
     const store2 = createStore(engine, [buildUserV2()]);
     await store2.user.migrateAll();
 
-    // Already-migrated docs from the first run should be reindexed (not
-    // re-migrated) on retry — their schema version stays the same.
+    // The first run rolled back atomically, so previously attempted writes are
+    // retried rather than treated as already migrated.
     const firstRunMigrated = migratedIds.slice(0, 5);
 
     for (const id of firstRunMigrated) {
-      expect(retryMigratedIds).not.toContain(id);
+      expect(retryWrittenIds).toContain(id);
     }
   });
 });
@@ -631,14 +622,14 @@ describe("migration crash recovery — multi-version chain", () => {
     const store1 = createStore(engine, [buildUserV3()]);
     await expectReject(store1.user.migrateAll(), SimulatedCrashError);
 
-    // 4 docs migrated to v3
+    // The failed batch rolls back atomically.
     let migratedCount = 0;
     for (let i = 0; i < 10; i++) {
       const id = `u${String(i).padStart(4, "0")}`;
       const raw = (await engine.get("user", id)) as Record<string, unknown>;
       if (raw.__v === 3) migratedCount++;
     }
-    expect(migratedCount).toBe(4);
+    expect(migratedCount).toBe(0);
 
     engine.setOptions({});
 
@@ -646,7 +637,7 @@ describe("migration crash recovery — multi-version chain", () => {
     const result = await store2.user.migrateAll();
 
     expect(result.status).toBe("completed");
-    expect(result.migrated).toBe(6);
+    expect(result.migrated).toBe(10);
 
     // All docs should be v3 with role field
     for (let i = 0; i < 10; i++) {
@@ -807,8 +798,7 @@ describe("checkpoint lifecycle", () => {
     const result = await store2.user.migrateAll();
 
     expect(result.status).toBe("completed");
-    // 10 were already migrated, so only 40 remain
-    expect(result.migrated).toBe(40);
+    expect(result.migrated).toBe(50);
   });
 });
 

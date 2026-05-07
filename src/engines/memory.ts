@@ -26,6 +26,11 @@ interface StoredDocument {
   uniqueIndexes: ResolvedIndexKeys;
 }
 
+interface StagedBatchSetItem {
+  readonly key: string;
+  readonly stored: StoredDocument;
+}
+
 // ---------------------------------------------------------------------------
 // Options
 // ---------------------------------------------------------------------------
@@ -283,6 +288,8 @@ export function memoryEngine(options?: MemoryEngineOptions): MemoryQueryEngine {
       const col = getCollection(collection);
       const collectionUniqueState = getCollectionUniqueOwnership(collection);
       const stagedUniqueState = cloneUniqueOwnershipState(collectionUniqueState);
+      const stagedItems: StagedBatchSetItem[] = [];
+      let stagedCreatedAtSequence = createdAtSequence;
 
       // Validate unique constraints for the whole batch up front so duplicate
       // unique values fail before any write is applied.
@@ -293,16 +300,28 @@ export function memoryEngine(options?: MemoryEngineOptions): MemoryQueryEngine {
       for (const item of items) {
         engineOptions.onBeforePut?.(collection, item.key, item.doc);
 
-        reserveUniqueIndexes(collection, item.key, item.uniqueIndexes ?? {}, collectionUniqueState);
         const existing = col.get(item.key);
-
-        col.set(item.key, {
-          createdAt: existing?.createdAt ?? ++createdAtSequence,
-          doc: cloneStoredDocument(item.doc),
-          indexes: { ...item.indexes },
-          uniqueIndexes: { ...item.uniqueIndexes },
+        stagedItems.push({
+          key: item.key,
+          stored: {
+            createdAt: existing?.createdAt ?? ++stagedCreatedAtSequence,
+            doc: cloneStoredDocument(item.doc),
+            indexes: { ...item.indexes },
+            uniqueIndexes: { ...item.uniqueIndexes },
+          },
         });
       }
+
+      collectionUniqueState.clear();
+      for (const [indexName, ownerByValue] of stagedUniqueState) {
+        collectionUniqueState.set(indexName, ownerByValue);
+      }
+
+      for (const item of stagedItems) {
+        col.set(item.key, item.stored);
+      }
+
+      createdAtSequence = stagedCreatedAtSequence;
     },
 
     async batchDelete(collection, keys) {
