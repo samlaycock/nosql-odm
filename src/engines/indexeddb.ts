@@ -57,9 +57,15 @@ interface IndexedDbOpenRequestLike<TDatabase> extends IndexedDbRequestLike<TData
 
 interface IndexedDbObjectStoreLike {
   get(key: string): IndexedDbRequestLike<unknown>;
-  getAll(): IndexedDbRequestLike<unknown[]>;
+  getAll(query?: unknown): IndexedDbRequestLike<unknown[]>;
   put(value: unknown): IndexedDbRequestLike<unknown>;
   delete(key: string): IndexedDbRequestLike<unknown>;
+  index(name: string): IndexedDbIndexLike;
+  createIndex(name: string, keyPath: string | string[]): unknown;
+}
+
+interface IndexedDbIndexLike {
+  getAll(query?: unknown): IndexedDbRequestLike<unknown[]>;
 }
 
 interface IndexedDbTransactionLike {
@@ -89,12 +95,15 @@ interface IndexedDbFactoryLike {
 // Storage model
 // ---------------------------------------------------------------------------
 
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 
 const STORE_DOCUMENTS = "documents";
 const STORE_META = "meta";
 const STORE_MIGRATION_LOCKS = "migration_locks";
 const STORE_MIGRATION_CHECKPOINTS = "migration_checkpoints";
+const STORE_QUERY_INDEX_ENTRIES = "query_index_entries";
+
+const QUERY_INDEX_LOOKUP = "lookup";
 
 const META_SEQUENCE_KEY = "sequence";
 const OUTDATED_PAGE_LIMIT = 100;
@@ -107,6 +116,14 @@ interface StoredDocumentRecord {
   doc: Record<string, unknown>;
   indexes: ResolvedIndexKeys;
   uniqueIndexes: ResolvedIndexKeys;
+}
+
+interface QueryIndexEntryRecord {
+  id: string;
+  collection: string;
+  indexName: string;
+  indexValue: string;
+  key: string;
 }
 
 interface MetaSequenceRecord {
@@ -174,122 +191,161 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
       const db = await dbPromise;
       const docId = makeDocumentId(collection, key);
 
-      await withTransaction(db, [STORE_DOCUMENTS, STORE_META], "readwrite", async (tx) => {
-        const docsStore = tx.objectStore(STORE_DOCUMENTS);
-        const metaStore = tx.objectStore(STORE_META);
-        const collectionRecords = await loadCollectionRecordsFromStore(docsStore, collection);
+      await withTransaction(
+        db,
+        [STORE_DOCUMENTS, STORE_META, STORE_QUERY_INDEX_ENTRIES],
+        "readwrite",
+        async (tx) => {
+          const docsStore = tx.objectStore(STORE_DOCUMENTS);
+          const metaStore = tx.objectStore(STORE_META);
+          const indexStore = tx.objectStore(STORE_QUERY_INDEX_ENTRIES);
+          const collectionRecords = await loadCollectionRecordsFromStore(docsStore, collection);
 
-        const existing = await requestToPromise(docsStore.get(docId));
+          const existing = await requestToPromise(docsStore.get(docId));
 
-        if (existing !== undefined) {
-          throw new EngineDocumentAlreadyExistsError(collection, key);
-        }
+          if (existing !== undefined) {
+            throw new EngineDocumentAlreadyExistsError(collection, key);
+          }
 
-        assertUniqueIndexes(collection, key, uniqueIndexes ?? {}, collectionRecords);
+          assertUniqueIndexes(collection, key, uniqueIndexes ?? {}, collectionRecords);
 
-        const sequence = (await loadSequence(metaStore)) + 1;
+          const sequence = (await loadSequence(metaStore)) + 1;
 
-        await requestToPromise(
-          docsStore.put(
-            createStoredDocumentRecord({
-              id: docId,
-              collection,
-              key,
-              createdAt: sequence,
-              doc,
-              indexes,
-              uniqueIndexes,
-            }),
-          ),
-        );
+          const record = createStoredDocumentRecord({
+            id: docId,
+            collection,
+            key,
+            createdAt: sequence,
+            doc,
+            indexes,
+            uniqueIndexes,
+          });
 
-        await saveSequence(metaStore, sequence);
-      });
+          await requestToPromise(docsStore.put(record));
+          await replaceQueryIndexEntries(indexStore, collection, key, {}, indexes);
+
+          await saveSequence(metaStore, sequence);
+        },
+      );
     },
 
     async put(collection, key, doc, indexes, _options, _migrationMetadata, uniqueIndexes) {
       const db = await dbPromise;
       const docId = makeDocumentId(collection, key);
 
-      await withTransaction(db, [STORE_DOCUMENTS, STORE_META], "readwrite", async (tx) => {
-        const docsStore = tx.objectStore(STORE_DOCUMENTS);
-        const metaStore = tx.objectStore(STORE_META);
-        const collectionRecords = await loadCollectionRecordsFromStore(docsStore, collection);
+      await withTransaction(
+        db,
+        [STORE_DOCUMENTS, STORE_META, STORE_QUERY_INDEX_ENTRIES],
+        "readwrite",
+        async (tx) => {
+          const docsStore = tx.objectStore(STORE_DOCUMENTS);
+          const metaStore = tx.objectStore(STORE_META);
+          const indexStore = tx.objectStore(STORE_QUERY_INDEX_ENTRIES);
+          const collectionRecords = await loadCollectionRecordsFromStore(docsStore, collection);
 
-        const existingRaw = await requestToPromise(docsStore.get(docId));
+          const existingRaw = await requestToPromise(docsStore.get(docId));
 
-        let createdAt: number;
+          let createdAt: number;
+          let existingIndexes: ResolvedIndexKeys = {};
 
-        if (existingRaw === undefined) {
-          createdAt = (await loadSequence(metaStore)) + 1;
-          await saveSequence(metaStore, createdAt);
-        } else {
-          createdAt = parseStoredDocumentRecord(existingRaw).createdAt;
-        }
+          if (existingRaw === undefined) {
+            createdAt = (await loadSequence(metaStore)) + 1;
+            await saveSequence(metaStore, createdAt);
+          } else {
+            const existing = parseStoredDocumentRecord(existingRaw);
+            createdAt = existing.createdAt;
+            existingIndexes = existing.indexes;
+          }
 
-        assertUniqueIndexes(collection, key, uniqueIndexes ?? {}, collectionRecords);
+          assertUniqueIndexes(collection, key, uniqueIndexes ?? {}, collectionRecords);
 
-        await requestToPromise(
-          docsStore.put(
-            createStoredDocumentRecord({
-              id: docId,
-              collection,
-              key,
-              createdAt,
-              doc,
-              indexes,
-              uniqueIndexes,
-            }),
-          ),
-        );
-      });
+          const record = createStoredDocumentRecord({
+            id: docId,
+            collection,
+            key,
+            createdAt,
+            doc,
+            indexes,
+            uniqueIndexes,
+          });
+
+          await requestToPromise(docsStore.put(record));
+          await replaceQueryIndexEntries(indexStore, collection, key, existingIndexes, indexes);
+        },
+      );
     },
 
     async update(collection, key, doc, indexes, _options, _migrationMetadata, uniqueIndexes) {
       const db = await dbPromise;
       const docId = makeDocumentId(collection, key);
 
-      await withTransaction(db, [STORE_DOCUMENTS], "readwrite", async (tx) => {
-        const docsStore = tx.objectStore(STORE_DOCUMENTS);
-        const collectionRecords = await loadCollectionRecordsFromStore(docsStore, collection);
-        const existingRaw = await requestToPromise(docsStore.get(docId));
+      await withTransaction(
+        db,
+        [STORE_DOCUMENTS, STORE_QUERY_INDEX_ENTRIES],
+        "readwrite",
+        async (tx) => {
+          const docsStore = tx.objectStore(STORE_DOCUMENTS);
+          const indexStore = tx.objectStore(STORE_QUERY_INDEX_ENTRIES);
+          const collectionRecords = await loadCollectionRecordsFromStore(docsStore, collection);
+          const existingRaw = await requestToPromise(docsStore.get(docId));
 
-        if (existingRaw === undefined) {
-          throw new EngineDocumentNotFoundError(collection, key);
-        }
+          if (existingRaw === undefined) {
+            throw new EngineDocumentNotFoundError(collection, key);
+          }
 
-        const existing = parseStoredDocumentRecord(existingRaw);
+          const existing = parseStoredDocumentRecord(existingRaw);
 
-        assertUniqueIndexes(collection, key, uniqueIndexes ?? {}, collectionRecords);
+          assertUniqueIndexes(collection, key, uniqueIndexes ?? {}, collectionRecords);
 
-        await requestToPromise(
-          docsStore.put(
-            createStoredDocumentRecord({
-              id: docId,
-              collection,
-              key,
-              createdAt: existing.createdAt,
-              doc,
-              indexes,
-              uniqueIndexes,
-            }),
-          ),
-        );
-      });
+          const record = createStoredDocumentRecord({
+            id: docId,
+            collection,
+            key,
+            createdAt: existing.createdAt,
+            doc,
+            indexes,
+            uniqueIndexes,
+          });
+
+          await requestToPromise(docsStore.put(record));
+          await replaceQueryIndexEntries(indexStore, collection, key, existing.indexes, indexes);
+        },
+      );
     },
 
     async delete(collection, key) {
       const db = await dbPromise;
       const docId = makeDocumentId(collection, key);
 
-      await withTransaction(db, [STORE_DOCUMENTS], "readwrite", async (tx) => {
-        await requestToPromise(tx.objectStore(STORE_DOCUMENTS).delete(docId));
-      });
+      await withTransaction(
+        db,
+        [STORE_DOCUMENTS, STORE_QUERY_INDEX_ENTRIES],
+        "readwrite",
+        async (tx) => {
+          const docsStore = tx.objectStore(STORE_DOCUMENTS);
+          const existingRaw = await requestToPromise(docsStore.get(docId));
+
+          if (existingRaw !== undefined) {
+            const existing = parseStoredDocumentRecord(existingRaw);
+            await replaceQueryIndexEntries(
+              tx.objectStore(STORE_QUERY_INDEX_ENTRIES),
+              collection,
+              key,
+              existing.indexes,
+              {},
+            );
+          }
+
+          await requestToPromise(docsStore.delete(docId));
+        },
+      );
     },
 
     async query(collection, params) {
       const db = await dbPromise;
-      const records = await listCollectionDocuments(db, collection);
+      const records =
+        (await listCollectionDocumentsByIndex(db, collection, params)) ??
+        (await listCollectionDocuments(db, collection));
       const matched = matchDocuments(records, params);
 
       return paginateQuery(collection, matched, params);
@@ -320,65 +376,96 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
     async batchSet(collection, items) {
       const db = await dbPromise;
 
-      await withTransaction(db, [STORE_DOCUMENTS, STORE_META], "readwrite", async (tx) => {
-        const docsStore = tx.objectStore(STORE_DOCUMENTS);
-        const metaStore = tx.objectStore(STORE_META);
-        const collectionRecords = await loadCollectionRecordsFromStore(docsStore, collection);
-        const recordsByKey = new Map(
-          collectionRecords.map((record) => [record.key, record] as const),
-        );
+      await withTransaction(
+        db,
+        [STORE_DOCUMENTS, STORE_META, STORE_QUERY_INDEX_ENTRIES],
+        "readwrite",
+        async (tx) => {
+          const docsStore = tx.objectStore(STORE_DOCUMENTS);
+          const metaStore = tx.objectStore(STORE_META);
+          const indexStore = tx.objectStore(STORE_QUERY_INDEX_ENTRIES);
+          const collectionRecords = await loadCollectionRecordsFromStore(docsStore, collection);
+          const recordsByKey = new Map(
+            collectionRecords.map((record) => [record.key, record] as const),
+          );
 
-        let sequence = await loadSequence(metaStore);
-        let sequenceChanged = false;
+          let sequence = await loadSequence(metaStore);
+          let sequenceChanged = false;
 
-        for (const item of items) {
-          const docId = makeDocumentId(collection, item.key);
-          const existingRaw = await requestToPromise(docsStore.get(docId));
+          for (const item of items) {
+            const docId = makeDocumentId(collection, item.key);
+            const existingRaw = await requestToPromise(docsStore.get(docId));
 
-          let createdAt: number;
+            let createdAt: number;
+            let existingIndexes: ResolvedIndexKeys = {};
 
-          if (existingRaw === undefined) {
-            sequence += 1;
-            sequenceChanged = true;
-            createdAt = sequence;
-          } else {
-            createdAt = parseStoredDocumentRecord(existingRaw).createdAt;
+            if (existingRaw === undefined) {
+              sequence += 1;
+              sequenceChanged = true;
+              createdAt = sequence;
+            } else {
+              const existing = parseStoredDocumentRecord(existingRaw);
+              createdAt = existing.createdAt;
+              existingIndexes = existing.indexes;
+            }
+
+            const uniqueIndexes = item.uniqueIndexes ?? {};
+
+            assertUniqueIndexes(collection, item.key, uniqueIndexes, [...recordsByKey.values()]);
+
+            const storedRecord = createStoredDocumentRecord({
+              id: docId,
+              collection,
+              key: item.key,
+              createdAt,
+              doc: item.doc,
+              indexes: item.indexes,
+              uniqueIndexes,
+            });
+
+            await requestToPromise(docsStore.put(storedRecord));
+            await replaceQueryIndexEntries(
+              indexStore,
+              collection,
+              item.key,
+              existingIndexes,
+              item.indexes,
+            );
+            recordsByKey.set(item.key, storedRecord);
           }
 
-          const uniqueIndexes = item.uniqueIndexes ?? {};
-
-          assertUniqueIndexes(collection, item.key, uniqueIndexes, [...recordsByKey.values()]);
-
-          const storedRecord = createStoredDocumentRecord({
-            id: docId,
-            collection,
-            key: item.key,
-            createdAt,
-            doc: item.doc,
-            indexes: item.indexes,
-            uniqueIndexes,
-          });
-
-          await requestToPromise(docsStore.put(storedRecord));
-          recordsByKey.set(item.key, storedRecord);
-        }
-
-        if (sequenceChanged) {
-          await saveSequence(metaStore, sequence);
-        }
-      });
+          if (sequenceChanged) {
+            await saveSequence(metaStore, sequence);
+          }
+        },
+      );
     },
 
     async batchDelete(collection, keys) {
       const db = await dbPromise;
 
-      await withTransaction(db, [STORE_DOCUMENTS], "readwrite", async (tx) => {
-        const docsStore = tx.objectStore(STORE_DOCUMENTS);
+      await withTransaction(
+        db,
+        [STORE_DOCUMENTS, STORE_QUERY_INDEX_ENTRIES],
+        "readwrite",
+        async (tx) => {
+          const docsStore = tx.objectStore(STORE_DOCUMENTS);
+          const indexStore = tx.objectStore(STORE_QUERY_INDEX_ENTRIES);
 
-        for (const key of keys) {
-          await requestToPromise(docsStore.delete(makeDocumentId(collection, key)));
-        }
-      });
+          for (const key of keys) {
+            const existingRaw = await requestToPromise(
+              docsStore.get(makeDocumentId(collection, key)),
+            );
+
+            if (existingRaw !== undefined) {
+              const existing = parseStoredDocumentRecord(existingRaw);
+              await replaceQueryIndexEntries(indexStore, collection, key, existing.indexes, {});
+            }
+
+            await requestToPromise(docsStore.delete(makeDocumentId(collection, key)));
+          }
+        },
+      );
     },
 
     migration: {
@@ -587,6 +674,105 @@ async function loadCollectionRecordsFromStore(
   });
 
   return records;
+}
+
+async function listCollectionDocumentsByIndex(
+  db: IndexedDbDatabaseLike,
+  collection: string,
+  params: QueryParams,
+): Promise<StoredDocumentRecord[] | null> {
+  if (!params.index || !params.filter) {
+    return null;
+  }
+
+  return withTransaction(
+    db,
+    [STORE_DOCUMENTS, STORE_QUERY_INDEX_ENTRIES],
+    "readonly",
+    async (tx) => {
+      const indexEntriesStore = tx.objectStore(STORE_QUERY_INDEX_ENTRIES);
+      const docsStore = tx.objectStore(STORE_DOCUMENTS);
+      const entries = await loadMatchingIndexEntries(
+        indexEntriesStore,
+        collection,
+        params.index!,
+        params.filter!.value,
+      );
+      const records: StoredDocumentRecord[] = [];
+
+      for (const entry of entries) {
+        const raw = await requestToPromise(docsStore.get(makeDocumentId(collection, entry.key)));
+
+        if (raw === undefined) {
+          continue;
+        }
+
+        records.push(parseStoredDocumentRecord(raw));
+      }
+
+      records.sort((a, b) => {
+        if (a.createdAt !== b.createdAt) {
+          return a.createdAt - b.createdAt;
+        }
+
+        return a.key.localeCompare(b.key);
+      });
+
+      return records;
+    },
+  );
+}
+
+async function loadMatchingIndexEntries(
+  indexEntriesStore: IndexedDbObjectStoreLike,
+  collection: string,
+  indexName: string,
+  filter: string | number | FieldCondition,
+): Promise<QueryIndexEntryRecord[]> {
+  const equalityValue = resolveEqualityFilterValue(filter);
+  const rawEntries =
+    equalityValue === null
+      ? await requestToPromise(indexEntriesStore.getAll())
+      : await requestToPromise(
+          indexEntriesStore
+            .index(QUERY_INDEX_LOOKUP)
+            .getAll([collection, indexName, equalityValue]),
+        );
+
+  return rawEntries
+    .map((entry) => parseQueryIndexEntryRecord(entry))
+    .filter(
+      (entry) =>
+        entry.collection === collection &&
+        entry.indexName === indexName &&
+        matchesFilter(entry.indexValue, filter),
+    );
+}
+
+async function replaceQueryIndexEntries(
+  indexStore: IndexedDbObjectStoreLike,
+  collection: string,
+  key: string,
+  previousIndexes: ResolvedIndexKeys,
+  nextIndexes: ResolvedIndexKeys,
+): Promise<void> {
+  for (const indexName of Object.keys(previousIndexes)) {
+    await requestToPromise(indexStore.delete(makeQueryIndexEntryId(collection, indexName, key)));
+  }
+
+  for (const [indexName, rawValue] of Object.entries(nextIndexes)) {
+    const indexValue = String(rawValue);
+
+    await requestToPromise(
+      indexStore.put({
+        id: makeQueryIndexEntryId(collection, indexName, key),
+        collection,
+        indexName,
+        indexValue,
+        key,
+      }),
+    );
+  }
 }
 
 function assertUniqueIndexes(
@@ -908,6 +1094,22 @@ function matchesFilter(indexValue: string, filter: string | number | FieldCondit
   return matchesCondition(indexValue, filter);
 }
 
+function resolveEqualityFilterValue(filter: string | number | FieldCondition): string | null {
+  if (typeof filter === "string" || typeof filter === "number") {
+    return String(filter);
+  }
+
+  const entries = Object.entries(filter).filter(([, value]) => value !== undefined);
+
+  if (entries.length !== 1) {
+    return null;
+  }
+
+  const [operator, value] = entries[0]!;
+
+  return operator === "$eq" ? String(value as string | number) : null;
+}
+
 function matchesCondition(value: string, condition: FieldCondition): boolean {
   if (condition.$eq !== undefined && value !== String(condition.$eq as string | number)) {
     return false;
@@ -973,10 +1175,27 @@ async function openDatabase(
       if (!db.objectStoreNames.contains(STORE_MIGRATION_CHECKPOINTS)) {
         db.createObjectStore(STORE_MIGRATION_CHECKPOINTS, { keyPath: "collection" });
       }
+
+      if (!db.objectStoreNames.contains(STORE_QUERY_INDEX_ENTRIES)) {
+        const queryIndexEntries = db.createObjectStore(STORE_QUERY_INDEX_ENTRIES, {
+          keyPath: "id",
+        });
+
+        queryIndexEntries.createIndex(QUERY_INDEX_LOOKUP, [
+          "collection",
+          "indexName",
+          "indexValue",
+        ]);
+      }
     };
 
     request.onsuccess = () => {
-      resolve(request.result);
+      const db = request.result;
+
+      ensureQueryIndexEntriesBackfilled(db).then(
+        () => resolve(db),
+        (error: unknown) => reject(error),
+      );
     };
 
     request.onerror = () => {
@@ -1023,6 +1242,35 @@ function requestToPromise<T>(request: IndexedDbRequestLike<T>): Promise<T> {
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(toError(request.error, "IndexedDB request failed"));
   });
+}
+
+async function ensureQueryIndexEntriesBackfilled(db: IndexedDbDatabaseLike): Promise<void> {
+  await withTransaction(
+    db,
+    [STORE_DOCUMENTS, STORE_QUERY_INDEX_ENTRIES],
+    "readwrite",
+    async (tx) => {
+      const indexStore = tx.objectStore(STORE_QUERY_INDEX_ENTRIES);
+      const existingEntries = await requestToPromise(indexStore.getAll());
+
+      if (existingEntries.length > 0) {
+        return;
+      }
+
+      const rawRecords = await requestToPromise(tx.objectStore(STORE_DOCUMENTS).getAll());
+
+      for (const rawRecord of rawRecords) {
+        const record = parseStoredDocumentRecord(rawRecord);
+        await replaceQueryIndexEntries(
+          indexStore,
+          record.collection,
+          record.key,
+          {},
+          record.indexes,
+        );
+      }
+    },
+  );
 }
 
 function resolveFactory(factory?: IndexedDbFactoryLike): IndexedDbFactoryLike {
@@ -1132,6 +1380,30 @@ function parseStoredDocumentRecord(value: unknown): StoredDocumentRecord {
   };
 }
 
+function parseQueryIndexEntryRecord(value: unknown): QueryIndexEntryRecord {
+  if (!isRecord(value)) {
+    throw new Error("IndexedDB query_index_entries store contains an invalid record");
+  }
+
+  const id = value.id;
+  const collection = value.collection;
+  const indexName = value.indexName;
+  const indexValue = value.indexValue;
+  const key = value.key;
+
+  if (
+    typeof id !== "string" ||
+    typeof collection !== "string" ||
+    typeof indexName !== "string" ||
+    typeof indexValue !== "string" ||
+    typeof key !== "string"
+  ) {
+    throw new Error("IndexedDB query_index_entries store contains an invalid record");
+  }
+
+  return { id, collection, indexName, indexValue, key };
+}
+
 function parseMigrationLockRecord(value: unknown): MigrationLockRecord {
   if (!isRecord(value)) {
     throw new Error("IndexedDB migration_locks store contains an invalid record");
@@ -1212,6 +1484,10 @@ function normalizeLimit(limit: number | undefined): number | null {
 
 function makeDocumentId(collection: string, key: string): string {
   return `${collection}\u0000${key}`;
+}
+
+function makeQueryIndexEntryId(collection: string, indexName: string, key: string): string {
+  return `${collection}\u0000${indexName}\u0000${key}`;
 }
 
 function randomId(): string {
