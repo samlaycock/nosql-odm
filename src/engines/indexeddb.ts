@@ -106,6 +106,7 @@ const STORE_QUERY_INDEX_ENTRIES = "query_index_entries";
 const QUERY_INDEX_LOOKUP = "lookup";
 
 const META_SEQUENCE_KEY = "sequence";
+const META_QUERY_INDEX_BACKFILL_KEY = "queryIndexEntriesBackfilled";
 const OUTDATED_PAGE_LIMIT = 100;
 
 interface StoredDocumentRecord {
@@ -127,7 +128,7 @@ interface QueryIndexEntryRecord {
 }
 
 interface MetaSequenceRecord {
-  key: typeof META_SEQUENCE_KEY;
+  key: typeof META_SEQUENCE_KEY | typeof META_QUERY_INDEX_BACKFILL_KEY;
   value: number;
 }
 
@@ -685,6 +686,12 @@ async function listCollectionDocumentsByIndex(
     return null;
   }
 
+  const equalityValue = resolveEqualityFilterValue(params.filter.value);
+
+  if (equalityValue === null) {
+    return null;
+  }
+
   return withTransaction(
     db,
     [STORE_DOCUMENTS, STORE_QUERY_INDEX_ENTRIES],
@@ -696,7 +703,7 @@ async function listCollectionDocumentsByIndex(
         indexEntriesStore,
         collection,
         params.index!,
-        params.filter!.value,
+        equalityValue,
       );
       const records: StoredDocumentRecord[] = [];
 
@@ -727,17 +734,11 @@ async function loadMatchingIndexEntries(
   indexEntriesStore: IndexedDbObjectStoreLike,
   collection: string,
   indexName: string,
-  filter: string | number | FieldCondition,
+  equalityValue: string,
 ): Promise<QueryIndexEntryRecord[]> {
-  const equalityValue = resolveEqualityFilterValue(filter);
-  const rawEntries =
-    equalityValue === null
-      ? await requestToPromise(indexEntriesStore.getAll())
-      : await requestToPromise(
-          indexEntriesStore
-            .index(QUERY_INDEX_LOOKUP)
-            .getAll([collection, indexName, equalityValue]),
-        );
+  const rawEntries = await requestToPromise(
+    indexEntriesStore.index(QUERY_INDEX_LOOKUP).getAll([collection, indexName, equalityValue]),
+  );
 
   return rawEntries
     .map((entry) => parseQueryIndexEntryRecord(entry))
@@ -745,7 +746,7 @@ async function loadMatchingIndexEntries(
       (entry) =>
         entry.collection === collection &&
         entry.indexName === indexName &&
-        matchesFilter(entry.indexValue, filter),
+        entry.indexValue === equalityValue,
     );
 }
 
@@ -1247,13 +1248,15 @@ function requestToPromise<T>(request: IndexedDbRequestLike<T>): Promise<T> {
 async function ensureQueryIndexEntriesBackfilled(db: IndexedDbDatabaseLike): Promise<void> {
   await withTransaction(
     db,
-    [STORE_DOCUMENTS, STORE_QUERY_INDEX_ENTRIES],
+    [STORE_DOCUMENTS, STORE_QUERY_INDEX_ENTRIES, STORE_META],
     "readwrite",
     async (tx) => {
       const indexStore = tx.objectStore(STORE_QUERY_INDEX_ENTRIES);
-      const existingEntries = await requestToPromise(indexStore.getAll());
+      const metaStore = tx.objectStore(STORE_META);
+      const backfilledRaw = await requestToPromise(metaStore.get(META_QUERY_INDEX_BACKFILL_KEY));
 
-      if (existingEntries.length > 0) {
+      if (backfilledRaw !== undefined) {
+        parseMetaFlagRecord(backfilledRaw, META_QUERY_INDEX_BACKFILL_KEY);
         return;
       }
 
@@ -1269,6 +1272,8 @@ async function ensureQueryIndexEntriesBackfilled(db: IndexedDbDatabaseLike): Pro
           record.indexes,
         );
       }
+
+      await saveMetaFlag(metaStore, META_QUERY_INDEX_BACKFILL_KEY);
     },
   );
 }
@@ -1463,6 +1468,30 @@ async function loadSequence(metaStore: IndexedDbObjectStoreLike): Promise<number
 
 async function saveSequence(metaStore: IndexedDbObjectStoreLike, value: number): Promise<void> {
   const record: MetaSequenceRecord = { key: META_SEQUENCE_KEY, value };
+  await requestToPromise(metaStore.put(record));
+}
+
+function parseMetaFlagRecord(
+  value: unknown,
+  expectedKey: typeof META_QUERY_INDEX_BACKFILL_KEY,
+): void {
+  if (!isRecord(value)) {
+    throw new Error("IndexedDB meta store contains an invalid flag record");
+  }
+
+  const key = value.key;
+  const flagValue = value.value;
+
+  if (key !== expectedKey || flagValue !== 1) {
+    throw new Error("IndexedDB meta store contains an invalid flag record");
+  }
+}
+
+async function saveMetaFlag(
+  metaStore: IndexedDbObjectStoreLike,
+  key: typeof META_QUERY_INDEX_BACKFILL_KEY,
+): Promise<void> {
+  const record: MetaSequenceRecord = { key, value: 1 };
   await requestToPromise(metaStore.put(record));
 }
 

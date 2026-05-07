@@ -66,9 +66,10 @@ function createEngine(): IndexedDbQueryEngine {
 
 function createDocumentGetAllGuardFactory() {
   let blockDocumentGetAll = false;
+  let blockQueryIndexEntriesGetAll = false;
 
   const wrapObjectStore = (storeName: string, store: unknown): unknown => {
-    if (storeName !== RAW_STORE_DOCUMENTS) {
+    if (storeName !== RAW_STORE_DOCUMENTS && storeName !== "query_index_entries") {
       return store;
     }
 
@@ -79,8 +80,14 @@ function createDocumentGetAllGuardFactory() {
         }
 
         return () => {
-          if (blockDocumentGetAll) {
+          if (storeName === RAW_STORE_DOCUMENTS && blockDocumentGetAll) {
             throw new Error("documents.getAll() should not be used for indexed query execution");
+          }
+
+          if (storeName === "query_index_entries" && blockQueryIndexEntriesGetAll) {
+            throw new Error(
+              "query_index_entries.getAll() should not be used for indexed query execution",
+            );
           }
 
           return (Reflect.get(target, property, receiver) as () => unknown).call(target);
@@ -154,6 +161,9 @@ function createDocumentGetAllGuardFactory() {
     factory,
     blockDocumentGetAll() {
       blockDocumentGetAll = true;
+    },
+    blockQueryIndexEntriesGetAll() {
+      blockQueryIndexEntriesGetAll = true;
     },
   };
 }
@@ -464,6 +474,58 @@ describe("indexedDbEngine query behavior", () => {
       expect(results.documents).toEqual([{ key: "u1", doc: { id: "u1" } }]);
     } finally {
       await indexedEngine.deleteDatabase();
+    }
+  });
+
+  test("query with comparison filters falls back instead of scanning all query index entries", async () => {
+    const guarded = createDocumentGetAllGuardFactory();
+    const indexedEngine = indexedDbEngine({
+      databaseName: `${databaseNameBase}_range_guarded_${Date.now()}`,
+      factory: guarded.factory,
+    });
+
+    try {
+      await indexedEngine.put("items", "a", { id: "a" }, { byDate: "2025-01-01" });
+      await indexedEngine.put("items", "b", { id: "b" }, { byDate: "2025-06-15" });
+      await indexedEngine.put("items", "c", { id: "c" }, { byDate: "2025-12-31" });
+      guarded.blockQueryIndexEntriesGetAll();
+
+      const results = await indexedEngine.query("items", {
+        index: "byDate",
+        filter: { value: { $between: ["2025-01-01", "2025-06-15"] } },
+      });
+
+      expect(results.documents.map((item) => item.key)).toEqual(["a", "b"]);
+    } finally {
+      await indexedEngine.deleteDatabase();
+    }
+  });
+
+  test("query index backfill completion does not depend on existing entry count", async () => {
+    const guarded = createDocumentGetAllGuardFactory();
+    const databaseName = `${databaseNameBase}_backfill_guarded_${Date.now()}`;
+    const firstEngine = indexedDbEngine({
+      databaseName,
+      factory: guarded.factory,
+    });
+
+    try {
+      await firstEngine.put("users", "u1", { id: "u1" }, {});
+      firstEngine.close();
+      guarded.blockDocumentGetAll();
+
+      const reopenedEngine = indexedDbEngine({
+        databaseName,
+        factory: guarded.factory,
+      });
+
+      try {
+        expect(await reopenedEngine.get("users", "u1")).toEqual({ id: "u1" });
+      } finally {
+        await reopenedEngine.deleteDatabase();
+      }
+    } finally {
+      firstEngine.close();
     }
   });
 
