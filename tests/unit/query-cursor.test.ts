@@ -23,6 +23,34 @@ function position(record: FakeRecord, params: QueryParams): QueryCursorRecordPos
 }
 
 describe("query cursor helpers", () => {
+  test("encodes and decodes cursors without the Node Buffer global", () => {
+    const originalBuffer = Object.getOwnPropertyDescriptor(globalThis, "Buffer");
+
+    // Browser-targeted adapters should not require bundlers to polyfill Buffer.
+    Reflect.deleteProperty(globalThis, "Buffer");
+
+    try {
+      const params: QueryParams = {
+        index: "byScore",
+        filter: { value: { $gte: "10" } },
+        sort: "asc",
+        limit: 2,
+      };
+      const records: FakeRecord[] = [
+        { key: "a", createdAt: 1, indexes: { byScore: "10" } },
+        { key: "b", createdAt: 2, indexes: { byScore: "10" } },
+        { key: "c", createdAt: 3, indexes: { byScore: "11" } },
+      ];
+      const cursor = encodeQueryPageCursor("items", params, position(records[1]!, params));
+
+      expect(resolveQueryPageStartIndex(records, "items", { ...params, cursor }, position)).toBe(2);
+    } finally {
+      if (originalBuffer) {
+        Object.defineProperty(globalThis, "Buffer", originalBuffer);
+      }
+    }
+  });
+
   test("rejects malformed cursors explicitly", () => {
     const records: FakeRecord[] = [];
 
