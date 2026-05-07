@@ -226,16 +226,17 @@ export function memoryEngine(options?: MemoryEngineOptions): MemoryQueryEngine {
 
       return {
         ...paginateQuery(collection, results, params),
-        diagnostics: params.index
-          ? {
-              mode: "native_pushdown",
-              reason: "native_pushdown",
-              index: params.index,
-            }
-          : {
-              mode: "fallback_scan",
-              reason: "full_scan",
-            },
+        diagnostics:
+          params.index && params.filter
+            ? {
+                mode: "native_pushdown",
+                reason: "native_pushdown",
+                index: params.index,
+              }
+            : {
+                mode: "fallback_scan",
+                reason: "full_scan",
+              },
       };
     },
 
