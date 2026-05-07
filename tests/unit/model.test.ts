@@ -521,6 +521,30 @@ describe("indexes", () => {
     });
   });
 
+  test("rejects non-string function index values", () => {
+    const invalidValues = [
+      { label: "number", value: 42 },
+      { label: "boolean", value: true },
+      { label: "object", value: { tenantId: "acme" } },
+      { label: "null", value: null },
+      { label: "undefined", value: undefined },
+    ] as const;
+
+    for (const { label, value } of invalidValues) {
+      const m = model("user")
+        .schema(1, z.object({ id: z.string(), tenantId: z.string() }))
+        .index({
+          name: "byTenant",
+          value: (() => value) as never,
+        })
+        .build();
+
+      expect(() => m.resolveIndexKeys({ id: "u1", tenantId: "acme" })).toThrow(
+        `Model "user" static index name "byTenant" function index value must resolve to a string, got ${label}`,
+      );
+    }
+  });
+
   test("resolves mixed static and dynamic indexes", () => {
     const m = model("user")
       .schema(

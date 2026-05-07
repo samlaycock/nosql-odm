@@ -397,7 +397,12 @@ export class ModelDefinition<
         continue;
       }
 
-      const resolvedValue = resolveIndexValue(index.value as IndexValue<unknown>, data);
+      const resolvedValue = resolveIndexValue(
+        index.value as IndexValue<unknown>,
+        data,
+        this.name,
+        this.describeIndexIdentifier(index),
+      );
 
       if (resolvedValue === undefined) {
         continue;
@@ -770,12 +775,19 @@ export function encodeNumericIndexValue(value: number): string {
   return encoded;
 }
 
-function resolveIndexValue<T>(value: IndexValue<T>, data: T): string | undefined {
+function resolveIndexValue<T>(
+  value: IndexValue<T>,
+  data: T,
+  modelName: string,
+  indexIdentifier: string,
+): string | undefined {
   if (typeof value === "function") {
     const resolved = value(data);
 
-    if (resolved === undefined || resolved === null) {
-      return undefined;
+    if (typeof resolved !== "string") {
+      throw new Error(
+        `Model "${modelName}" ${indexIdentifier} function index value must resolve to a string, got ${formatIndexValueType(resolved)}`,
+      );
     }
 
     return resolved;
@@ -788,6 +800,18 @@ function resolveIndexValue<T>(value: IndexValue<T>, data: T): string | undefined
   }
 
   return String(fieldValue as string | number | boolean | bigint | symbol);
+}
+
+function formatIndexValueType(value: unknown): string {
+  if (value === null) {
+    return "null";
+  }
+
+  if (Array.isArray(value)) {
+    return "array";
+  }
+
+  return typeof value;
 }
 
 function findDuplicateStrings(values: readonly string[]): string[] {
