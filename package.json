@@ -136,6 +136,7 @@
     "pg": "8.18.0",
     "redis": "5.11.0",
     "tsdown": "0.20.3",
+    "typescript": "^5",
     "zod": "4.3.6"
   },
   "peerDependencies": {
@@ -146,8 +147,7 @@
     "mongodb": "^7.1.0",
     "mysql2": "^3.17.2",
     "pg": "^8.18.0",
-    "redis": "^5.11.0",
-    "typescript": "^5"
+    "redis": "^5.11.0"
   },
   "peerDependenciesMeta": {
     "@aws-sdk/lib-dynamodb": {

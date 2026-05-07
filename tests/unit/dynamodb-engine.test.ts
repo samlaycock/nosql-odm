@@ -28,7 +28,11 @@ class FakeDynamoClient {
     }
 
     if (command instanceof BatchGetCommand) {
-      return { Responses: { "test-table": this.existingDocument ? [this.existingDocument] : [] } };
+      return {
+        Responses: {
+          "test-table": this.existingDocument ? [this.existingDocument] : [],
+        },
+      };
     }
 
     if (command instanceof TransactWriteCommand) {
@@ -88,7 +92,7 @@ describe("dynamoDbEngine", () => {
       tableName: "test-table",
     });
 
-    await expect(engine.create("users", "u1", { id: "u1" }, makeIndexes(99))).rejects.toThrow(
+    expect(engine.create("users", "u1", { id: "u1" }, makeIndexes(99))).rejects.toThrow(
       /100-item transaction limit/i,
     );
     expect(client.sentCommands).toEqual(["UpdateCommand"]);
@@ -102,7 +106,7 @@ describe("dynamoDbEngine", () => {
       tableName: "test-table",
     });
 
-    await expect(engine.delete("users", "u1")).rejects.toThrow(/100-item transaction limit/i);
+    expect(engine.delete("users", "u1")).rejects.toThrow(/100-item transaction limit/i);
     expect(client.sentCommands).toEqual(["GetCommand"]);
   });
 
@@ -113,7 +117,7 @@ describe("dynamoDbEngine", () => {
       tableName: "test-table",
     });
 
-    await expect(
+    expect(
       engine.batchSet("users", [{ key: "u1", doc: { id: "u1" }, indexes: makeIndexes(99) }]),
     ).rejects.toThrow(/100-item transaction limit/i);
     expect(client.sentCommands).toEqual(["BatchGetCommand", "UpdateCommand"]);

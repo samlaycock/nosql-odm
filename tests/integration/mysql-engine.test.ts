@@ -195,7 +195,9 @@ describe("mySqlEngine integration", () => {
     await connectWithRetry(requireAdminPool());
 
     await requireAdminPool().query(
-      `CREATE DATABASE IF NOT EXISTS ${quoteIdentifier(databaseName)} CHARACTER SET utf8mb4 COLLATE utf8mb4_bin`,
+      `CREATE DATABASE IF NOT EXISTS ${quoteIdentifier(
+        databaseName,
+      )} CHARACTER SET utf8mb4 COLLATE utf8mb4_bin`,
     );
 
     pool = createPool({
@@ -253,7 +255,10 @@ describe("mySqlEngine integration", () => {
   test("create stores and get returns document", async () => {
     await engine.create(collection, "u1", { id: "u1", name: "Sam" }, { primary: "u1" });
 
-    expect(await engine.get(collection, "u1")).toEqual({ id: "u1", name: "Sam" });
+    expect(await engine.get(collection, "u1")).toEqual({
+      id: "u1",
+      name: "Sam",
+    });
   });
 
   test("supports custom internal table names", async () => {
@@ -359,7 +364,7 @@ describe("mySqlEngine integration", () => {
       { primary: "u1" },
     );
 
-    await expect(
+    expect(
       engine.create(
         collection,
         "u2",
@@ -390,7 +395,7 @@ describe("mySqlEngine integration", () => {
       { primary: "u1" },
     );
 
-    await expect(
+    expect(
       engine.create(
         collection,
         "u2",
@@ -480,7 +485,7 @@ describe("mySqlEngine integration", () => {
     expect((canonicalOwnerRows as unknown[]).length).toBe(1);
     expect((canonicalOwnerRows as Array<{ doc_key: string }>)[0]?.doc_key).toBe("u1");
 
-    await expect(
+    expect(
       engine.create(
         collection,
         "u4",
@@ -543,7 +548,10 @@ describe("mySqlEngine integration", () => {
     await engine.put(collection, "u1", { id: "u1", name: "Sam" }, { primary: "u1" });
     await engine.update(collection, "u1", { id: "u1", name: "Samuel" }, { primary: "u1" });
 
-    expect(await engine.get(collection, "u1")).toEqual({ id: "u1", name: "Samuel" });
+    expect(await engine.get(collection, "u1")).toEqual({
+      id: "u1",
+      name: "Samuel",
+    });
   });
 
   test("update throws not-found error when key does not exist", async () => {

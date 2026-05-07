@@ -335,7 +335,7 @@ describe("sqlite setup", () => {
     });
 
     try {
-      await expect(
+      expect(
         migratedEngine.create(
           "users",
           "u2",
@@ -955,7 +955,13 @@ describe("batchSetWithResult()", () => {
     await engine.put(
       "users",
       "u1",
-      { __v: 1, __indexes: ["primary"], id: "u1", name: "Before", email: "before@example.com" },
+      {
+        __v: 1,
+        __indexes: ["primary"],
+        id: "u1",
+        name: "Before",
+        email: "before@example.com",
+      },
       { primary: "u1" },
     );
 
