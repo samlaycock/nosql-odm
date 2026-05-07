@@ -398,6 +398,25 @@ describe("batchSet()", () => {
     expect(stored.nested.value).toBe(1);
   });
 
+  test("preserves the first createdAt when a batch contains duplicate new keys", async () => {
+    await engine.batchSet!("users", [
+      { key: "a", doc: { id: "a", name: "First" }, indexes: { byGroup: "same" } },
+      { key: "b", doc: { id: "b", name: "Second" }, indexes: { byGroup: "same" } },
+      { key: "a", doc: { id: "a", name: "Updated" }, indexes: { byGroup: "same" } },
+    ]);
+
+    const results = await engine.query("users", {
+      index: "byGroup",
+      filter: { value: "same" },
+      sort: "asc",
+    });
+
+    expect(results.documents).toEqual([
+      { key: "a", doc: { id: "a", name: "Updated" } },
+      { key: "b", doc: { id: "b", name: "Second" } },
+    ]);
+  });
+
   test("does not persist any documents when write preparation fails", async () => {
     engine = memoryEngine({
       onBeforePut(_collection, key) {
@@ -407,16 +426,16 @@ describe("batchSet()", () => {
       },
     });
 
-    try {
-      await engine.batchSet!("users", [
-        { key: "a", doc: { id: "a", name: "Alice" }, indexes: { primary: "a" } },
-        { key: "b", doc: { id: "b", name: "Bob" }, indexes: { primary: "b" } },
-      ]);
-      throw new Error("expected batchSet to fail");
-    } catch (error) {
-      expect(error).toBeInstanceOf(Error);
-      expect((error as Error).message).toBe("write preparation failed");
-    }
+    const rejection = expect(
+      Promise.resolve().then(() =>
+        engine.batchSet!("users", [
+          { key: "a", doc: { id: "a", name: "Alice" }, indexes: { primary: "a" } },
+          { key: "b", doc: { id: "b", name: "Bob" }, indexes: { primary: "b" } },
+        ]),
+      ),
+    ).rejects.toThrow("write preparation failed") as unknown as Promise<void>;
+
+    await rejection;
 
     expect(await engine.get("users", "a")).toBeNull();
     expect(await engine.get("users", "b")).toBeNull();

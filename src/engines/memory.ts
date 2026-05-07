@@ -289,6 +289,7 @@ export function memoryEngine(options?: MemoryEngineOptions): MemoryQueryEngine {
       const collectionUniqueState = getCollectionUniqueOwnership(collection);
       const stagedUniqueState = cloneUniqueOwnershipState(collectionUniqueState);
       const stagedItems: StagedBatchSetItem[] = [];
+      const stagedItemByKey = new Map<string, StagedBatchSetItem>();
       let stagedCreatedAtSequence = createdAtSequence;
 
       // Validate unique constraints for the whole batch up front so duplicate
@@ -300,8 +301,8 @@ export function memoryEngine(options?: MemoryEngineOptions): MemoryQueryEngine {
       for (const item of items) {
         engineOptions.onBeforePut?.(collection, item.key, item.doc);
 
-        const existing = col.get(item.key);
-        stagedItems.push({
+        const existing = stagedItemByKey.get(item.key)?.stored ?? col.get(item.key);
+        const stagedItem = {
           key: item.key,
           stored: {
             createdAt: existing?.createdAt ?? ++stagedCreatedAtSequence,
@@ -309,7 +310,10 @@ export function memoryEngine(options?: MemoryEngineOptions): MemoryQueryEngine {
             indexes: { ...item.indexes },
             uniqueIndexes: { ...item.uniqueIndexes },
           },
-        });
+        };
+
+        stagedItems.push(stagedItem);
+        stagedItemByKey.set(item.key, stagedItem);
       }
 
       collectionUniqueState.clear();
