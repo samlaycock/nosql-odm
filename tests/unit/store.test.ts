@@ -627,6 +627,31 @@ describe("createStore()", () => {
     }).toThrow('Duplicate model name: "user"');
   });
 
+  test("throws when model names collide with store-level APIs", () => {
+    const reservedNames = [
+      "getOrCreateMigration",
+      "migrateNextPage",
+      "getMigrationProgress",
+      "migrateAll",
+    ] as const;
+
+    for (const reservedName of reservedNames) {
+      const reservedModel = model(reservedName)
+        .schema(
+          1,
+          z.object({
+            id: z.string(),
+          }),
+        )
+        .index({ name: "primary", value: "id" })
+        .build();
+
+      expect(() => {
+        createStore(engine, [reservedModel]);
+      }).toThrow(`Model name "${reservedName}" collides with a store-level API`);
+    }
+  });
+
   test("creates a store with a single model", () => {
     const store = createStore(engine, [buildUserV1()]);
 

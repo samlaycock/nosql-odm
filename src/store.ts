@@ -186,6 +186,13 @@ export type Store<
   migrateAll(options?: MigrationRunOptions): Promise<MigrationResult[]>;
 };
 
+const RESERVED_STORE_API_NAMES = new Set([
+  "getOrCreateMigration",
+  "migrateNextPage",
+  "getMigrationProgress",
+  "migrateAll",
+]);
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -1907,6 +1914,10 @@ export function createStore<
   const boundModels = new Map<string, BoundModelImpl<any, TOptions, any, any>>();
 
   for (const modelDef of models) {
+    if (RESERVED_STORE_API_NAMES.has(modelDef.name)) {
+      throw new Error(`Model name "${modelDef.name}" collides with a store-level API`);
+    }
+
     if (boundModels.has(modelDef.name)) {
       throw new Error(`Duplicate model name: "${modelDef.name}"`);
     }
