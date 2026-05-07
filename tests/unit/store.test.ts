@@ -24,6 +24,7 @@ import {
   MigrationProjectionError,
   MigrationAlreadyRunningError,
   MigrationScopeConflictError,
+  NonObjectDocumentError,
   type ProjectionSkippedEvent,
   UniqueConstraintError,
 } from "../../src/store";
@@ -322,6 +323,35 @@ function buildBlobV2WithBigIntMigration() {
       },
     )
     .index({ name: "primary", value: "id" })
+    .build();
+}
+
+function buildPrimitiveStringModel() {
+  return model("primitiveString").schema(1, z.string()).build();
+}
+
+function buildPrimitiveNumberModel() {
+  return model("primitiveNumber").schema(1, z.number()).build();
+}
+
+function buildPrimitiveBooleanModel() {
+  return model("primitiveBoolean").schema(1, z.boolean()).build();
+}
+
+function buildPrimitiveMigrationModel() {
+  return model("primitiveMigration")
+    .schema(
+      1,
+      z.object({
+        id: z.string(),
+        value: z.string(),
+      }),
+    )
+    .schema(2, z.string(), {
+      migrate(old) {
+        return old.value;
+      },
+    })
     .build();
 }
 
@@ -3171,6 +3201,52 @@ describe("JSON compatibility on engine writes", () => {
       }),
       /\$\.payload\.deep\[1\]\.bad/,
     );
+  });
+});
+
+describe("object-document validation on store writes", () => {
+  test("create rejects string schema outputs before writing to engine", async () => {
+    const store = createStore(engine, [buildPrimitiveStringModel()]);
+
+    await expectReject(store.primitiveString.create("s1", "value"), NonObjectDocumentError);
+
+    expect(await engine.get("primitiveString", "s1")).toBeNull();
+  });
+
+  test("batchSet rejects number schema outputs atomically before writing to engine", async () => {
+    const store = createStore(engine, [buildPrimitiveNumberModel()]);
+
+    await expectReject(
+      store.primitiveNumber.batchSet([
+        { key: "n1", data: 1 },
+        { key: "n2", data: 2 },
+      ]),
+      NonObjectDocumentError,
+    );
+
+    expect(await engine.get("primitiveNumber", "n1")).toBeNull();
+    expect(await engine.get("primitiveNumber", "n2")).toBeNull();
+  });
+
+  test("create rejects boolean schema outputs before writing to engine", async () => {
+    const store = createStore(engine, [buildPrimitiveBooleanModel()]);
+
+    await expectReject(store.primitiveBoolean.create("b1", true), NonObjectDocumentError);
+
+    expect(await engine.get("primitiveBoolean", "b1")).toBeNull();
+  });
+
+  test("lazy migration writeback rejects primitive migrated documents", async () => {
+    await engine.put(
+      "primitiveMigration",
+      "p1",
+      { __v: 1, __indexes: [], id: "p1", value: "migrated" },
+      {},
+    );
+
+    const store = createStore(engine, [buildPrimitiveMigrationModel()]);
+
+    await expectReject(store.primitiveMigration.findByKey("p1"), NonObjectDocumentError);
   });
 });
 
