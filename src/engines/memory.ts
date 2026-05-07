@@ -224,7 +224,19 @@ export function memoryEngine(options?: MemoryEngineOptions): MemoryQueryEngine {
       const col = getCollection(collection);
       const results = matchDocuments(col, params);
 
-      return paginateQuery(collection, results, params);
+      return {
+        ...paginateQuery(collection, results, params),
+        diagnostics: params.index
+          ? {
+              mode: "native_pushdown",
+              reason: "native_pushdown",
+              index: params.index,
+            }
+          : {
+              mode: "fallback_scan",
+              reason: "full_scan",
+            },
+      };
     },
 
     async probeUnique(collection, indexName, values) {

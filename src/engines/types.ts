@@ -210,6 +210,23 @@ export interface EngineGetResult {
 export interface EngineQueryResult {
   documents: KeyedDocument[];
   cursor: string | null;
+  diagnostics?: EngineQueryDiagnostics;
+}
+
+export type QueryExecutionMode = "native_pushdown" | "fallback_scan" | "degraded_pagination";
+
+export type QueryDiagnosticReason =
+  | "native_pushdown"
+  | "fallback_scan"
+  | "unsupported_operator"
+  | "unsupported_filter"
+  | "full_scan"
+  | "degraded_pagination";
+
+export interface EngineQueryDiagnostics {
+  readonly mode: QueryExecutionMode;
+  readonly reason: QueryDiagnosticReason;
+  readonly index?: string;
 }
 
 /**

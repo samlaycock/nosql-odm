@@ -4602,6 +4602,67 @@ describe("multi-model isolation", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Query diagnostics
+// ---------------------------------------------------------------------------
+
+describe("query diagnostics", () => {
+  test("emits native pushdown diagnostics for indexed queries", async () => {
+    const events: Array<Record<string, unknown>> = [];
+    const store = createStore(engine, [buildUserV1()], {
+      queryDiagnostics: {
+        onQueryDiagnostic(event) {
+          events.push(event as unknown as Record<string, unknown>);
+        },
+      },
+    });
+
+    await store.user.create("u1", {
+      id: "u1",
+      name: "Sam",
+      email: "sam@example.com",
+    });
+
+    await store.user.query({
+      index: "byEmail",
+      filter: { value: "sam@example.com" },
+    });
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      model: "user",
+      mode: "native_pushdown",
+      reason: "native_pushdown",
+      index: "byEmail",
+      params: {
+        index: "byEmail",
+        filter: { value: "sam@example.com" },
+      },
+    });
+  });
+
+  test("emits fallback scan diagnostics for unindexed queries", async () => {
+    const events: Array<Record<string, unknown>> = [];
+    const store = createStore(engine, [buildUserV1()], {
+      queryDiagnostics: {
+        onQueryDiagnostic(event) {
+          events.push(event as unknown as Record<string, unknown>);
+        },
+      },
+    });
+
+    await store.user.query({});
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      model: "user",
+      mode: "fallback_scan",
+      reason: "full_scan",
+      params: {},
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Dynamic indexes through migration
 // ---------------------------------------------------------------------------
 
