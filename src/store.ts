@@ -289,6 +289,21 @@ export class DuplicateBatchSetKeysError extends NosqlOdmError<
   }
 }
 
+export class NonObjectDocumentError extends NosqlOdmError<typeof ERROR_CODES.NON_OBJECT_DOCUMENT> {
+  readonly collection: string;
+  readonly key: string;
+
+  constructor(collection: string, key: string) {
+    super(
+      "NonObjectDocumentError",
+      ERROR_CODES.NON_OBJECT_DOCUMENT,
+      `Model "${collection}" must validate to a non-array object before storing document "${key}"`,
+    );
+    this.collection = collection;
+    this.key = key;
+  }
+}
+
 export class MigrationProjectionError extends NosqlOdmError<
   typeof ERROR_CODES.MIGRATION_PROJECTION_FAILED
 > {
@@ -504,6 +519,10 @@ function resolveBatchSetPreparationConcurrency(options?: BatchSetPreparationOpti
     "batchSetPreparation",
     DEFAULT_BATCH_SET_PREPARATION_CONCURRENCY,
   );
+}
+
+function isObjectDocument(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function findDuplicateBatchSetKeyConflicts<T>(
@@ -1007,7 +1026,11 @@ class BoundModelImpl<
   }
 
   // Stamps the version and index names onto a document for storage.
-  private stamp(data: object, key: string): Record<string, unknown> | PreparedDocument {
+  private stamp(data: unknown, key: string): Record<string, unknown> | PreparedDocument {
+    if (!isObjectDocument(data)) {
+      throw new NonObjectDocumentError(this.model.name, key);
+    }
+
     const stamped = {
       ...data,
       [this.model.options.versionField]: this.model.latestVersion,

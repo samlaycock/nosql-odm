@@ -36,6 +36,7 @@ export {
   MigrationAlreadyRunningError,
   MissingMigratorError,
   MigrationScopeConflictError,
+  NonObjectDocumentError,
   UniqueConstraintError,
   type QueryResult,
   type BatchSetInputItem,
