@@ -186,6 +186,7 @@ export type Store<
   migrateAll(options?: MigrationRunOptions): Promise<MigrationResult[]>;
 };
 
+// Keep in sync with the store-level methods declared in the `Store` type above.
 const RESERVED_STORE_API_NAMES = new Set([
   "getOrCreateMigration",
   "migrateNextPage",
