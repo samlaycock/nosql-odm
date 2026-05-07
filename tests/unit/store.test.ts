@@ -4660,6 +4660,15 @@ describe("query diagnostics", () => {
       params: {},
     });
   });
+
+  test("memory engine reports fallback scan diagnostics when index is provided without a filter", async () => {
+    const result = await engine.query("user", { index: "byEmail" });
+
+    expect(result.diagnostics).toEqual({
+      mode: "fallback_scan",
+      reason: "full_scan",
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
