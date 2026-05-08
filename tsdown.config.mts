@@ -4,6 +4,7 @@ export default defineConfig({
   entry: [
     "./src/index.ts",
     "./src/engines/memory.ts",
+    "./src/engines/types.ts",
     "./src/engines/sqlite.ts",
     "./src/engines/indexeddb.ts",
     "./src/engines/dynamodb.ts",

@@ -22,6 +22,14 @@ A lightweight, schema-first ODM for NoSQL-style data stores.
 
 In other words, the ODM acts as a type-safe proxy over the engine contract. Adapter authors implement correctness/performance details at the engine boundary.
 
+Custom engine authors should import the shared engine contract from the dedicated engine types subpath:
+
+```ts
+import type { QueryEngine, QueryParams, EngineQueryResult } from "nosql-odm/engines/types";
+```
+
+The root package still re-exports these types for app code, but `nosql-odm/engines/types` is the clearest import path for third-party adapters that implement the low-level storage boundary.
+
 ## Installation
 
 ```bash

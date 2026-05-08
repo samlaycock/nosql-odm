@@ -31,6 +31,11 @@
       "import": "./dist/engines/memory.mjs",
       "require": "./dist/engines/memory.js"
     },
+    "./engines/types": {
+      "types": "./dist/engines/types.d.ts",
+      "import": "./dist/engines/types.mjs",
+      "require": "./dist/engines/types.js"
+    },
     "./engines/sqlite": {
       "types": "./dist/engines/sqlite.d.ts",
       "import": "./dist/engines/sqlite.mjs",
