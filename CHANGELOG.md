@@ -1,5 +1,21 @@
 # nosql-odm
 
+## 0.11.1
+
+### Patch Changes
+
+- 04d6264: Make memory engine batchSet writes atomic when per-item write preparation fails.
+- 75ff565: Bound `batchSet` document validation and preparation concurrency with the new `batchSetPreparation.concurrency` createStore option.
+- 1bef620: Replace query cursor Buffer encoding with a runtime-neutral base64url codec for browser-compatible adapters.
+- 391ee4c: Move TypeScript from peer dependencies to development dependencies so consumers are not asked to install it unless their own project needs it.
+- 190f773: Expose `nosql-odm/engines/types` as a dedicated subpath for custom query engine authors.
+- 856fb79: Use frozen Bun installs for all publish-gating jobs so release checks validate the lockfile dependency graph.
+- 9551267: Reject schema outputs that validate to primitive values before writing documents to the store.
+- b852a45: Reject model names that collide with store-level migration APIs.
+- a88a98e: Validate dynamic index names before resolving index entries for writes.
+- e55c01c: Reject non-string values returned by function indexes before passing resolved index keys to engines.
+- dd4e562: Validate query limit values in the store layer before dispatching to engines.
+
 ## 0.11.0
 
 ### Minor Changes
