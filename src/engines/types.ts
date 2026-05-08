@@ -162,6 +162,7 @@ export interface QueryParams {
   filter?: QueryFilter;
   /** Field-level filter — resolves the index automatically. Mutually exclusive with `index`/`filter`. */
   where?: WhereFilter;
+  /** Maximum documents to return. Must be a finite, non-negative integer; 0 returns an empty page. */
   limit?: number;
   cursor?: string;
   sort?: "asc" | "desc";
