@@ -3236,6 +3236,39 @@ describe("object-document validation on store writes", () => {
     expect(await engine.get("primitiveBoolean", "b1")).toBeNull();
   });
 
+  test("update rejects primitive validated outputs before writing to engine", async () => {
+    await engine.put(
+      "primitiveUpdate",
+      "u1",
+      { __v: 1, __indexes: [], id: "u1", value: "stored" },
+      {},
+    );
+
+    const primitiveUpdateModel = model("primitiveUpdate")
+      .schema(
+        1,
+        z.object({
+          id: z.string(),
+          value: z.string(),
+        }),
+      )
+      .build();
+    primitiveUpdateModel.validate = async () => false as never;
+    const store = createStore(engine, [primitiveUpdateModel]);
+
+    await expectReject(
+      store.primitiveUpdate.update("u1", { value: "next" }),
+      NonObjectDocumentError,
+    );
+
+    expect(await engine.get("primitiveUpdate", "u1")).toEqual({
+      __v: 1,
+      __indexes: [],
+      id: "u1",
+      value: "stored",
+    });
+  });
+
   test("lazy migration writeback rejects primitive migrated documents", async () => {
     await engine.put(
       "primitiveMigration",
@@ -3247,6 +3280,19 @@ describe("object-document validation on store writes", () => {
     const store = createStore(engine, [buildPrimitiveMigrationModel()]);
 
     await expectReject(store.primitiveMigration.findByKey("p1"), NonObjectDocumentError);
+  });
+
+  test("migrateAll rejects primitive migrated documents", async () => {
+    await engine.put(
+      "primitiveMigration",
+      "p1",
+      { __v: 1, __indexes: [], id: "p1", value: "migrated" },
+      {},
+    );
+
+    const store = createStore(engine, [buildPrimitiveMigrationModel()]);
+
+    await expectReject(store.primitiveMigration.migrateAll(), NonObjectDocumentError);
   });
 });
 

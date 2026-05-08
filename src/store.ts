@@ -638,7 +638,7 @@ class BoundModelImpl<
 
   async create(key: string, data: T, options?: TOptions): Promise<T> {
     const validated = await this.model.validate(data);
-    const doc = this.stamp(validated as object, key);
+    const doc = this.stamp(validated, key);
     const indexes = this.model.resolveIndexKeys(validated);
     const uniqueIndexes = this.model.resolveUniqueIndexKeys(validated);
     const migrationMetadata = this.currentMigrationMetadata();
@@ -697,7 +697,7 @@ class BoundModelImpl<
 
     const merged = { ...current, ...(data as object) };
     const validated = await this.model.validate(merged);
-    const doc = this.stamp(validated as object, key);
+    const doc = this.stamp(validated, key);
     const indexes = this.model.resolveIndexKeys(validated);
     const uniqueIndexes = this.model.resolveUniqueIndexKeys(validated);
     const migrationMetadata = this.currentMigrationMetadata();
@@ -860,7 +860,7 @@ class BoundModelImpl<
         return {
           key: item.key,
           validated,
-          doc: this.stamp(validated as object, item.key),
+          doc: this.stamp(validated, item.key),
           indexes: this.model.resolveIndexKeys(validated),
           uniqueIndexes: this.model.resolveUniqueIndexKeys(validated),
           migrationMetadata: this.currentMigrationMetadata(),
@@ -1075,7 +1075,7 @@ class BoundModelImpl<
 
     const prepared = items.map((item) => ({
       key: item.key,
-      doc: this.stamp(item.value as object, item.key),
+      doc: this.stamp(item.value, item.key),
       indexes: this.model.resolveIndexKeys(item.value),
       uniqueIndexes: this.model.resolveUniqueIndexKeys(item.value),
       migrationMetadata: this.currentMigrationMetadata(),
@@ -1211,7 +1211,7 @@ class BoundModelImpl<
       },
       toBatchSetItem: (key, value) => ({
         key,
-        doc: this.stamp(value as object, key),
+        doc: this.stamp(value, key),
         indexes: this.model.resolveIndexKeys(value as T),
         uniqueIndexes: this.model.resolveUniqueIndexKeys(value as T),
         migrationMetadata: this.currentMigrationMetadata(),
