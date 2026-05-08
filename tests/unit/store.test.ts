@@ -1983,6 +1983,53 @@ describe("store.query()", () => {
     expect(page2.cursor).toBeNull();
   });
 
+  test("rejects invalid query limits before dispatching to the engine", async () => {
+    const forwardedLimits: number[] = [];
+    const trackingEngine: QueryEngine<never> = {
+      async get() {
+        return null;
+      },
+      async create() {},
+      async put() {},
+      async update() {},
+      async delete() {},
+      async query(_collection, params) {
+        if (params.limit !== undefined) {
+          forwardedLimits.push(params.limit);
+        }
+
+        return { documents: [], cursor: null };
+      },
+      async batchGet() {
+        return [];
+      },
+      async batchSet() {},
+      async batchDelete() {},
+      migration: {
+        async acquireLock() {
+          return null;
+        },
+        async releaseLock() {},
+        async getOutdated() {
+          return { documents: [], cursor: null };
+        },
+      },
+    };
+    const store = createStore(trackingEngine, [buildUserV1()]);
+
+    for (const limit of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, -1, 1.5]) {
+      await expectReject(
+        store.user.query({ limit }),
+        "query limit must be a finite, non-negative integer",
+      );
+    }
+
+    await store.user.query({ limit: 0 });
+    await store.user.query({ limit: 2 });
+
+    expect(forwardedLimits).toEqual([0, 2]);
+  });
+
   test("projects read results with bounded concurrency while preserving document order", async () => {
     const tracker = createReadProjectionTracker();
     const migratedDocs = createMigratedUserDocuments(10);

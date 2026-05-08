@@ -1688,10 +1688,12 @@ class BoundModelImpl<
       throw new Error('query params with "filter" must also include "index"');
     }
 
+    const limit = this.normalizeQueryLimit(params.limit);
+
     if (hasWhere) {
       return {
         ...this.resolveWhere(params.where!),
-        limit: params.limit,
+        limit,
         cursor: params.cursor,
         querySignatureSalt: this.currentQuerySignatureSalt(),
         sort: params.sort,
@@ -1701,6 +1703,7 @@ class BoundModelImpl<
     if (hasIndex) {
       return {
         ...params,
+        limit,
         index: this.resolveIndexName(params.index!),
         querySignatureSalt: this.currentQuerySignatureSalt(),
       };
@@ -1708,8 +1711,21 @@ class BoundModelImpl<
 
     return {
       ...params,
+      limit,
       querySignatureSalt: this.currentQuerySignatureSalt(),
     };
+  }
+
+  private normalizeQueryLimit(limit: number | undefined): number | undefined {
+    if (limit === undefined) {
+      return undefined;
+    }
+
+    if (!Number.isFinite(limit) || limit < 0 || !Number.isInteger(limit)) {
+      throw new Error("query limit must be a finite, non-negative integer");
+    }
+
+    return limit;
   }
 
   // Resolves a user-facing index name to the engine-level index identifier.
