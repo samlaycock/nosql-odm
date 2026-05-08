@@ -17,6 +17,9 @@ export default defineConfig({
   ],
   format: ["cjs", "esm"],
   platform: "neutral",
+  outputOptions: {
+    codeSplitting: true,
+  },
   dts: true,
   outDir: "./dist",
 });
