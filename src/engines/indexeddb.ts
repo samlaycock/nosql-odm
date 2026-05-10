@@ -114,6 +114,7 @@ interface StoredDocumentRecord {
   collection: string;
   key: string;
   createdAt: number;
+  writeVersion: number;
   doc: Record<string, unknown>;
   indexes: ResolvedIndexKeys;
   uniqueIndexes: ResolvedIndexKeys;
@@ -188,6 +189,26 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
       });
     },
 
+    async getWithMetadata(collection, key) {
+      const db = await dbPromise;
+      const docId = makeDocumentId(collection, key);
+
+      return withTransaction(db, [STORE_DOCUMENTS], "readonly", async (tx) => {
+        const raw = await requestToPromise(tx.objectStore(STORE_DOCUMENTS).get(docId));
+
+        if (raw === undefined) {
+          return null;
+        }
+
+        const record = parseStoredDocumentRecord(raw);
+
+        return {
+          doc: structuredClone(record.doc),
+          writeToken: String(record.writeVersion),
+        };
+      });
+    },
+
     async create(collection, key, doc, indexes, _options, _migrationMetadata, uniqueIndexes) {
       const db = await dbPromise;
       const docId = makeDocumentId(collection, key);
@@ -217,6 +238,7 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
             collection,
             key,
             createdAt: sequence,
+            writeVersion: 1,
             doc,
             indexes,
             uniqueIndexes,
@@ -247,14 +269,17 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
           const existingRaw = await requestToPromise(docsStore.get(docId));
 
           let createdAt: number;
+          let writeVersion: number;
           let existingIndexes: ResolvedIndexKeys = {};
 
           if (existingRaw === undefined) {
             createdAt = (await loadSequence(metaStore)) + 1;
+            writeVersion = 1;
             await saveSequence(metaStore, createdAt);
           } else {
             const existing = parseStoredDocumentRecord(existingRaw);
             createdAt = existing.createdAt;
+            writeVersion = existing.writeVersion + 1;
             existingIndexes = existing.indexes;
           }
 
@@ -265,6 +290,7 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
             collection,
             key,
             createdAt,
+            writeVersion,
             doc,
             indexes,
             uniqueIndexes,
@@ -303,6 +329,7 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
             collection,
             key,
             createdAt: existing.createdAt,
+            writeVersion: existing.writeVersion + 1,
             doc,
             indexes,
             uniqueIndexes,
@@ -352,6 +379,16 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
       return paginateQuery(collection, matched, params);
     },
 
+    async queryWithMetadata(collection, params) {
+      const db = await dbPromise;
+      const records =
+        (await listCollectionDocumentsByIndex(db, collection, params)) ??
+        (await listCollectionDocuments(db, collection));
+      const matched = matchDocuments(records, params);
+
+      return paginateQuery(collection, matched, params, true);
+    },
+
     async batchGet(collection, keys) {
       const db = await dbPromise;
 
@@ -368,6 +405,32 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
 
           const record = parseStoredDocumentRecord(raw);
           results.push({ key, doc: structuredClone(record.doc) });
+        }
+
+        return results;
+      });
+    },
+
+    async batchGetWithMetadata(collection, keys) {
+      const db = await dbPromise;
+
+      return withTransaction(db, [STORE_DOCUMENTS], "readonly", async (tx) => {
+        const docsStore = tx.objectStore(STORE_DOCUMENTS);
+        const results: KeyedDocument[] = [];
+
+        for (const key of keys) {
+          const raw = await requestToPromise(docsStore.get(makeDocumentId(collection, key)));
+
+          if (raw === undefined) {
+            continue;
+          }
+
+          const record = parseStoredDocumentRecord(raw);
+          results.push({
+            key,
+            doc: structuredClone(record.doc),
+            writeToken: String(record.writeVersion),
+          });
         }
 
         return results;
@@ -398,15 +461,18 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
             const existingRaw = await requestToPromise(docsStore.get(docId));
 
             let createdAt: number;
+            let writeVersion: number;
             let existingIndexes: ResolvedIndexKeys = {};
 
             if (existingRaw === undefined) {
               sequence += 1;
               sequenceChanged = true;
               createdAt = sequence;
+              writeVersion = 1;
             } else {
               const existing = parseStoredDocumentRecord(existingRaw);
               createdAt = existing.createdAt;
+              writeVersion = existing.writeVersion + 1;
               existingIndexes = existing.indexes;
             }
 
@@ -419,6 +485,7 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
               collection,
               key: item.key,
               createdAt,
+              writeVersion,
               doc: item.doc,
               indexes: item.indexes,
               uniqueIndexes,
@@ -438,6 +505,82 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
           if (sequenceChanged) {
             await saveSequence(metaStore, sequence);
           }
+        },
+      );
+    },
+
+    async batchSetWithResult(collection, items) {
+      const db = await dbPromise;
+
+      return withTransaction(
+        db,
+        [STORE_DOCUMENTS, STORE_META, STORE_QUERY_INDEX_ENTRIES],
+        "readwrite",
+        async (tx) => {
+          const docsStore = tx.objectStore(STORE_DOCUMENTS);
+          const metaStore = tx.objectStore(STORE_META);
+          const indexStore = tx.objectStore(STORE_QUERY_INDEX_ENTRIES);
+          const collectionRecords = await loadCollectionRecordsFromStore(docsStore, collection);
+          const recordsByKey = new Map(
+            collectionRecords.map((record) => [record.key, record] as const),
+          );
+          const persistedKeys: string[] = [];
+          const conflictedKeys: string[] = [];
+
+          let sequence = await loadSequence(metaStore);
+          let sequenceChanged = false;
+
+          for (const item of items) {
+            const existing = recordsByKey.get(item.key);
+
+            if (
+              item.expectedWriteToken !== undefined &&
+              String(existing?.writeVersion) !== item.expectedWriteToken
+            ) {
+              conflictedKeys.push(item.key);
+              continue;
+            }
+
+            const docId = makeDocumentId(collection, item.key);
+            const createdAt = existing?.createdAt ?? sequence + 1;
+
+            if (!existing) {
+              sequence = createdAt;
+              sequenceChanged = true;
+            }
+
+            const uniqueIndexes = item.uniqueIndexes ?? {};
+
+            assertUniqueIndexes(collection, item.key, uniqueIndexes, [...recordsByKey.values()]);
+
+            const storedRecord = createStoredDocumentRecord({
+              id: docId,
+              collection,
+              key: item.key,
+              createdAt,
+              writeVersion: (existing?.writeVersion ?? 0) + 1,
+              doc: item.doc,
+              indexes: item.indexes,
+              uniqueIndexes,
+            });
+
+            await requestToPromise(docsStore.put(storedRecord));
+            await replaceQueryIndexEntries(
+              indexStore,
+              collection,
+              item.key,
+              existing?.indexes ?? {},
+              item.indexes,
+            );
+            recordsByKey.set(item.key, storedRecord);
+            persistedKeys.push(item.key);
+          }
+
+          if (sequenceChanged) {
+            await saveSequence(metaStore, sequence);
+          }
+
+          return { persistedKeys, conflictedKeys };
         },
       );
     },
@@ -877,6 +1020,7 @@ function paginate(records: StoredDocumentRecord[], params: QueryParams): EngineQ
     documents: page.map((record) => ({
       key: record.key,
       doc: structuredClone(record.doc),
+      writeToken: String(record.writeVersion),
     })),
     cursor,
   };
@@ -886,6 +1030,7 @@ function paginateQuery(
   collection: string,
   records: StoredDocumentRecord[],
   params: QueryParams,
+  includeMetadata = false,
 ): EngineQueryResult {
   const startIndex = resolveQueryPageStartIndex(
     records,
@@ -921,10 +1066,19 @@ function paginateQuery(
       : null;
 
   return {
-    documents: page.map((record) => ({
-      key: record.key,
-      doc: structuredClone(record.doc),
-    })),
+    documents: page.map((record) => {
+      const document = {
+        key: record.key,
+        doc: structuredClone(record.doc),
+      };
+
+      return includeMetadata
+        ? {
+            ...document,
+            writeToken: String(record.writeVersion),
+          }
+        : document;
+    }),
     cursor,
   };
 }
@@ -1303,6 +1457,7 @@ function createStoredDocumentRecord(input: {
   collection: string;
   key: string;
   createdAt: number;
+  writeVersion: number;
   doc: unknown;
   indexes: ResolvedIndexKeys;
   uniqueIndexes?: ResolvedIndexKeys;
@@ -1312,6 +1467,7 @@ function createStoredDocumentRecord(input: {
     collection: input.collection,
     key: input.key,
     createdAt: input.createdAt,
+    writeVersion: input.writeVersion,
     doc: getPreparedClone(input.doc) ?? (structuredClone(input.doc) as Record<string, unknown>),
     indexes: { ...input.indexes },
     uniqueIndexes: { ...input.uniqueIndexes },
@@ -1327,6 +1483,7 @@ function parseStoredDocumentRecord(value: unknown): StoredDocumentRecord {
   const collection = value.collection;
   const key = value.key;
   const createdAt = value.createdAt;
+  const writeVersion = value.writeVersion;
   const doc = value.doc;
   const indexes = value.indexes;
   const uniqueIndexes = value.uniqueIndexes;
@@ -1337,6 +1494,13 @@ function parseStoredDocumentRecord(value: unknown): StoredDocumentRecord {
 
   if (typeof createdAt !== "number" || !Number.isFinite(createdAt)) {
     throw new Error("IndexedDB documents store contains an invalid record (bad createdAt)");
+  }
+
+  if (
+    writeVersion !== undefined &&
+    (typeof writeVersion !== "number" || !Number.isFinite(writeVersion) || writeVersion < 1)
+  ) {
+    throw new Error("IndexedDB documents store contains an invalid record (bad writeVersion)");
   }
 
   if (!isRecord(doc)) {
@@ -1379,6 +1543,7 @@ function parseStoredDocumentRecord(value: unknown): StoredDocumentRecord {
     collection,
     key,
     createdAt,
+    writeVersion: writeVersion ?? 1,
     doc: doc as Record<string, unknown>,
     indexes: resolvedIndexes,
     uniqueIndexes: resolvedUniqueIndexes,
