@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { indexedDB as fakeIndexedDB } from "fake-indexeddb";
+import * as z from "zod";
 
 import { indexedDbEngine, type IndexedDbQueryEngine } from "../../src/engines/indexeddb";
 import {
@@ -7,9 +8,17 @@ import {
   EngineDocumentNotFoundError,
   EngineUniqueConstraintError,
   type ComparableVersion,
+  type QueryEngine,
 } from "../../src/engines/types";
+import { model } from "../../src/model";
+import { ConcurrentWriteError, createStore } from "../../src/store";
 import { runQueryEngineConformanceSuite } from "./conformance-suite";
-import { createCollectionNameFactory, createTestResourceName, expectReject } from "./helpers";
+import {
+  createCollectionNameFactory,
+  createTestResourceName,
+  expectReject,
+  expectRejectInstanceOf,
+} from "./helpers";
 import { runMigrationIntegrationSuite } from "./migration-suite";
 
 let engine: IndexedDbQueryEngine;
@@ -308,6 +317,71 @@ describe("indexedDbEngine basic CRUD", () => {
     expect(await engine.get("users", "u1")).toEqual({
       id: "u1",
       name: "Samuel",
+    });
+  });
+
+  test("metadata reads expose changing write tokens", async () => {
+    await engine.put("users", "u1", { id: "u1", name: "Sam" }, { primary: "u1" });
+
+    const first = await engine.getWithMetadata!("users", "u1");
+
+    await engine.update("users", "u1", { id: "u1", name: "Samuel" }, { primary: "u1" });
+
+    const second = await engine.getWithMetadata!("users", "u1");
+
+    expect(first?.writeToken).toBe("1");
+    expect(second?.writeToken).toBe("2");
+    expect(second?.doc).toEqual({ id: "u1", name: "Samuel" });
+  });
+
+  test("store.update throws ConcurrentWriteError when an IndexedDB document changes after read", async () => {
+    const User = model("user")
+      .schema(
+        1,
+        z.object({
+          id: z.string(),
+          name: z.string(),
+          email: z.email(),
+        }),
+      )
+      .index({ name: "primary", value: "id" })
+      .build();
+    const conflictingEngine: QueryEngine = {
+      ...engine,
+      async getWithMetadata(collection, key) {
+        const result = await engine.getWithMetadata!(collection, key);
+
+        if (key === "u1") {
+          await engine.update(
+            collection,
+            key,
+            {
+              __v: 1,
+              __indexes: ["primary"],
+              id: "u1",
+              name: "Concurrent",
+              email: "sam@example.com",
+            },
+            { primary: "u1" },
+          );
+        }
+
+        return result;
+      },
+    };
+    const store = createStore(conflictingEngine, [User]);
+
+    await store.user.create("u1", {
+      id: "u1",
+      name: "Sam",
+      email: "sam@example.com",
+    });
+
+    await expectRejectInstanceOf(store.user.update("u1", { name: "Samuel" }), ConcurrentWriteError);
+    expect(await store.user.findByKey("u1")).toEqual({
+      id: "u1",
+      name: "Concurrent",
+      email: "sam@example.com",
     });
   });
 
