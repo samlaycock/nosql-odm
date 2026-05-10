@@ -535,7 +535,7 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
 
             if (
               item.expectedWriteToken !== undefined &&
-              String(existing?.writeVersion) !== item.expectedWriteToken
+              (existing === undefined || String(existing.writeVersion) !== item.expectedWriteToken)
             ) {
               conflictedKeys.push(item.key);
               continue;
