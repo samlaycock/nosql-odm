@@ -621,9 +621,6 @@ export class DefaultMigrator<TOptions = Record<string, unknown>> implements Migr
       if (normalized) {
         persistedKeys = new Set(normalized.persistedKeys);
         conflictedKeys = new Set(normalized.conflictedKeys);
-        persistedRecords = normalized.persistedKeys.filter(
-          (key) => !conflictedKeys.has(key),
-        ).length;
       }
 
       const attemptedKeys = writes.map((write) => write.key);
@@ -632,6 +629,7 @@ export class DefaultMigrator<TOptions = Record<string, unknown>> implements Migr
         ? attemptedKeys.filter((key) => persistedSet.has(key) && !conflictedKeys.has(key))
         : attemptedKeys.filter((key) => !conflictedKeys.has(key));
       const conflictedHookKeys = attemptedKeys.filter((key) => conflictedKeys.has(key));
+      persistedRecords = persistedHookKeys.length;
 
       await this.runHook("onDocumentsPersisted", {
         runId: run.id,
