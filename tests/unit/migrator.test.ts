@@ -324,6 +324,63 @@ describe("paged migration API", () => {
       1,
     );
   });
+
+  test("migrateNextPage counts persisted records when persist returns void", async () => {
+    await seedUsers(engine, 101);
+    delete (engine as { batchSetWithResult?: unknown }).batchSetWithResult;
+
+    const store = createStore(engine, [buildUserV2()]);
+    const page = await store.user.migrateNextPage();
+
+    expect(page.status).toBe("processed");
+    expect(page.telemetry?.persistedRecords).toBe(100);
+    expect(page.progress?.progressByModel.user?.telemetry.persistedRecords).toBe(100);
+  });
+
+  test("migrateNextPage counts persisted and conflicted records from batch results", async () => {
+    await seedUsers(engine, 2);
+
+    const persistedEvents: Array<{
+      persistedKeys: readonly string[];
+      conflictedKeys: readonly string[];
+    }> = [];
+    engine.batchSetWithResult = async (_collection, items) => {
+      await engine.batchSet(
+        "user",
+        items.filter((item) => item.key === "u0000"),
+      );
+
+      return {
+        persistedKeys: ["u0000"],
+        conflictedKeys: ["u0001"],
+      };
+    };
+
+    const store = createStore(engine, [buildUserV2()], {
+      migrationHooks: {
+        onDocumentsPersisted(event) {
+          persistedEvents.push({
+            persistedKeys: event.persistedKeys,
+            conflictedKeys: event.conflictedKeys,
+          });
+        },
+      },
+    });
+    const page = await store.user.migrateNextPage();
+
+    expect(page.status).toBe("completed");
+    expect(page.migrated).toBe(1);
+    expect(page.skipped).toBe(1);
+    expect(page.telemetry?.persistedRecords).toBe(1);
+    expect(page.telemetry?.writebackFailures).toBe(1);
+    expect(page.skipReasons).toEqual({ concurrent_write: 1 });
+    expect(persistedEvents).toEqual([
+      {
+        persistedKeys: ["u0000"],
+        conflictedKeys: ["u0001"],
+      },
+    ]);
+  });
 });
 
 describe("migration progress", () => {
