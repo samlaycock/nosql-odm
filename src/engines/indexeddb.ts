@@ -1027,11 +1027,25 @@ function resolveIndexEntryRange(
   return {
     query: keyRange.bound(
       [collection, indexName, rangeBounds.lower],
-      [collection, indexName, rangeBounds.upper],
+      buildIndexRangeUpperKey(collection, indexName, rangeBounds),
       rangeBounds.lowerOpen,
       rangeBounds.upperOpen,
     ),
   };
+}
+
+function buildIndexRangeUpperKey(
+  collection: string,
+  indexName: string,
+  rangeBounds: { upper: unknown; upperOpen: boolean },
+): unknown[] {
+  const key = [collection, indexName, rangeBounds.upper];
+
+  if (!rangeBounds.upperOpen) {
+    key.push([]);
+  }
+
+  return key;
 }
 
 function resolveIndexRangeBounds(condition: FieldCondition): {

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { indexedDB as fakeIndexedDB } from "fake-indexeddb";
+import { IDBKeyRange, indexedDB as fakeIndexedDB } from "fake-indexeddb";
 import * as z from "zod";
 
 import { indexedDbEngine, type IndexedDbQueryEngine } from "../../src/engines/indexeddb";
@@ -832,6 +832,34 @@ describe("indexedDbEngine query behavior", () => {
 
     expect(results.documents).toHaveLength(2);
     expect(results.documents.map((item) => item.key)).toEqual(["a", "b"]);
+  });
+
+  test("native key range pushdown includes inclusive upper-bound documents", async () => {
+    const keyRangeGlobal = globalThis as typeof globalThis & {
+      IDBKeyRange?: typeof IDBKeyRange;
+    };
+    const previousKeyRange = keyRangeGlobal.IDBKeyRange;
+    keyRangeGlobal.IDBKeyRange = IDBKeyRange;
+
+    try {
+      await engine.put("items", "a", { id: "a" }, { byDate: "2025-01-01" });
+      await engine.put("items", "b", { id: "b" }, { byDate: "2025-06-15" });
+      await engine.put("items", "c", { id: "c" }, { byDate: "2025-12-31" });
+
+      const between = await engine.query("items", {
+        index: "byDate",
+        filter: { value: { $between: ["2025-01-01", "2025-06-15"] } },
+      });
+      const lte = await engine.query("items", {
+        index: "byDate",
+        filter: { value: { $lte: "2025-06-15" } },
+      });
+
+      expect(between.documents.map((item) => item.key)).toEqual(["a", "b"]);
+      expect(lte.documents.map((item) => item.key)).toEqual(["a", "b"]);
+    } finally {
+      keyRangeGlobal.IDBKeyRange = previousKeyRange;
+    }
   });
 
   test("query sort asc/desc for indexed queries", async () => {
