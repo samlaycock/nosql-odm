@@ -743,20 +743,38 @@ describe("indexedDbEngine batch methods", () => {
         undefined,
         { byEmail: "alex@example.com" },
       );
+      await indexedEngine.put(
+        "users",
+        "u4",
+        { id: "u4", email: "casey@example.com" },
+        { byEmail: "casey@example.com" },
+        undefined,
+        undefined,
+        { byEmail: "casey@example.com" },
+      );
+      await indexedEngine.put(
+        "users",
+        "u4",
+        { id: "u4", email: "riley@example.com" },
+        { byEmail: "riley@example.com" },
+        undefined,
+        undefined,
+        { byEmail: "riley@example.com" },
+      );
       await indexedEngine.batchSet("users", [
         {
-          key: "u4",
-          doc: { id: "u4", email: "casey@example.com" },
-          indexes: { byEmail: "casey@example.com" },
-          uniqueIndexes: { byEmail: "casey@example.com" },
+          key: "u5",
+          doc: { id: "u5", email: "morgan@example.com" },
+          indexes: { byEmail: "morgan@example.com" },
+          uniqueIndexes: { byEmail: "morgan@example.com" },
         },
       ]);
 
       await expectRejectInstanceOf(
         indexedEngine.create(
           "users",
-          "u5",
-          { id: "u5", email: "alex@example.com" },
+          "u6",
+          { id: "u6", email: "alex@example.com" },
           { byEmail: "alex@example.com" },
           undefined,
           undefined,

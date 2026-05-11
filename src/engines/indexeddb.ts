@@ -1267,9 +1267,18 @@ async function replaceUniqueIndexEntries(
       continue;
     }
 
-    await requestToPromise(
-      uniqueIndexStore.delete(makeUniqueIndexEntryId(collection, indexName, String(rawValue))),
-    );
+    const entryId = makeUniqueIndexEntryId(collection, indexName, String(rawValue));
+    const entryRaw = await requestToPromise(uniqueIndexStore.get(entryId));
+
+    if (entryRaw === undefined) {
+      continue;
+    }
+
+    const entry = parseUniqueIndexEntryRecord(entryRaw);
+
+    if (entry.key === key) {
+      await requestToPromise(uniqueIndexStore.delete(entryId));
+    }
   }
 
   for (const [indexName, rawValue] of Object.entries(nextUniqueIndexes)) {
