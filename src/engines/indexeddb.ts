@@ -7,6 +7,7 @@ import {
   EngineUniqueConstraintError,
   type ComparableVersion,
   type EngineQueryResult,
+  type EngineQueryDiagnostics,
   type FieldCondition,
   type KeyedDocument,
   type MigrationCriteria,
@@ -56,16 +57,26 @@ interface IndexedDbOpenRequestLike<TDatabase> extends IndexedDbRequestLike<TData
 }
 
 interface IndexedDbObjectStoreLike {
+  readonly indexNames?: {
+    contains(name: string): boolean;
+  };
   get(key: string): IndexedDbRequestLike<unknown>;
   getAll(query?: unknown): IndexedDbRequestLike<unknown[]>;
   put(value: unknown): IndexedDbRequestLike<unknown>;
   delete(key: string): IndexedDbRequestLike<unknown>;
   index(name: string): IndexedDbIndexLike;
   createIndex(name: string, keyPath: string | string[]): unknown;
+  deleteIndex?(name: string): void;
 }
 
 interface IndexedDbIndexLike {
   getAll(query?: unknown): IndexedDbRequestLike<unknown[]>;
+  openCursor(query?: unknown): IndexedDbRequestLike<IndexedDbCursorLike | null>;
+}
+
+interface IndexedDbCursorLike {
+  readonly value: unknown;
+  continue(): void;
 }
 
 interface IndexedDbTransactionLike {
@@ -95,7 +106,7 @@ interface IndexedDbFactoryLike {
 // Storage model
 // ---------------------------------------------------------------------------
 
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 
 const STORE_DOCUMENTS = "documents";
 const STORE_META = "meta";
@@ -106,7 +117,7 @@ const STORE_QUERY_INDEX_ENTRIES = "query_index_entries";
 const QUERY_INDEX_LOOKUP = "lookup";
 
 const META_SEQUENCE_KEY = "sequence";
-const META_QUERY_INDEX_BACKFILL_KEY = "queryIndexEntriesBackfilled";
+const META_QUERY_INDEX_BACKFILL_KEY = "queryIndexEntriesBackfilledV2";
 const OUTDATED_PAGE_LIMIT = 100;
 
 interface StoredDocumentRecord {
@@ -125,7 +136,22 @@ interface QueryIndexEntryRecord {
   collection: string;
   indexName: string;
   indexValue: string;
+  createdAt: number;
   key: string;
+}
+
+interface IndexedDbKeyRangeFactoryLike {
+  bound(lower: unknown, upper: unknown, lowerOpen?: boolean, upperOpen?: boolean): object;
+  only(value: unknown): object;
+}
+
+interface IndexedDbIndexQueryResult {
+  records: StoredDocumentRecord[];
+  diagnostics: EngineQueryDiagnostics;
+}
+
+interface IndexEntryRange {
+  query?: object;
 }
 
 interface MetaSequenceRecord {
@@ -250,7 +276,7 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
           });
 
           await requestToPromise(docsStore.put(record));
-          await replaceQueryIndexEntries(indexStore, collection, key, {}, indexes);
+          await replaceQueryIndexEntries(indexStore, collection, key, sequence, {}, indexes);
 
           await saveSequence(metaStore, sequence);
         },
@@ -302,7 +328,14 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
           });
 
           await requestToPromise(docsStore.put(record));
-          await replaceQueryIndexEntries(indexStore, collection, key, existingIndexes, indexes);
+          await replaceQueryIndexEntries(
+            indexStore,
+            collection,
+            key,
+            createdAt,
+            existingIndexes,
+            indexes,
+          );
         },
       );
     },
@@ -341,7 +374,14 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
           });
 
           await requestToPromise(docsStore.put(record));
-          await replaceQueryIndexEntries(indexStore, collection, key, existing.indexes, indexes);
+          await replaceQueryIndexEntries(
+            indexStore,
+            collection,
+            key,
+            existing.createdAt,
+            existing.indexes,
+            indexes,
+          );
         },
       );
     },
@@ -364,6 +404,7 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
               tx.objectStore(STORE_QUERY_INDEX_ENTRIES),
               collection,
               key,
+              existing.createdAt,
               existing.indexes,
               {},
             );
@@ -376,22 +417,34 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
 
     async query(collection, params) {
       const db = await dbPromise;
-      const records =
-        (await listCollectionDocumentsByIndex(db, collection, params)) ??
-        (await listCollectionDocuments(db, collection));
+      const indexed = await listCollectionDocumentsByIndex(db, collection, params);
+      const records = indexed?.records ?? (await listCollectionDocuments(db, collection));
       const matched = matchDocuments(records, params);
 
-      return paginateQuery(collection, matched, params);
+      return withDiagnostics(
+        paginateQuery(collection, matched, params),
+        indexed?.diagnostics ?? {
+          mode: "fallback_scan",
+          reason: "fallback_scan",
+          ...(params.index ? { index: params.index } : {}),
+        },
+      );
     },
 
     async queryWithMetadata(collection, params) {
       const db = await dbPromise;
-      const records =
-        (await listCollectionDocumentsByIndex(db, collection, params)) ??
-        (await listCollectionDocuments(db, collection));
+      const indexed = await listCollectionDocumentsByIndex(db, collection, params);
+      const records = indexed?.records ?? (await listCollectionDocuments(db, collection));
       const matched = matchDocuments(records, params);
 
-      return paginateQuery(collection, matched, params, true);
+      return withDiagnostics(
+        paginateQuery(collection, matched, params, true),
+        indexed?.diagnostics ?? {
+          mode: "fallback_scan",
+          reason: "fallback_scan",
+          ...(params.index ? { index: params.index } : {}),
+        },
+      );
     },
 
     async batchGet(collection, keys) {
@@ -497,6 +550,7 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
               indexStore,
               collection,
               item.key,
+              createdAt,
               existingIndexes,
               item.indexes,
             );
@@ -570,6 +624,7 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
               indexStore,
               collection,
               item.key,
+              createdAt,
               existing?.indexes ?? {},
               item.indexes,
             );
@@ -604,7 +659,14 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
 
             if (existingRaw !== undefined) {
               const existing = parseStoredDocumentRecord(existingRaw);
-              await replaceQueryIndexEntries(indexStore, collection, key, existing.indexes, {});
+              await replaceQueryIndexEntries(
+                indexStore,
+                collection,
+                key,
+                existing.createdAt,
+                existing.indexes,
+                {},
+              );
             }
 
             await requestToPromise(docsStore.delete(makeDocumentId(collection, key)));
@@ -844,14 +906,14 @@ async function listCollectionDocumentsByIndex(
   db: IndexedDbDatabaseLike,
   collection: string,
   params: QueryParams,
-): Promise<StoredDocumentRecord[] | null> {
+): Promise<IndexedDbIndexQueryResult | null> {
   if (!params.index || !params.filter) {
     return null;
   }
 
-  const equalityValue = resolveEqualityFilterValue(params.filter.value);
+  const range = resolveIndexEntryRange(collection, params.index, params.filter.value);
 
-  if (equalityValue === null) {
+  if (range === null) {
     return null;
   }
 
@@ -866,7 +928,8 @@ async function listCollectionDocumentsByIndex(
         indexEntriesStore,
         collection,
         params.index!,
-        equalityValue,
+        params.filter!.value,
+        range.query ?? null,
       );
       const records = (
         await loadDocumentsByKeysFromStore(
@@ -886,7 +949,14 @@ async function listCollectionDocumentsByIndex(
         return a.key.localeCompare(b.key);
       });
 
-      return records;
+      return {
+        records,
+        diagnostics: {
+          mode: "native_pushdown",
+          reason: "native_pushdown",
+          index: params.index!,
+        },
+      };
     },
   );
 }
@@ -895,11 +965,14 @@ async function loadMatchingIndexEntries(
   indexEntriesStore: IndexedDbObjectStoreLike,
   collection: string,
   indexName: string,
-  equalityValue: string,
+  filter: string | number | FieldCondition,
+  range: unknown,
 ): Promise<QueryIndexEntryRecord[]> {
-  const rawEntries = await requestToPromise(
-    indexEntriesStore.index(QUERY_INDEX_LOOKUP).getAll([collection, indexName, equalityValue]),
-  );
+  const index = indexEntriesStore.index(QUERY_INDEX_LOOKUP);
+  const rawEntries =
+    range === null
+      ? await cursorValuesToArray(index.openCursor())
+      : await requestToPromise(index.getAll(range));
 
   return rawEntries
     .map((entry) => parseQueryIndexEntryRecord(entry))
@@ -907,14 +980,156 @@ async function loadMatchingIndexEntries(
       (entry) =>
         entry.collection === collection &&
         entry.indexName === indexName &&
-        entry.indexValue === equalityValue,
+        matchesFilter(entry.indexValue, filter),
     );
+}
+
+function resolveIndexEntryRange(
+  collection: string,
+  indexName: string,
+  filter: string | number | FieldCondition,
+): IndexEntryRange | null {
+  const keyRange = resolveKeyRangeFactory();
+
+  if (!keyRange) {
+    return {};
+  }
+
+  if (typeof filter === "string" || typeof filter === "number") {
+    return {
+      query: keyRange.bound(
+        [collection, indexName, String(filter)],
+        [collection, indexName, String(filter), []],
+      ),
+    };
+  }
+
+  const entries = Object.entries(filter).filter(([, value]) => value !== undefined);
+
+  if (entries.length === 0) {
+    return null;
+  }
+
+  if (filter.$eq !== undefined) {
+    const value = String(filter.$eq as string | number);
+
+    return {
+      query: keyRange.bound([collection, indexName, value], [collection, indexName, value, []]),
+    };
+  }
+
+  const rangeBounds = resolveIndexRangeBounds(filter);
+
+  if (rangeBounds === null) {
+    return null;
+  }
+
+  return {
+    query: keyRange.bound(
+      [collection, indexName, rangeBounds.lower],
+      [collection, indexName, rangeBounds.upper],
+      rangeBounds.lowerOpen,
+      rangeBounds.upperOpen,
+    ),
+  };
+}
+
+function resolveIndexRangeBounds(condition: FieldCondition): {
+  lower: unknown;
+  upper: unknown;
+  lowerOpen: boolean;
+  upperOpen: boolean;
+} | null {
+  if (condition.$begins !== undefined) {
+    return {
+      lower: condition.$begins,
+      upper: `${condition.$begins}\uffff`,
+      lowerOpen: false,
+      upperOpen: false,
+    };
+  }
+
+  if (condition.$between !== undefined) {
+    const [low, high] = condition.$between as [string | number, string | number];
+
+    return {
+      lower: String(low),
+      upper: String(high),
+      lowerOpen: false,
+      upperOpen: false,
+    };
+  }
+
+  let lower = "";
+  let upper: unknown = [];
+  let lowerOpen = false;
+  let upperOpen = false;
+
+  if (condition.$gt !== undefined) {
+    lower = String(condition.$gt as string | number);
+    lowerOpen = true;
+  }
+
+  if (condition.$gte !== undefined) {
+    lower = String(condition.$gte as string | number);
+    lowerOpen = false;
+  }
+
+  if (condition.$lt !== undefined) {
+    upper = String(condition.$lt as string | number);
+    upperOpen = true;
+  }
+
+  if (condition.$lte !== undefined) {
+    upper = String(condition.$lte as string | number);
+    upperOpen = false;
+  }
+
+  if (
+    condition.$gt === undefined &&
+    condition.$gte === undefined &&
+    condition.$lt === undefined &&
+    condition.$lte === undefined
+  ) {
+    return null;
+  }
+
+  return { lower, upper, lowerOpen, upperOpen };
+}
+
+function resolveKeyRangeFactory(): IndexedDbKeyRangeFactoryLike | null {
+  const maybeFactory = (globalThis as { IDBKeyRange?: IndexedDbKeyRangeFactoryLike }).IDBKeyRange;
+
+  return maybeFactory ?? null;
+}
+
+async function cursorValuesToArray(
+  request: IndexedDbRequestLike<IndexedDbCursorLike | null>,
+): Promise<unknown[]> {
+  return new Promise((resolve, reject) => {
+    const values: unknown[] = [];
+
+    request.onsuccess = () => {
+      const cursor = request.result;
+
+      if (cursor === null) {
+        resolve(values);
+        return;
+      }
+
+      values.push(cursor.value);
+      cursor.continue();
+    };
+
+    request.onerror = () => reject(toError(request.error, "IndexedDB cursor request failed"));
+  });
 }
 
 async function replaceQueryIndexEntries(
   indexStore: IndexedDbObjectStoreLike,
   collection: string,
   key: string,
+  createdAt: number,
   previousIndexes: ResolvedIndexKeys,
   nextIndexes: ResolvedIndexKeys,
 ): Promise<void> {
@@ -931,6 +1146,7 @@ async function replaceQueryIndexEntries(
         collection,
         indexName,
         indexValue,
+        createdAt,
         key,
       }),
     );
@@ -1101,6 +1317,16 @@ function paginateQuery(
   };
 }
 
+function withDiagnostics(
+  result: EngineQueryResult,
+  diagnostics: EngineQueryDiagnostics,
+): EngineQueryResult {
+  return {
+    ...result,
+    diagnostics,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Migration helpers
 // ---------------------------------------------------------------------------
@@ -1267,22 +1493,6 @@ function matchesFilter(indexValue: string, filter: string | number | FieldCondit
   return matchesCondition(indexValue, filter);
 }
 
-function resolveEqualityFilterValue(filter: string | number | FieldCondition): string | null {
-  if (typeof filter === "string" || typeof filter === "number") {
-    return String(filter);
-  }
-
-  const entries = Object.entries(filter).filter(([, value]) => value !== undefined);
-
-  if (entries.length !== 1) {
-    return null;
-  }
-
-  const [operator, value] = entries[0]!;
-
-  return operator === "$eq" ? String(value as string | number) : null;
-}
-
 function matchesCondition(value: string, condition: FieldCondition): boolean {
   if (condition.$eq !== undefined && value !== String(condition.$eq as string | number)) {
     return false;
@@ -1354,11 +1564,18 @@ async function openDatabase(
           keyPath: "id",
         });
 
-        queryIndexEntries.createIndex(QUERY_INDEX_LOOKUP, [
-          "collection",
-          "indexName",
-          "indexValue",
-        ]);
+        createQueryIndexLookup(queryIndexEntries);
+      } else {
+        const tx = (request as unknown as { transaction?: IndexedDbTransactionLike }).transaction;
+        const queryIndexEntries = tx?.objectStore(STORE_QUERY_INDEX_ENTRIES);
+
+        if (queryIndexEntries) {
+          if (queryIndexEntries.indexNames?.contains(QUERY_INDEX_LOOKUP)) {
+            queryIndexEntries.deleteIndex?.(QUERY_INDEX_LOOKUP);
+          }
+
+          createQueryIndexLookup(queryIndexEntries);
+        }
       }
     };
 
@@ -1375,6 +1592,16 @@ async function openDatabase(
       reject(toError(request.error, `Failed to open IndexedDB database "${databaseName}"`));
     };
   });
+}
+
+function createQueryIndexLookup(queryIndexEntries: IndexedDbObjectStoreLike): void {
+  queryIndexEntries.createIndex(QUERY_INDEX_LOOKUP, [
+    "collection",
+    "indexName",
+    "indexValue",
+    "createdAt",
+    "key",
+  ]);
 }
 
 async function withTransaction<T>(
@@ -1440,6 +1667,7 @@ async function ensureQueryIndexEntriesBackfilled(db: IndexedDbDatabaseLike): Pro
           indexStore,
           record.collection,
           record.key,
+          record.createdAt,
           {},
           record.indexes,
         );
@@ -1577,6 +1805,7 @@ function parseQueryIndexEntryRecord(value: unknown): QueryIndexEntryRecord {
   const collection = value.collection;
   const indexName = value.indexName;
   const indexValue = value.indexValue;
+  const createdAt = value.createdAt;
   const key = value.key;
 
   if (
@@ -1584,12 +1813,14 @@ function parseQueryIndexEntryRecord(value: unknown): QueryIndexEntryRecord {
     typeof collection !== "string" ||
     typeof indexName !== "string" ||
     typeof indexValue !== "string" ||
+    typeof createdAt !== "number" ||
+    !Number.isFinite(createdAt) ||
     typeof key !== "string"
   ) {
     throw new Error("IndexedDB query_index_entries store contains an invalid record");
   }
 
-  return { id, collection, indexName, indexValue, key };
+  return { id, collection, indexName, indexValue, createdAt, key };
 }
 
 function parseMigrationLockRecord(value: unknown): MigrationLockRecord {

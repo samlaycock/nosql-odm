@@ -762,7 +762,7 @@ describe("indexedDbEngine query behavior", () => {
     }
   });
 
-  test("query with comparison filters falls back instead of scanning all query index entries", async () => {
+  test("query with comparison filters uses native index pushdown", async () => {
     const guarded = createDocumentGetAllGuardFactory();
     const indexedEngine = indexedDbEngine({
       databaseName: `${databaseNameBase}_range_guarded_${Date.now()}`,
@@ -773,6 +773,7 @@ describe("indexedDbEngine query behavior", () => {
       await indexedEngine.put("items", "a", { id: "a" }, { byDate: "2025-01-01" });
       await indexedEngine.put("items", "b", { id: "b" }, { byDate: "2025-06-15" });
       await indexedEngine.put("items", "c", { id: "c" }, { byDate: "2025-12-31" });
+      guarded.blockDocumentGetAll();
       guarded.blockQueryIndexEntriesGetAll();
 
       const results = await indexedEngine.query("items", {
@@ -781,6 +782,11 @@ describe("indexedDbEngine query behavior", () => {
       });
 
       expect(results.documents.map((item) => item.key)).toEqual(["a", "b"]);
+      expect(results.diagnostics).toEqual({
+        mode: "native_pushdown",
+        reason: "native_pushdown",
+        index: "byDate",
+      });
     } finally {
       await indexedEngine.deleteDatabase();
     }
@@ -870,6 +876,33 @@ describe("indexedDbEngine query behavior", () => {
     expect(page1.documents).toHaveLength(2);
     expect(page1.cursor).not.toBeNull();
     expect(page2.documents).toHaveLength(1);
+    expect(page2.cursor).toBeNull();
+  });
+
+  test("sorted indexed pagination remains stable when the cursor row is deleted", async () => {
+    await engine.put("items", "a", { id: "a" }, { byDate: "2025-01-01" });
+    await engine.put("items", "b", { id: "b" }, { byDate: "2025-02-01" });
+    await engine.put("items", "c", { id: "c" }, { byDate: "2025-03-01" });
+
+    const page1 = await engine.query("items", {
+      index: "byDate",
+      filter: { value: { $begins: "2025-" } },
+      sort: "asc",
+      limit: 2,
+    });
+
+    await engine.delete("items", page1.documents[1]!.key);
+
+    const page2 = await engine.query("items", {
+      index: "byDate",
+      filter: { value: { $begins: "2025-" } },
+      sort: "asc",
+      cursor: page1.cursor ?? undefined,
+      limit: 2,
+    });
+
+    expect(page1.documents.map((item) => item.key)).toEqual(["a", "b"]);
+    expect(page2.documents.map((item) => item.key)).toEqual(["c"]);
     expect(page2.cursor).toBeNull();
   });
 
