@@ -641,6 +641,40 @@ describe("indexedDbEngine batch methods", () => {
     }
   });
 
+  test("batchGetWithMetadata queues document reads before awaiting request results", async () => {
+    const asserted = createDocumentGetQueueAssertionFactory(4);
+    const indexedEngine = indexedDbEngine({
+      databaseName: `${databaseNameBase}_batch_get_metadata_queue_${Date.now()}`,
+      factory: asserted.factory,
+    });
+
+    try {
+      await indexedEngine.batchSet("users", [
+        { key: "u1", doc: { id: "u1", name: "A" }, indexes: { primary: "u1" } },
+        { key: "u2", doc: { id: "u2", name: "B" }, indexes: { primary: "u2" } },
+      ]);
+
+      asserted.startAssertion();
+      const docs = await indexedEngine.batchGetWithMetadata!("users", [
+        "u2",
+        "u1",
+        "u2",
+        "missing",
+      ]);
+
+      expect(asserted.documentGetCount).toBe(4);
+      expect(docs.map((entry) => entry.key)).toEqual(["u2", "u1", "u2"]);
+      expect(docs[0]?.doc).toEqual({ id: "u2", name: "B" });
+      expect(docs[0]?.writeToken).toBe("1");
+      expect(docs[1]?.doc).toEqual({ id: "u1", name: "A" });
+      expect(docs[1]?.writeToken).toBe("1");
+      expect(docs[2]?.doc).toEqual({ id: "u2", name: "B" });
+      expect(docs[2]?.writeToken).toBe("1");
+    } finally {
+      await indexedEngine.deleteDatabase();
+    }
+  });
+
   test("batchSet enforces every unique index field atomically", async () => {
     try {
       await engine.batchSet!("users", [
