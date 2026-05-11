@@ -699,6 +699,75 @@ describe("indexedDbEngine batch methods", () => {
     expect(await engine.get("users", "u1")).toBeNull();
     expect(await engine.get("users", "u2")).toBeNull();
   });
+
+  test("unique writes avoid collection document scans", async () => {
+    const guarded = createDocumentGetAllGuardFactory();
+    const indexedEngine = indexedDbEngine({
+      databaseName: `${databaseNameBase}_unique_write_guarded_${Date.now()}`,
+      factory: guarded.factory,
+    });
+
+    try {
+      await indexedEngine.batchSet("users", [
+        {
+          key: "u1",
+          doc: { id: "u1", email: "sam@example.com" },
+          indexes: { byEmail: "sam@example.com" },
+          uniqueIndexes: { byEmail: "sam@example.com" },
+        },
+        {
+          key: "u2",
+          doc: { id: "u2", email: "jamie@example.com" },
+          indexes: { byEmail: "jamie@example.com" },
+          uniqueIndexes: { byEmail: "jamie@example.com" },
+        },
+      ]);
+
+      guarded.blockDocumentGetAll();
+
+      await indexedEngine.create(
+        "users",
+        "u3",
+        { id: "u3", email: "taylor@example.com" },
+        { byEmail: "taylor@example.com" },
+        undefined,
+        undefined,
+        { byEmail: "taylor@example.com" },
+      );
+      await indexedEngine.update(
+        "users",
+        "u3",
+        { id: "u3", email: "alex@example.com" },
+        { byEmail: "alex@example.com" },
+        undefined,
+        undefined,
+        { byEmail: "alex@example.com" },
+      );
+      await indexedEngine.batchSet("users", [
+        {
+          key: "u4",
+          doc: { id: "u4", email: "casey@example.com" },
+          indexes: { byEmail: "casey@example.com" },
+          uniqueIndexes: { byEmail: "casey@example.com" },
+        },
+      ]);
+
+      await expectRejectInstanceOf(
+        indexedEngine.create(
+          "users",
+          "u5",
+          { id: "u5", email: "alex@example.com" },
+          { byEmail: "alex@example.com" },
+          undefined,
+          undefined,
+          { byEmail: "alex@example.com" },
+        ),
+        EngineUniqueConstraintError,
+      );
+    } finally {
+      await indexedEngine.deleteDatabase();
+    }
+  });
 });
 
 describe("indexedDbEngine query behavior", () => {
