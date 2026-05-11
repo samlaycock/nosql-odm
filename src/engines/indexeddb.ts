@@ -144,6 +144,11 @@ interface MigrationCheckpointRecord {
   cursor: string;
 }
 
+interface LoadedDocumentRecord {
+  readonly key: string;
+  readonly record: StoredDocumentRecord | null;
+}
+
 // ---------------------------------------------------------------------------
 // Engine implementation
 // ---------------------------------------------------------------------------
@@ -395,16 +400,14 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
       return withTransaction(db, [STORE_DOCUMENTS], "readonly", async (tx) => {
         const docsStore = tx.objectStore(STORE_DOCUMENTS);
         const results: KeyedDocument[] = [];
+        const records = await loadDocumentsByKeysFromStore(docsStore, collection, keys);
 
-        for (const key of keys) {
-          const raw = await requestToPromise(docsStore.get(makeDocumentId(collection, key)));
-
-          if (raw === undefined) {
+        for (const entry of records) {
+          if (entry.record === null) {
             continue;
           }
 
-          const record = parseStoredDocumentRecord(raw);
-          results.push({ key, doc: structuredClone(record.doc) });
+          results.push({ key: entry.key, doc: structuredClone(entry.record.doc) });
         }
 
         return results;
@@ -417,19 +420,17 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
       return withTransaction(db, [STORE_DOCUMENTS], "readonly", async (tx) => {
         const docsStore = tx.objectStore(STORE_DOCUMENTS);
         const results: KeyedDocument[] = [];
+        const records = await loadDocumentsByKeysFromStore(docsStore, collection, keys);
 
-        for (const key of keys) {
-          const raw = await requestToPromise(docsStore.get(makeDocumentId(collection, key)));
-
-          if (raw === undefined) {
+        for (const entry of records) {
+          if (entry.record === null) {
             continue;
           }
 
-          const record = parseStoredDocumentRecord(raw);
           results.push({
-            key,
-            doc: structuredClone(record.doc),
-            writeToken: String(record.writeVersion),
+            key: entry.key,
+            doc: structuredClone(entry.record.doc),
+            writeToken: String(entry.record.writeVersion),
           });
         }
 
@@ -820,6 +821,25 @@ async function loadCollectionRecordsFromStore(
   return records;
 }
 
+async function loadDocumentsByKeysFromStore(
+  docsStore: IndexedDbObjectStoreLike,
+  collection: string,
+  keys: readonly string[],
+): Promise<LoadedDocumentRecord[]> {
+  const requests = keys.map((key) =>
+    requestToPromise(docsStore.get(makeDocumentId(collection, key))).then((raw) => ({
+      key,
+      raw,
+    })),
+  );
+  const rawEntries = await Promise.all(requests);
+
+  return rawEntries.map((entry) => ({
+    key: entry.key,
+    record: entry.raw === undefined ? null : parseStoredDocumentRecord(entry.raw),
+  }));
+}
+
 async function listCollectionDocumentsByIndex(
   db: IndexedDbDatabaseLike,
   collection: string,
@@ -848,17 +868,15 @@ async function listCollectionDocumentsByIndex(
         params.index!,
         equalityValue,
       );
-      const records: StoredDocumentRecord[] = [];
-
-      for (const entry of entries) {
-        const raw = await requestToPromise(docsStore.get(makeDocumentId(collection, entry.key)));
-
-        if (raw === undefined) {
-          continue;
-        }
-
-        records.push(parseStoredDocumentRecord(raw));
-      }
+      const records = (
+        await loadDocumentsByKeysFromStore(
+          docsStore,
+          collection,
+          entries.map((entry) => entry.key),
+        )
+      )
+        .map((entry) => entry.record)
+        .filter((record) => record !== null);
 
       records.sort((a, b) => {
         if (a.createdAt !== b.createdAt) {
