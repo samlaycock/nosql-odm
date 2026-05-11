@@ -278,7 +278,9 @@ describe("paged migration API", () => {
     expect(userProgress).toBeDefined();
     const userTelemetry = userProgress!.telemetry;
     expect(userTelemetry.totalDurationMs).toBeGreaterThanOrEqual(15);
-    expect(userTelemetry.averagePageDurationMs).toBe(firstTelemetry.durationMs);
+    expect(userTelemetry.averagePageDurationMs).toBe(
+      Number((firstTelemetry.durationMs / 1).toFixed(2)),
+    );
     expect(userTelemetry.recordsPerSecond).toBeGreaterThan(0);
     expect(userTelemetry.writebackFailures).toBe(0);
     expect(userTelemetry.recentPages).toHaveLength(1);
