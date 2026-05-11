@@ -41,6 +41,7 @@ interface RawOpenRequest<TDatabase> extends RawRequest<TDatabase> {
 }
 
 interface RawObjectStore {
+  get(key: string): RawRequest<unknown>;
   getAll(): RawRequest<unknown[]>;
   put(value: unknown): RawRequest<unknown>;
 }
@@ -173,6 +174,131 @@ function createDocumentGetAllGuardFactory() {
     },
     blockQueryIndexEntriesGetAll() {
       blockQueryIndexEntriesGetAll = true;
+    },
+  };
+}
+
+function createDocumentGetQueueAssertionFactory(expectedGetCount: number) {
+  let documentGetCount = 0;
+  let assertGetCount = false;
+
+  const wrapRequest = (request: unknown): unknown => {
+    return new Proxy(request as Record<string, unknown>, {
+      get(target, property, receiver) {
+        return Reflect.get(target, property, receiver);
+      },
+      set(target, property, value, receiver) {
+        if (property !== "onsuccess" || typeof value !== "function") {
+          return Reflect.set(target, property, value, receiver);
+        }
+
+        const wrappedHandler = (event: unknown) => {
+          if (assertGetCount) {
+            expect(documentGetCount).toBe(expectedGetCount);
+          }
+
+          value(event);
+        };
+
+        return Reflect.set(target, property, wrappedHandler, receiver);
+      },
+    });
+  };
+
+  const wrapObjectStore = (storeName: string, store: unknown): unknown => {
+    if (storeName !== RAW_STORE_DOCUMENTS) {
+      return store;
+    }
+
+    return new Proxy(store as Record<string, unknown>, {
+      get(target, property, receiver) {
+        if (property !== "get") {
+          return Reflect.get(target, property, receiver);
+        }
+
+        return (key: string) => {
+          documentGetCount += 1;
+
+          return wrapRequest(
+            (Reflect.get(target, property, receiver) as (documentKey: string) => unknown).call(
+              target,
+              key,
+            ),
+          );
+        };
+      },
+    });
+  };
+
+  const wrapTransaction = (transaction: unknown): unknown => {
+    return new Proxy(transaction as Record<string, unknown>, {
+      get(target, property, receiver) {
+        if (property !== "objectStore") {
+          return Reflect.get(target, property, receiver);
+        }
+
+        return (storeName: string) => {
+          const objectStore = (
+            Reflect.get(target, property, receiver) as (name: string) => unknown
+          ).call(target, storeName);
+
+          return wrapObjectStore(storeName, objectStore);
+        };
+      },
+    });
+  };
+
+  const wrapDatabase = (database: unknown): unknown => {
+    return new Proxy(database as Record<string, unknown>, {
+      get(target, property, receiver) {
+        if (property !== "transaction") {
+          return Reflect.get(target, property, receiver);
+        }
+
+        return (storeNames: string | string[], mode?: "readonly" | "readwrite") => {
+          const transaction = (
+            Reflect.get(target, property, receiver) as (
+              names: string | string[],
+              mode?: "readonly" | "readwrite",
+            ) => unknown
+          ).call(target, storeNames, mode);
+
+          return wrapTransaction(transaction);
+        };
+      },
+    });
+  };
+
+  const factory = {
+    open(name: string, version?: number) {
+      const request = (fakeIndexedDB as unknown as IndexedDbFactory).open(name, version);
+
+      return new Proxy(request as unknown as Record<string, unknown>, {
+        get(target, property, receiver) {
+          if (property === "result") {
+            return wrapDatabase(Reflect.get(target, property, receiver));
+          }
+
+          return Reflect.get(target, property, receiver);
+        },
+        set(target, property, value, receiver) {
+          return Reflect.set(target, property, value, receiver);
+        },
+      }) as unknown as ReturnType<IndexedDbFactory["open"]>;
+    },
+    deleteDatabase(name: string) {
+      return (fakeIndexedDB as unknown as IndexedDbFactory).deleteDatabase(name);
+    },
+  } satisfies IndexedDbFactory;
+
+  return {
+    factory,
+    startAssertion() {
+      documentGetCount = 0;
+      assertGetCount = true;
+    },
+    get documentGetCount() {
+      return documentGetCount;
     },
   };
 }
@@ -489,6 +615,32 @@ describe("indexedDbEngine batch methods", () => {
     expect(docs[0]!.doc).not.toBe(docs[1]!.doc);
   });
 
+  test("batchGet queues document reads before awaiting request results", async () => {
+    const asserted = createDocumentGetQueueAssertionFactory(4);
+    const indexedEngine = indexedDbEngine({
+      databaseName: `${databaseNameBase}_batch_get_queue_${Date.now()}`,
+      factory: asserted.factory,
+    });
+
+    try {
+      await indexedEngine.batchSet("users", [
+        { key: "u1", doc: { id: "u1", name: "A" }, indexes: { primary: "u1" } },
+        { key: "u2", doc: { id: "u2", name: "B" }, indexes: { primary: "u2" } },
+      ]);
+
+      asserted.startAssertion();
+      const docs = await indexedEngine.batchGet("users", ["u2", "u1", "u2", "missing"]);
+
+      expect(asserted.documentGetCount).toBe(4);
+      expect(docs.map((entry) => entry.key)).toEqual(["u2", "u1", "u2"]);
+      expect(docs[0]?.doc).toEqual({ id: "u2", name: "B" });
+      expect(docs[1]?.doc).toEqual({ id: "u1", name: "A" });
+      expect(docs[2]?.doc).toEqual({ id: "u2", name: "B" });
+    } finally {
+      await indexedEngine.deleteDatabase();
+    }
+  });
+
   test("batchSet enforces every unique index field atomically", async () => {
     try {
       await engine.batchSet!("users", [
@@ -546,6 +698,31 @@ describe("indexedDbEngine query behavior", () => {
       });
 
       expect(results.documents).toEqual([{ key: "u1", doc: { id: "u1" } }]);
+    } finally {
+      await indexedEngine.deleteDatabase();
+    }
+  });
+
+  test("query with index equality queues hydration reads before awaiting request results", async () => {
+    const asserted = createDocumentGetQueueAssertionFactory(2);
+    const indexedEngine = indexedDbEngine({
+      databaseName: `${databaseNameBase}_query_hydration_queue_${Date.now()}`,
+      factory: asserted.factory,
+    });
+
+    try {
+      await indexedEngine.put("users", "u1", { id: "u1", name: "A" }, { status: "active" });
+      await indexedEngine.put("users", "u2", { id: "u2", name: "B" }, { status: "active" });
+      await indexedEngine.put("users", "u3", { id: "u3", name: "C" }, { status: "inactive" });
+
+      asserted.startAssertion();
+      const results = await indexedEngine.query("users", {
+        index: "status",
+        filter: { value: "active" },
+      });
+
+      expect(asserted.documentGetCount).toBe(2);
+      expect(results.documents.map((entry) => entry.key)).toEqual(["u1", "u2"]);
     } finally {
       await indexedEngine.deleteDatabase();
     }
