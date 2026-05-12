@@ -127,10 +127,6 @@ interface UniqueOwnershipRecord {
   indexValue: string;
 }
 
-interface CreatedAtReservation {
-  value: number;
-}
-
 export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQueryEngine {
   const database = options.database;
   const documentsCollection = database.collection(
@@ -188,16 +184,12 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
           throw new EngineDocumentAlreadyExistsError(collection, key);
         }
 
-        const createdAtReservation = await reserveNextCreatedAt(
-          transaction,
-          metadataCollection,
-          collection,
-        );
+        const createdAt = nextCreatedAt();
         const resolved = resolveWriteMetadata(migrationMetadata, doc);
         const created = createStoredDocumentRecord(
           collection,
           key,
-          createdAtReservation.value,
+          createdAt,
           1,
           doc,
           indexes,
@@ -231,14 +223,7 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
         const existingRecord = existing.exists
           ? parseStoredDocumentRecord(snapshotData(existing, "document record"))
           : null;
-        const createdAtReservation = existingRecord
-          ? null
-          : await reserveNextCreatedAt(transaction, metadataCollection, collection);
-        const createdAt = existingRecord?.createdAt ?? createdAtReservation?.value;
-
-        if (createdAt === undefined) {
-          throw new Error("Missing Firestore createdAt reservation");
-        }
+        const createdAt = existingRecord?.createdAt ?? nextCreatedAt();
 
         const writeVersion = existingRecord ? existingRecord.writeVersion + 1 : 1;
         const updated = createStoredDocumentRecord(
@@ -379,14 +364,7 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
           const existingRecord = existing.exists
             ? parseStoredDocumentRecord(snapshotData(existing, "document record"))
             : null;
-          const createdAtReservation = existingRecord
-            ? null
-            : await reserveNextCreatedAt(transaction, metadataCollection, collection);
-          const createdAt = existingRecord?.createdAt ?? createdAtReservation?.value;
-
-          if (createdAt === undefined) {
-            throw new Error("Missing Firestore createdAt reservation");
-          }
+          const createdAt = existingRecord?.createdAt ?? nextCreatedAt();
 
           const writeVersion = existingRecord ? existingRecord.writeVersion + 1 : 1;
           const resolved = resolveWriteMetadata(item.migrationMetadata, item.doc);
@@ -459,14 +437,7 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
             return "persisted" as const;
           }
 
-          const createdAtReservation = existingRecord
-            ? null
-            : await reserveNextCreatedAt(transaction, metadataCollection, collection);
-          const createdAt = existingRecord?.createdAt ?? createdAtReservation?.value;
-
-          if (createdAt === undefined) {
-            throw new Error("Missing Firestore createdAt reservation");
-          }
+          const createdAt = existingRecord?.createdAt ?? nextCreatedAt();
 
           const writeVersion = existingRecord ? existingRecord.writeVersion + 1 : 1;
           const updated = createStoredDocumentRecord(
@@ -730,20 +701,6 @@ function encodeIdPart(value: string): string {
 
 function hashIndexValue(value: string): string {
   return createHash("sha256").update(value).digest("hex");
-}
-
-async function reserveNextCreatedAt(
-  transaction: FirestoreTransactionLike,
-  metadataCollection: FirestoreCollectionLike,
-  collection: string,
-): Promise<CreatedAtReservation> {
-  void transaction;
-  void metadataCollection;
-  void collection;
-
-  return {
-    value: nextCreatedAt(),
-  };
 }
 
 async function listCollectionDocuments(
