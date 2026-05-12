@@ -1,0 +1,25 @@
+{
+  "name": "example-app",
+  "private": true,
+  "type": "module",
+  "module": "index.ts",
+  "scripts": {
+    "dev": "bun --hot src/index.ts",
+    "start": "bun src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "services:up": "docker compose up -d",
+    "services:down": "docker compose down"
+  },
+  "dependencies": {
+    "@upstash/redis": "1.36.2",
+    "@upstash/workflow": "1.1.1",
+    "hono": "4.12.0",
+    "zod": "4.3.6"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  }
+}
