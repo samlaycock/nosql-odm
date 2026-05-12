@@ -3,25 +3,18 @@ import {
   GetCommand,
   QueryCommand,
   TransactWriteCommand,
-  UpdateCommand,
 } from "@aws-sdk/lib-dynamodb";
 import { describe, expect, test } from "bun:test";
 
 import { dynamoDbEngine } from "../../src/engines/dynamodb";
 
 class FakeDynamoClient {
-  sequenceValue = 0;
   sentCommands: string[] = [];
 
   constructor(private readonly existingDocument: Record<string, unknown> | null = null) {}
 
   async send(command: { input: unknown }): Promise<unknown> {
     this.sentCommands.push(command.constructor.name);
-
-    if (command instanceof UpdateCommand) {
-      this.sequenceValue += 1;
-      return { Attributes: { value: this.sequenceValue } };
-    }
 
     if (command instanceof GetCommand) {
       return { Item: this.existingDocument };
@@ -95,7 +88,7 @@ describe("dynamoDbEngine", () => {
     expect(engine.create("users", "u1", { id: "u1" }, makeIndexes(99))).rejects.toThrow(
       /100-item transaction limit/i,
     );
-    expect(client.sentCommands).toEqual(["UpdateCommand"]);
+    expect(client.sentCommands).toEqual([]);
   });
 
   test("delete fails fast when a single DynamoDB transaction would exceed 100 items", async () => {
@@ -120,6 +113,18 @@ describe("dynamoDbEngine", () => {
     expect(
       engine.batchSet("users", [{ key: "u1", doc: { id: "u1" }, indexes: makeIndexes(99) }]),
     ).rejects.toThrow(/100-item transaction limit/i);
-    expect(client.sentCommands).toEqual(["BatchGetCommand", "UpdateCommand"]);
+    expect(client.sentCommands).toEqual(["BatchGetCommand"]);
+  });
+
+  test("create does not reserve createdAt through a metadata update", async () => {
+    const client = new FakeDynamoClient();
+    const engine = dynamoDbEngine({
+      client,
+      tableName: "test-table",
+    });
+
+    await engine.create("users", "u1", { id: "u1" }, {});
+
+    expect(client.sentCommands).toEqual(["TransactWriteCommand"]);
   });
 });

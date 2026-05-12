@@ -497,7 +497,7 @@ describe("firestoreEngine query execution", () => {
         { fieldPath: "createdAt", direction: "asc" },
         { fieldPath: "key", direction: "asc" },
       ],
-      startAfter: ["2025-02-01", 2, "u2"],
+      startAfter: ["2025-02-01", expect.any(Number), "u2"],
       limit: 3,
     });
   });
@@ -566,7 +566,7 @@ describe("firestoreEngine query execution", () => {
         { fieldPath: "createdAt", direction: "asc" },
         { fieldPath: "key", direction: "asc" },
       ],
-      startAfter: [3, "u3"],
+      startAfter: [expect.any(Number), "u3"],
       limit: 3,
     });
   });

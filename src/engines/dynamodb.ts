@@ -6,7 +6,6 @@ import {
   PutCommand,
   QueryCommand,
   TransactWriteCommand,
-  UpdateCommand,
   type BatchGetCommandInput,
   type BatchWriteCommandInput,
   type QueryCommandInput,
@@ -14,6 +13,7 @@ import {
 } from "@aws-sdk/lib-dynamodb";
 
 import { DefaultMigrator } from "../migrator";
+import { nextCreatedAt } from "./distributed-created-at";
 import { getPreparedClone, prepareDocumentForStorage } from "./document-preparation";
 import { encodeQueryPageCursor, resolveQueryPageStartIndex } from "./query-cursor";
 import {
@@ -275,7 +275,7 @@ export function dynamoDbEngine(options: DynamoDbEngineOptions): DynamoDbQueryEng
     },
 
     async create(collection, key, doc, indexes, _options, migrationMetadata) {
-      const createdAt = await nextSequence(client, tableName, keyConfig, collection);
+      const createdAt = nextCreatedAt();
       const item = createDocumentItem(collection, key, createdAt, 1, doc, indexes);
       const queryIndexItems = createQueryIndexItems(collection, key, createdAt, indexes);
       const metadata =
@@ -306,8 +306,7 @@ export function dynamoDbEngine(options: DynamoDbEngineOptions): DynamoDbQueryEng
 
     async put(collection, key, doc, indexes, _options, migrationMetadata) {
       const existing = await getDocumentItem(client, tableName, keyConfig, collection, key);
-      const createdAt =
-        existing?.createdAt ?? (await nextSequence(client, tableName, keyConfig, collection));
+      const createdAt = existing?.createdAt ?? nextCreatedAt();
       const writeVersion = (existing?.writeVersion ?? 0) + 1;
       const item = createDocumentItem(collection, key, createdAt, writeVersion, doc, indexes);
       const queryIndexItems = createQueryIndexItems(collection, key, createdAt, indexes);
@@ -448,9 +447,7 @@ export function dynamoDbEngine(options: DynamoDbEngineOptions): DynamoDbQueryEng
 
       for (const item of items) {
         const existingRecord = existing.get(item.key);
-        const createdAt =
-          existingRecord?.createdAt ??
-          (await nextSequence(client, tableName, keyConfig, collection));
+        const createdAt = existingRecord?.createdAt ?? nextCreatedAt();
         const writeVersion = (existingRecord?.writeVersion ?? 0) + 1;
         const metadata =
           normalizeMigrationMetadata(item.migrationMetadata) ??
@@ -535,9 +532,7 @@ export function dynamoDbEngine(options: DynamoDbEngineOptions): DynamoDbQueryEng
           continue;
         }
 
-        const createdAt =
-          existingRecord?.createdAt ??
-          (await nextSequence(client, tableName, keyConfig, collection));
+        const createdAt = existingRecord?.createdAt ?? nextCreatedAt();
         const writeVersion = (existingRecord?.writeVersion ?? 0) + 1;
         const docItem = createDocumentItem(
           collection,
@@ -777,10 +772,6 @@ function lockSortKey(collection: string): string {
 
 function checkpointSortKey(collection: string): string {
   return `CHECKPOINT#${collection}`;
-}
-
-function sequenceSortKey(collection: string): string {
-  return `SEQUENCE#${collection}`;
 }
 
 function metadataSortKey(key: string): string {
@@ -1024,45 +1015,6 @@ function parseMigrationMetadataItem(
     migrationSyncPk,
     migrationSyncSk,
   };
-}
-
-async function nextSequence(
-  client: DynamoDbDocumentClientLike,
-  tableName: string,
-  keyConfig: DynamoKeyConfig,
-  collection: string,
-): Promise<number> {
-  const sk = sequenceSortKey(collection);
-
-  const response = (await client.send(
-    new UpdateCommand({
-      TableName: tableName,
-      Key: toDynamoPrimaryKey(keyConfig, META_PARTITION_KEY, sk),
-      UpdateExpression: "SET #itemType = :itemType, #value = if_not_exists(#value, :zero) + :inc",
-      ExpressionAttributeNames: {
-        "#itemType": "itemType",
-        "#value": "value",
-      },
-      ExpressionAttributeValues: {
-        ":itemType": "sequence",
-        ":zero": 0,
-        ":inc": 1,
-      },
-      ReturnValues: "UPDATED_NEW",
-    }),
-  )) as {
-    Attributes?: {
-      value?: unknown;
-    };
-  };
-
-  const value = response.Attributes?.value;
-
-  if (typeof value !== "number" || !Number.isFinite(value)) {
-    throw new Error("DynamoDB returned an invalid sequence value");
-  }
-
-  return value;
 }
 
 function createDocumentItem(
