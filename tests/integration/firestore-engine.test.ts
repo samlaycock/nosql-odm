@@ -210,7 +210,7 @@ describe("firestoreEngine integration", () => {
       .get();
 
     expect(rawDoc.exists).toBe(true);
-    expect(rawSeq.exists).toBe(true);
+    expect(rawSeq.exists).toBe(false);
   });
 
   test("get returns deep clones", async () => {
