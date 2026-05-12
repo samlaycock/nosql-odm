@@ -15,6 +15,7 @@ export default defineConfig({
     "./src/engines/mysql.ts",
     "./src/engines/postgres.ts",
   ],
+  external: [/^node:/],
   format: ["cjs", "esm"],
   platform: "neutral",
   outputOptions: {
