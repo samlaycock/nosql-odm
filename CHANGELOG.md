@@ -1,5 +1,20 @@
 # nosql-odm
 
+## 0.11.2
+
+### Patch Changes
+
+- 5538400: Add optimistic write-token support to the IndexedDB adapter so stale conditional writes are reported as conflicts instead of overwriting newer documents.
+- 64f8129: Emit `onPageCommitted` for the final migration page before `onMigrationCompleted`.
+- c6ddbee: Count migration persisted-record telemetry for engines whose migration persist path returns void after successful batch writes.
+- 9a055a9: Add IndexedDB unique ownership storage so unique checks avoid collection scans during writes.
+- 1b8a11f: Run the production build in the PR quality workflow so packaging and declaration generation failures block merges.
+- 63c7d86: Queue IndexedDB batch and index-query document reads before awaiting results to reduce per-key read latency while preserving duplicate keys and request order.
+- a381f3d: Externalize Node built-ins during neutral builds so Node-only engine entries no longer emit unresolved import warnings.
+- dbc0676: Add regression coverage for migration telemetry average page duration calculations.
+- a840fd2: Reduce non-SQL adapter write contention by replacing per-collection createdAt sequence reservations with time-sortable local allocation while preserving deterministic cursor tie-breaking.
+- 37e672e: Push IndexedDB range, comparison, and prefix index queries through native index-entry scans with diagnostics instead of falling back to full collection scans.
+
 ## 0.11.1
 
 ### Patch Changes
