@@ -463,8 +463,17 @@ export class DefaultMigrator<TOptions = Record<string, unknown>> implements Migr
         const completed = run.modelIndex >= run.models.length;
 
         if (completed) {
-          await this.engine.migration.clearCheckpoint?.(runKey);
           const completedProgress = toProgress(run, false);
+          await this.runHook("onPageCommitted", {
+            runId: run.id,
+            model: modelName,
+            migrated: result.migrated,
+            skipped: result.skipped,
+            cursor: run.cursor,
+            hasMore: false,
+            telemetry: pageTelemetry,
+          });
+          await this.engine.migration.clearCheckpoint?.(runKey);
           await this.runHook("onMigrationCompleted", { progress: completedProgress });
 
           return {

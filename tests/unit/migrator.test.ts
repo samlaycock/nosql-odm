@@ -235,6 +235,7 @@ describe("paged migration API", () => {
 
     const pageCommittedEvents: Array<{
       model: string;
+      hasMore: boolean;
       telemetry: {
         durationMs: number;
         recordsPerSecond: number;
@@ -243,12 +244,15 @@ describe("paged migration API", () => {
       };
     }> = [];
     let completedProgress: MigrationRunProgress | null = null;
+    const hookOrder: string[] = [];
 
     const store = createStore(engine, [buildUserV2()], {
       migrationHooks: {
         onPageCommitted(event) {
+          hookOrder.push(`page:${event.hasMore ? "more" : "final"}`);
           pageCommittedEvents.push({
             model: event.model,
+            hasMore: event.hasMore,
             telemetry: {
               durationMs: event.telemetry.durationMs,
               recordsPerSecond: event.telemetry.recordsPerSecond,
@@ -258,6 +262,7 @@ describe("paged migration API", () => {
           });
         },
         onMigrationCompleted(event) {
+          hookOrder.push("completed");
           completedProgress = event.progress;
         },
       },
@@ -295,16 +300,29 @@ describe("paged migration API", () => {
     expect(secondTelemetry.durationMs).toBeGreaterThanOrEqual(15);
     expect(secondTelemetry.skipReasons.validation_error).toBeGreaterThanOrEqual(1);
 
-    expect(pageCommittedEvents).toHaveLength(1);
-    expect(pageCommittedEvents[0]).toEqual({
-      model: "user",
-      telemetry: {
-        durationMs: firstTelemetry.durationMs,
-        recordsPerSecond: firstTelemetry.recordsPerSecond,
-        writebackFailures: 0,
-        skipReasons: { validation_error: 1 },
+    expect(pageCommittedEvents).toEqual([
+      {
+        model: "user",
+        hasMore: true,
+        telemetry: {
+          durationMs: firstTelemetry.durationMs,
+          recordsPerSecond: firstTelemetry.recordsPerSecond,
+          writebackFailures: 0,
+          skipReasons: { validation_error: 1 },
+        },
       },
-    });
+      {
+        model: "user",
+        hasMore: false,
+        telemetry: {
+          durationMs: secondTelemetry.durationMs,
+          recordsPerSecond: secondTelemetry.recordsPerSecond,
+          writebackFailures: 0,
+          skipReasons: secondTelemetry.skipReasons,
+        },
+      },
+    ]);
+    expect(hookOrder).toEqual(["page:more", "page:final", "completed"]);
 
     expect(completedProgress).not.toBeNull();
     const completedUserProgress = completedProgress!.progressByModel.user;
