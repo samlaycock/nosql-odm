@@ -1,5 +1,5 @@
 import { DefaultMigrator } from "../migrator";
-import { reserveCreatedAtRange as reserveDistributedCreatedAtRange } from "./distributed-created-at";
+import { nextCreatedAt, reserveCreatedAtRange } from "./distributed-created-at";
 import { getPreparedClone, prepareDocumentForStorage } from "./document-preparation";
 import {
   encodeQueryPageCursor,
@@ -235,7 +235,7 @@ export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine
     async create(collection, key, doc, indexes, _options, migrationMetadata) {
       await ready;
 
-      const createdAt = await nextCreatedAt(metadataCollection, collection);
+      const createdAt = nextCreatedAt();
       const metadata =
         normalizeMigrationMetadata(migrationMetadata) ?? deriveLegacyMetadataFromDocument(doc);
       const record = createStoredDocumentRecord(
@@ -262,7 +262,7 @@ export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine
     async put(collection, key, doc, indexes, _options, migrationMetadata) {
       await ready;
 
-      const createdAt = await nextCreatedAt(metadataCollection, collection);
+      const createdAt = nextCreatedAt();
       const normalizedDoc = normalizeDocument(doc);
       const normalizedIndexes = normalizeIndexes(indexes);
       const metadata =
@@ -575,11 +575,7 @@ export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine
           metadata,
         };
       });
-      const createdAts = await reserveCreatedAtRange(
-        metadataCollection,
-        collection,
-        preparedItems.length,
-      );
+      const createdAts = reserveCreatedAtRange(preparedItems.length);
       const operations: MongoBulkWriteOperationLike[] = preparedItems.map((item, index) => ({
         updateOne: {
           filter: {
@@ -646,11 +642,7 @@ export function mongoDbEngine(options: MongoDbEngineOptions): MongoDbQueryEngine
       const persisted = Array.from({ length: preparedItems.length }, () => false);
 
       if (unconditionalItems.length > 0) {
-        const createdAts = await reserveCreatedAtRange(
-          metadataCollection,
-          collection,
-          unconditionalItems.length,
-        );
+        const createdAts = reserveCreatedAtRange(unconditionalItems.length);
         const operations: MongoBulkWriteOperationLike[] = unconditionalItems.map((item, index) => ({
           updateOne: {
             filter: {
@@ -1009,38 +1001,6 @@ async function ensureSchema(
       key: 1,
     });
   }
-}
-
-async function nextCreatedAt(
-  metadataCollection: MongoCollectionLike,
-  collection: string,
-): Promise<number> {
-  void metadataCollection;
-  void collection;
-
-  const createdAts = reserveDistributedCreatedAtRange(1);
-  const createdAt = createdAts[0];
-
-  if (createdAt === undefined) {
-    throw new Error("MongoDB failed to allocate createdAt");
-  }
-
-  return createdAt;
-}
-
-async function reserveCreatedAtRange(
-  metadataCollection: MongoCollectionLike,
-  collection: string,
-  count: number,
-): Promise<number[]> {
-  void metadataCollection;
-  void collection;
-
-  if (!Number.isInteger(count) || count <= 0) {
-    return [];
-  }
-
-  return reserveDistributedCreatedAtRange(count);
 }
 
 async function listCollectionDocuments(
