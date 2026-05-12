@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
 import { DefaultMigrator } from "../migrator";
+import { nextCreatedAt } from "./distributed-created-at";
 import { getPreparedClone, prepareDocumentForStorage } from "./document-preparation";
 import {
   encodeQueryPageCursor,
@@ -127,7 +128,6 @@ interface UniqueOwnershipRecord {
 }
 
 interface CreatedAtReservation {
-  ref: FirestoreDocumentReferenceLike;
   value: number;
 }
 
@@ -214,10 +214,6 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
           {},
           created.uniqueIndexes,
         );
-        transaction.set(
-          createdAtReservation.ref,
-          createSequenceRecord(collection, createdAtReservation.value),
-        );
         transaction.create(ref, created);
 
         return created;
@@ -265,12 +261,6 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
           existingRecord?.uniqueIndexes ?? {},
           updated.uniqueIndexes,
         );
-        if (createdAtReservation) {
-          transaction.set(
-            createdAtReservation.ref,
-            createSequenceRecord(collection, createdAtReservation.value),
-          );
-        }
         transaction.set(ref, updated);
       });
     },
@@ -420,12 +410,6 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
             existingRecord?.uniqueIndexes ?? {},
             updated.uniqueIndexes,
           );
-          if (createdAtReservation) {
-            transaction.set(
-              createdAtReservation.ref,
-              createSequenceRecord(collection, createdAtReservation.value),
-            );
-          }
           transaction.set(ref, updated);
         });
       }
@@ -504,12 +488,6 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
             existingRecord?.uniqueIndexes ?? {},
             updated.uniqueIndexes,
           );
-          if (createdAtReservation) {
-            transaction.set(
-              createdAtReservation.ref,
-              createSequenceRecord(collection, createdAtReservation.value),
-            );
-          }
           transaction.set(ref, updated);
           return "persisted" as const;
         });
@@ -746,10 +724,6 @@ function uniqueOwnershipDocId(collection: string, indexName: string, indexValue:
   return `unique:${encodeIdPart(collection)}:${encodeIdPart(indexName)}:${hashIndexValue(indexValue)}`;
 }
 
-function sequenceDocId(collection: string): string {
-  return `sequence:${encodeIdPart(collection)}`;
-}
-
 function encodeIdPart(value: string): string {
   return encodeURIComponent(value);
 }
@@ -763,30 +737,12 @@ async function reserveNextCreatedAt(
   metadataCollection: FirestoreCollectionLike,
   collection: string,
 ): Promise<CreatedAtReservation> {
-  const ref = metadataRef(metadataCollection, sequenceDocId(collection));
-  const raw = await transaction.get(ref);
-  const snapshot = parseDocumentSnapshot(raw, "sequence record");
-
-  const value = snapshot.exists
-    ? readFiniteNumber(
-        parseRecord(snapshotData(snapshot, "sequence record"), "sequence record"),
-        "value",
-        "sequence record",
-      )
-    : 0;
-  const next = value + 1;
+  void transaction;
+  void metadataCollection;
+  void collection;
 
   return {
-    ref,
-    value: next,
-  };
-}
-
-function createSequenceRecord(collection: string, value: number): Record<string, unknown> {
-  return {
-    kind: "sequence",
-    collection,
-    value,
+    value: nextCreatedAt(),
   };
 }
 

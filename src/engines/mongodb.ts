@@ -1,4 +1,5 @@
 import { DefaultMigrator } from "../migrator";
+import { reserveCreatedAtRange as reserveDistributedCreatedAtRange } from "./distributed-created-at";
 import { getPreparedClone, prepareDocumentForStorage } from "./document-preparation";
 import {
   encodeQueryPageCursor,
@@ -1014,11 +1015,14 @@ async function nextCreatedAt(
   metadataCollection: MongoCollectionLike,
   collection: string,
 ): Promise<number> {
-  const createdAts = await reserveCreatedAtRange(metadataCollection, collection, 1);
+  void metadataCollection;
+  void collection;
+
+  const createdAts = reserveDistributedCreatedAtRange(1);
   const createdAt = createdAts[0];
 
   if (createdAt === undefined) {
-    throw new Error("MongoDB returned an invalid sequence record");
+    throw new Error("MongoDB failed to allocate createdAt");
   }
 
   return createdAt;
@@ -1029,42 +1033,14 @@ async function reserveCreatedAtRange(
   collection: string,
   count: number,
 ): Promise<number[]> {
-  // Reserve one sequence value per attempted upsert to preserve legacy ordering behavior.
-  // Updates can leave gaps because createdAt is written only on insert via $setOnInsert.
+  void metadataCollection;
+  void collection;
+
   if (!Number.isInteger(count) || count <= 0) {
     return [];
   }
 
-  const raw = await metadataCollection.findOneAndUpdate(
-    {
-      collection,
-      kind: "sequence",
-    },
-    {
-      $setOnInsert: {
-        collection,
-        kind: "sequence",
-      },
-      $inc: {
-        value: count,
-      },
-    },
-    {
-      upsert: true,
-      returnDocument: "after",
-    },
-  );
-
-  const valueDoc = parseFindOneAndUpdateResult(raw, "sequence record");
-  const value = readFiniteNumber(valueDoc, "value", "sequence record");
-  const start = value - count + 1;
-  const createdAts: number[] = [];
-
-  for (let index = 0; index < count; index += 1) {
-    createdAts.push(start + index);
-  }
-
-  return createdAts;
+  return reserveDistributedCreatedAtRange(count);
 }
 
 async function listCollectionDocuments(
@@ -1901,39 +1877,6 @@ function parseLockRecord(raw: unknown): LockRecord {
 function parseCheckpointRecord(raw: unknown): string {
   const record = parseRecord(raw, "migration checkpoint record");
   return readString(record, "cursor", "migration checkpoint record");
-}
-
-function parseFindOneAndUpdateResult(raw: unknown, context: string): Record<string, unknown> {
-  const wrapped = parseFindOneAndUpdateWrappedValue(raw);
-
-  if (wrapped.found) {
-    return parseRecord(wrapped.value, context);
-  }
-
-  return parseRecord(raw, context);
-}
-
-type WrappedFindOneAndUpdateValue = { found: true; value: unknown } | { found: false };
-
-function parseFindOneAndUpdateWrappedValue(raw: unknown): WrappedFindOneAndUpdateValue {
-  if (!isRecord(raw)) {
-    return { found: false };
-  }
-
-  // MongoDB Node drivers prior to v6 return a ModifyResult wrapper that
-  // includes metadata fields like `ok` / `lastErrorObject` and a `value`.
-  if (!("ok" in raw) && !("lastErrorObject" in raw)) {
-    return { found: false };
-  }
-
-  if (!("value" in raw)) {
-    return { found: false };
-  }
-
-  return {
-    found: true,
-    value: raw.value,
-  };
 }
 
 function parseIndexes(raw: unknown): ResolvedIndexKeys {

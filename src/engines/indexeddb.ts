@@ -1,4 +1,5 @@
 import { DefaultMigrator } from "../migrator";
+import { nextCreatedAt, reserveCreatedAtRange } from "./distributed-created-at";
 import { getPreparedClone, prepareDocumentForStorage } from "./document-preparation";
 import { encodeQueryPageCursor, resolveQueryPageStartIndex } from "./query-cursor";
 import {
@@ -117,7 +118,6 @@ const STORE_UNIQUE_INDEX_ENTRIES = "unique_index_entries";
 
 const QUERY_INDEX_LOOKUP = "lookup";
 
-const META_SEQUENCE_KEY = "sequence";
 const META_QUERY_INDEX_BACKFILL_KEY = "queryIndexEntriesBackfilledV2";
 const META_UNIQUE_INDEX_BACKFILL_KEY = "uniqueIndexEntriesBackfilledV4";
 const OUTDATED_PAGE_LIMIT = 100;
@@ -165,10 +165,7 @@ interface IndexEntryRange {
 }
 
 interface MetaSequenceRecord {
-  key:
-    | typeof META_SEQUENCE_KEY
-    | typeof META_QUERY_INDEX_BACKFILL_KEY
-    | typeof META_UNIQUE_INDEX_BACKFILL_KEY;
+  key: typeof META_QUERY_INDEX_BACKFILL_KEY | typeof META_UNIQUE_INDEX_BACKFILL_KEY;
   value: number;
 }
 
@@ -259,11 +256,10 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
 
       await withTransaction(
         db,
-        [STORE_DOCUMENTS, STORE_META, STORE_QUERY_INDEX_ENTRIES, STORE_UNIQUE_INDEX_ENTRIES],
+        [STORE_DOCUMENTS, STORE_QUERY_INDEX_ENTRIES, STORE_UNIQUE_INDEX_ENTRIES],
         "readwrite",
         async (tx) => {
           const docsStore = tx.objectStore(STORE_DOCUMENTS);
-          const metaStore = tx.objectStore(STORE_META);
           const indexStore = tx.objectStore(STORE_QUERY_INDEX_ENTRIES);
           const uniqueIndexStore = tx.objectStore(STORE_UNIQUE_INDEX_ENTRIES);
 
@@ -275,13 +271,13 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
 
           await assertUniqueIndexes(uniqueIndexStore, collection, key, uniqueIndexes ?? {});
 
-          const sequence = (await loadSequence(metaStore)) + 1;
+          const createdAt = nextCreatedAt();
 
           const record = createStoredDocumentRecord({
             id: docId,
             collection,
             key,
-            createdAt: sequence,
+            createdAt,
             writeVersion: 1,
             doc,
             indexes,
@@ -289,7 +285,7 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
           });
 
           await requestToPromise(docsStore.put(record));
-          await replaceQueryIndexEntries(indexStore, collection, key, sequence, {}, indexes);
+          await replaceQueryIndexEntries(indexStore, collection, key, createdAt, {}, indexes);
           await replaceUniqueIndexEntries(
             uniqueIndexStore,
             collection,
@@ -297,8 +293,6 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
             {},
             uniqueIndexes ?? {},
           );
-
-          await saveSequence(metaStore, sequence);
         },
       );
     },
@@ -309,11 +303,10 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
 
       await withTransaction(
         db,
-        [STORE_DOCUMENTS, STORE_META, STORE_QUERY_INDEX_ENTRIES, STORE_UNIQUE_INDEX_ENTRIES],
+        [STORE_DOCUMENTS, STORE_QUERY_INDEX_ENTRIES, STORE_UNIQUE_INDEX_ENTRIES],
         "readwrite",
         async (tx) => {
           const docsStore = tx.objectStore(STORE_DOCUMENTS);
-          const metaStore = tx.objectStore(STORE_META);
           const indexStore = tx.objectStore(STORE_QUERY_INDEX_ENTRIES);
           const uniqueIndexStore = tx.objectStore(STORE_UNIQUE_INDEX_ENTRIES);
 
@@ -325,9 +318,8 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
           let existingUniqueIndexes: ResolvedIndexKeys = {};
 
           if (existingRaw === undefined) {
-            createdAt = (await loadSequence(metaStore)) + 1;
+            createdAt = nextCreatedAt();
             writeVersion = 1;
-            await saveSequence(metaStore, createdAt);
           } else {
             const existing = parseStoredDocumentRecord(existingRaw);
             createdAt = existing.createdAt;
@@ -540,16 +532,14 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
 
       await withTransaction(
         db,
-        [STORE_DOCUMENTS, STORE_META, STORE_QUERY_INDEX_ENTRIES, STORE_UNIQUE_INDEX_ENTRIES],
+        [STORE_DOCUMENTS, STORE_QUERY_INDEX_ENTRIES, STORE_UNIQUE_INDEX_ENTRIES],
         "readwrite",
         async (tx) => {
           const docsStore = tx.objectStore(STORE_DOCUMENTS);
-          const metaStore = tx.objectStore(STORE_META);
           const indexStore = tx.objectStore(STORE_QUERY_INDEX_ENTRIES);
           const uniqueIndexStore = tx.objectStore(STORE_UNIQUE_INDEX_ENTRIES);
-
-          let sequence = await loadSequence(metaStore);
-          let sequenceChanged = false;
+          const createdAts = reserveCreatedAtRange(items.length);
+          let createdAtIndex = 0;
 
           for (const item of items) {
             const docId = makeDocumentId(collection, item.key);
@@ -561,9 +551,14 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
             let existingUniqueIndexes: ResolvedIndexKeys = {};
 
             if (existingRaw === undefined) {
-              sequence += 1;
-              sequenceChanged = true;
-              createdAt = sequence;
+              const reservedCreatedAt = createdAts[createdAtIndex];
+              createdAtIndex += 1;
+
+              if (reservedCreatedAt === undefined) {
+                throw new Error("IndexedDB failed to allocate createdAt");
+              }
+
+              createdAt = reservedCreatedAt;
               writeVersion = 1;
             } else {
               const existing = parseStoredDocumentRecord(existingRaw);
@@ -605,10 +600,6 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
               uniqueIndexes,
             );
           }
-
-          if (sequenceChanged) {
-            await saveSequence(metaStore, sequence);
-          }
         },
       );
     },
@@ -618,18 +609,16 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
 
       return withTransaction(
         db,
-        [STORE_DOCUMENTS, STORE_META, STORE_QUERY_INDEX_ENTRIES, STORE_UNIQUE_INDEX_ENTRIES],
+        [STORE_DOCUMENTS, STORE_QUERY_INDEX_ENTRIES, STORE_UNIQUE_INDEX_ENTRIES],
         "readwrite",
         async (tx) => {
           const docsStore = tx.objectStore(STORE_DOCUMENTS);
-          const metaStore = tx.objectStore(STORE_META);
           const indexStore = tx.objectStore(STORE_QUERY_INDEX_ENTRIES);
           const uniqueIndexStore = tx.objectStore(STORE_UNIQUE_INDEX_ENTRIES);
           const persistedKeys: string[] = [];
           const conflictedKeys: string[] = [];
-
-          let sequence = await loadSequence(metaStore);
-          let sequenceChanged = false;
+          const createdAts = reserveCreatedAtRange(items.length);
+          let createdAtIndex = 0;
 
           for (const item of items) {
             const existingRaw = await requestToPromise(
@@ -647,11 +636,15 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
             }
 
             const docId = makeDocumentId(collection, item.key);
-            const createdAt = existing?.createdAt ?? sequence + 1;
+            const reservedCreatedAt = existing ? undefined : createdAts[createdAtIndex];
+            const createdAt = existing?.createdAt ?? reservedCreatedAt;
 
             if (!existing) {
-              sequence = createdAt;
-              sequenceChanged = true;
+              createdAtIndex += 1;
+            }
+
+            if (createdAt === undefined) {
+              throw new Error("IndexedDB failed to allocate createdAt");
             }
 
             const uniqueIndexes = item.uniqueIndexes ?? {};
@@ -686,10 +679,6 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
               uniqueIndexes,
             );
             persistedKeys.push(item.key);
-          }
-
-          if (sequenceChanged) {
-            await saveSequence(metaStore, sequence);
           }
 
           return { persistedKeys, conflictedKeys };
@@ -2043,32 +2032,6 @@ function parseMigrationCheckpointRecord(value: unknown): MigrationCheckpointReco
   }
 
   return { collection, cursor };
-}
-
-async function loadSequence(metaStore: IndexedDbObjectStoreLike): Promise<number> {
-  const raw = await requestToPromise(metaStore.get(META_SEQUENCE_KEY));
-
-  if (raw === undefined) {
-    return 0;
-  }
-
-  if (!isRecord(raw)) {
-    throw new Error("IndexedDB meta store contains an invalid sequence record");
-  }
-
-  const key = raw.key;
-  const value = raw.value;
-
-  if (key !== META_SEQUENCE_KEY || typeof value !== "number" || !Number.isFinite(value)) {
-    throw new Error("IndexedDB meta store contains an invalid sequence record");
-  }
-
-  return value;
-}
-
-async function saveSequence(metaStore: IndexedDbObjectStoreLike, value: number): Promise<void> {
-  const record: MetaSequenceRecord = { key: META_SEQUENCE_KEY, value };
-  await requestToPromise(metaStore.put(record));
 }
 
 function parseMetaFlagRecord(

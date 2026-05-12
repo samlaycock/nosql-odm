@@ -384,7 +384,7 @@ describe("mongodb engine batch operations", () => {
     expect(engine.capabilities?.uniqueConstraints).toBe("none");
   });
 
-  test("batchSet uses a single bulkWrite and sequence reservation for large batches", async () => {
+  test("batchSet uses a single bulkWrite without reserving a metadata sequence", async () => {
     const documents = new FakeMongoDocumentsCollection();
     const metadata = new FakeMongoMetadataCollection();
     const engine = mongoDbEngine({
@@ -405,7 +405,7 @@ describe("mongodb engine batch operations", () => {
     expect(documents.bulkWriteCalls).toHaveLength(1);
     expect(documents.bulkWriteCalls[0]?.operations).toHaveLength(items.length);
     expect(documents.updateOneCalls).toHaveLength(0);
-    expect(metadata.findOneAndUpdateCalls).toHaveLength(1);
+    expect(metadata.findOneAndUpdateCalls).toHaveLength(0);
   });
 
   test("batchSetWithResult bulk-writes unconditional items and keeps conditional conflict semantics", async () => {
@@ -427,7 +427,7 @@ describe("mongodb engine batch operations", () => {
     expect(documents.bulkWriteCalls).toHaveLength(1);
     expect(documents.bulkWriteCalls[0]?.operations).toHaveLength(2);
     expect(documents.updateOneCalls).toHaveLength(2);
-    expect(metadata.findOneAndUpdateCalls).toHaveLength(1);
+    expect(metadata.findOneAndUpdateCalls).toHaveLength(0);
   });
 
   test("batchSetWithResult throws when unconditional bulkWrite acknowledges fewer writes than expected", async () => {

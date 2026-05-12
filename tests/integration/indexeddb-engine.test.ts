@@ -1385,17 +1385,18 @@ describe("indexedDbEngine corruption handling", () => {
     await expectReject(engine.get("users", "bad"), /invalid record \(bad document\)/);
   });
 
-  test("create throws for invalid sequence metadata", async () => {
+  test("create ignores legacy sequence metadata", async () => {
     await engine.get("users", "bootstrap");
     await putRawRecord(RAW_STORE_META, {
       key: "sequence",
       value: "not-a-number",
     });
 
-    await expectReject(
-      engine.create("users", "u1", { id: "u1" }, { primary: "u1" }),
-      /invalid sequence record/,
-    );
+    await engine.create("users", "u1", { id: "u1" }, { primary: "u1" });
+
+    const created = await engine.get("users", "u1");
+
+    expect(created).toEqual({ id: "u1" });
   });
 
   test("acquireLock throws for invalid lock records", async () => {
