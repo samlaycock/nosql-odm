@@ -198,6 +198,8 @@ const RESERVED_STORE_API_NAMES = new Set([
   "migrateAll",
 ]);
 
+const UNSAFE_STORE_MODEL_NAMES = new Set(["__proto__", "prototype", "constructor"]);
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -2000,6 +2002,10 @@ export function createStore<
   for (const modelDef of models) {
     if (RESERVED_STORE_API_NAMES.has(modelDef.name)) {
       throw new Error(`Model name "${modelDef.name}" collides with a store-level API`);
+    }
+
+    if (UNSAFE_STORE_MODEL_NAMES.has(modelDef.name)) {
+      throw new Error(`Model name "${modelDef.name}" collides with an unsafe object property`);
     }
 
     if (boundModels.has(modelDef.name)) {
