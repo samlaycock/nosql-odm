@@ -682,6 +682,28 @@ describe("createStore()", () => {
     }
   });
 
+  test("throws when model names collide with unsafe object properties", () => {
+    const unsafeNames = ["__proto__", "prototype", "constructor"] as const;
+
+    for (const unsafeName of unsafeNames) {
+      const unsafeModel = model(unsafeName)
+        .schema(
+          1,
+          z.object({
+            id: z.string(),
+          }),
+        )
+        .index({ name: "primary", value: "id" })
+        .build();
+
+      expect(() => {
+        createStore(engine, [unsafeModel]);
+      }).toThrow(`Model name "${unsafeName}" collides with an unsafe object property`);
+
+      expect(Object.getPrototypeOf({})).toBe(Object.prototype);
+    }
+  });
+
   test("creates a store with a single model", () => {
     const store = createStore(engine, [buildUserV1()]);
 
