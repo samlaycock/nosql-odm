@@ -1027,7 +1027,7 @@ function buildFirestoreWhereFilters(
     return null;
   }
 
-  if (hasBegins && (hasEq || hasBetween || hasRange)) {
+  if (hasBegins) {
     return null;
   }
 

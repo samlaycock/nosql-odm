@@ -2204,10 +2204,7 @@ function buildIndexLexRange(filter: string | number | FieldCondition): IndexLexR
     filter.$lte === undefined &&
     filter.$between === undefined
   ) {
-    return {
-      min: `[${filter.$begins}`,
-      max: `[${filter.$begins}\xff`,
-    };
+    return null;
   }
 
   if (filter.$between !== undefined) {

@@ -989,11 +989,12 @@ describe("non-SQL query pushdown", () => {
     expect(String(logged[0]?.[0])).toContain("onQueryFallbackScan");
   });
 
-  test("firestore query pushes supported index filters into where clauses", async () => {
+  test("firestore query falls back for $begins to avoid Unicode-unsafe sentinels", async () => {
     const db = new FakeFirestoreDatabase([
       makeEngineDoc("u1", 2, { byEmail: "sam@example.com" }, { id: "u1" }),
       makeEngineDoc("u2", 1, { byEmail: "alex@example.com" }, { id: "u2" }),
       makeEngineDoc("u3", 3, { byEmail: "zoe@example.com" }, { id: "u3" }),
+      makeEngineDoc("u4", 4, { byEmail: "a\uf900@example.com" }, { id: "u4" }),
     ]);
     const engine = firestoreEngine({
       database: db as unknown as Parameters<typeof firestoreEngine>[0]["database"],
@@ -1004,12 +1005,8 @@ describe("non-SQL query pushdown", () => {
       filter: { value: { $begins: "a" } },
     });
 
-    expect(db.documentWhereCalls).toEqual([
-      { field: "collection", op: "==", value: "users" },
-      { field: "indexes.byEmail", op: ">=", value: "a" },
-      { field: "indexes.byEmail", op: "<=", value: "a\uf8ff" },
-    ]);
-    expect(result.documents.map((doc) => doc.key)).toEqual(["u2"]);
+    expect(db.documentWhereCalls).toEqual([{ field: "collection", op: "==", value: "users" }]);
+    expect(result.documents.map((doc) => doc.key)).toEqual(["u2", "u4"]);
   });
 
   test("firestore query rejects malformed cursor before backend query", async () => {

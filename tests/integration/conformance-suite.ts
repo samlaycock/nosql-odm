@@ -156,6 +156,37 @@ export function runQueryEngineConformanceSuite<TOptions = Record<string, unknown
       expect(page2.cursor).toBeNull();
     });
 
+    test("applies $begins semantics to Unicode suffixes above sentinel ranges", async () => {
+      const engine = getEngine();
+      const collection = nextCollection("unicode_prefix_users");
+
+      await engine.batchSet(collection, [
+        {
+          key: "u1",
+          doc: { id: "u1", role: "private-use" },
+          indexes: { byRole: "member#\uf900" },
+        },
+        {
+          key: "u2",
+          doc: { id: "u2", role: "emoji" },
+          indexes: { byRole: "member#😀" },
+        },
+        {
+          key: "u3",
+          doc: { id: "u3", role: "other" },
+          indexes: { byRole: "admin#\uf900" },
+        },
+      ]);
+
+      const results = await engine.query(collection, {
+        index: "byRole",
+        filter: { value: { $begins: "member#" } },
+        sort: "asc",
+      });
+
+      expect(results.documents.map((entry) => entry.key).sort()).toEqual(["u1", "u2"]);
+    });
+
     test("uses opaque, query-bound cursors that resume correctly after cursor row deletion", async () => {
       const engine = getEngine();
       const collection = nextCollection("cursor_users");
