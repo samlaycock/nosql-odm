@@ -5290,6 +5290,34 @@ describe("lazy migration error handling", () => {
       },
     ]);
   });
+
+  test("update rejects ahead-of-latest documents without downgrading when migration errors are ignored", async () => {
+    await engine.put(
+      "user",
+      "u1",
+      {
+        __v: 2,
+        id: "u1",
+        name: "Sam",
+        email: "sam@example.com",
+        futureOnly: "preserve me",
+      },
+      { primary: "u1", byEmail: "sam@example.com" },
+    );
+
+    const store = createStore(engine, [buildUserV1()]);
+
+    await expectReject(store.user.update("u1", { name: "Samuel" }), MigrationProjectionError);
+
+    const raw = (await engine.get("user", "u1")) as Record<string, unknown>;
+    expect(raw).toEqual({
+      __v: 2,
+      id: "u1",
+      name: "Sam",
+      email: "sam@example.com",
+      futureOnly: "preserve me",
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
