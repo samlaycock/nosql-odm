@@ -14,6 +14,7 @@ import {
   EngineDocumentNotFoundError,
   EngineUniqueConstraintError,
   type EngineGetResult,
+  type FieldCondition,
   type KeyedDocument,
   type MigrationDocumentMetadata,
   type MigrationLock,
@@ -1936,23 +1937,36 @@ class BoundModelImpl<
       return filter;
     }
 
-    return {
-      value: {
-        ...value,
-        $eq: this.encodeNumericFilterOperand(value.$eq),
-        $gt: this.encodeNumericFilterOperand(value.$gt),
-        $lt: this.encodeNumericFilterOperand(value.$lt),
-        $gte: this.encodeNumericFilterOperand(value.$gte),
-        $lte: this.encodeNumericFilterOperand(value.$lte),
-        $between:
-          value.$between === undefined
-            ? undefined
-            : [
-                this.encodeNumericFilterOperand(value.$between[0]),
-                this.encodeNumericFilterOperand(value.$between[1]),
-              ],
-      },
-    };
+    const encoded: FieldCondition = { ...value };
+
+    if (value.$eq !== undefined) {
+      encoded.$eq = this.encodeNumericFilterOperand(value.$eq);
+    }
+
+    if (value.$gt !== undefined) {
+      encoded.$gt = this.encodeNumericFilterOperand(value.$gt);
+    }
+
+    if (value.$lt !== undefined) {
+      encoded.$lt = this.encodeNumericFilterOperand(value.$lt);
+    }
+
+    if (value.$gte !== undefined) {
+      encoded.$gte = this.encodeNumericFilterOperand(value.$gte);
+    }
+
+    if (value.$lte !== undefined) {
+      encoded.$lte = this.encodeNumericFilterOperand(value.$lte);
+    }
+
+    if (value.$between !== undefined) {
+      encoded.$between = [
+        this.encodeNumericFilterOperand(value.$between[0]),
+        this.encodeNumericFilterOperand(value.$between[1]),
+      ];
+    }
+
+    return { value: encoded };
   }
 
   private encodeNumericFilterOperand(value: unknown): unknown {
