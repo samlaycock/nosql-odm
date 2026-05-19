@@ -745,13 +745,14 @@ await store.user.query({
 
 ### Lexicographic ordering rules
 
-All index values are strings. Sort/range comparisons are lexicographic.
+All persisted index values are strings. String, boolean, bigint, and symbol
+field-backed indexes sort/range-filter lexicographically.
 
-If you need numeric ordering, use `encodeNumericIndexValue()` so lexicographic
-order matches numeric order (including negatives/decimals):
+Numeric field-backed indexes are encoded automatically so sort/range comparisons
+match numeric order, including negatives and decimals:
 
 ```ts
-import { encodeNumericIndexValue, model } from "nosql-odm";
+import { model } from "nosql-odm";
 
 const Product = model("product")
   .schema(
@@ -762,23 +763,28 @@ const Product = model("product")
     }),
   )
   .index({ name: "primary", value: "id" })
-  .index({ name: "byPrice", value: (p) => encodeNumericIndexValue(p.priceCents) })
+  .index({ name: "byPrice", value: "priceCents" })
   .build();
 ```
 
-Use the same encoding for query filters/range bounds:
+Store queries against declared field-backed indexes encode numeric filters and
+range bounds automatically:
 
 ```ts
 const results = await store.product.query({
   index: "byPrice",
-  filter: { value: { $gte: encodeNumericIndexValue(500) } },
+  filter: { value: { $gte: 500 } },
   sort: "asc",
 });
 ```
 
-If you switch an existing index from raw strings/manual padding to
-`encodeNumericIndexValue()`, reindex stored documents (for example via
-`migrateAll()`) so persisted index entries use the new encoding.
+Function-backed indexes still return raw strings. Use `encodeNumericIndexValue()`
+inside function-backed indexes when you need numeric ordering, and pass encoded
+string bounds when querying those indexes directly.
+
+If you upgrade an existing numeric field-backed index from raw string storage,
+reindex stored documents (for example via `migrateAll()`) so persisted index
+entries use the numeric encoding.
 
 For dates/times, prefer sortable ISO-8601 strings (`2026-02-13T19:00:00.000Z`).
 

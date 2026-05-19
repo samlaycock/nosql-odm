@@ -2,8 +2,11 @@ import type BetterSqlite3 from "better-sqlite3";
 
 import { Database as BunDatabase } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import * as z from "zod";
 
 import { sqliteEngine, type SqliteQueryEngine } from "../../src/engines/sqlite";
+import { model } from "../../src/model";
+import { createStore } from "../../src/store";
 import { runQueryEngineConformanceSuite } from "./conformance-suite";
 import { createCollectionNameFactory } from "./helpers";
 import { runMigrationIntegrationSuite } from "./migration-suite";
@@ -81,6 +84,40 @@ runQueryEngineConformanceSuite({
   getEngine: () => engine,
   nextCollection,
   assertEngineUniqueConstraintConformance: true,
+});
+
+describe("store query integration", () => {
+  test("field-backed numeric indexes sort and range-filter numerically", async () => {
+    const item = model("item")
+      .schema(
+        1,
+        z.object({
+          id: z.string(),
+          age: z.number(),
+        }),
+      )
+      .index({ name: "primary", value: "id" })
+      .index({ name: "byAge", value: "age" })
+      .build();
+    const store = createStore(engine, [item]);
+
+    await store.item.create("two", { id: "two", age: 2 });
+    await store.item.create("ten", { id: "ten", age: 10 });
+    await store.item.create("negative", { id: "negative", age: -3 });
+    await store.item.create("decimal", { id: "decimal", age: 2.5 });
+
+    const results = await store.item.query({
+      index: "byAge",
+      filter: { value: { $gt: -4, $lt: 3 } },
+      sort: "asc",
+    });
+
+    expect(results.documents.map((document) => document.id)).toEqual([
+      "negative",
+      "two",
+      "decimal",
+    ]);
+  });
 });
 
 describe("sqliteEngine integration", () => {

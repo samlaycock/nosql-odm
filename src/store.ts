@@ -42,7 +42,7 @@ import {
   type MigrationScope,
   MigrationScopeConflictError,
 } from "./migrator";
-import { ModelDefinition } from "./model";
+import { encodeNumericIndexValue, ModelDefinition } from "./model";
 
 export type {
   MigrationHooks,
@@ -1712,10 +1712,18 @@ class BoundModelImpl<
     }
 
     if (hasIndex) {
+      const matchingIndex = this.model.indexes.find(
+        (index) => typeof index.name === "string" && index.name === params.index,
+      );
+
       return {
         ...params,
         limit,
         index: this.resolveIndexName(params.index!),
+        filter:
+          matchingIndex && typeof matchingIndex.value === "string"
+            ? this.encodeNumericFilterValues(params.filter!)
+            : params.filter,
         querySignatureSalt: this.currentQuerySignatureSalt(),
       };
     }
@@ -1794,7 +1802,10 @@ class BoundModelImpl<
 
     if (matchingIndex) {
       // Use the storage key for the engine, not the query name
-      return { index: matchingIndex.key, filter: { value } };
+      return {
+        index: matchingIndex.key,
+        filter: this.encodeNumericFilterValues({ value }),
+      };
     }
 
     const hasMetadataMatch = this.model.indexes.some(
@@ -1914,6 +1925,40 @@ class BoundModelImpl<
     );
   }
 
+  private encodeNumericFilterValues(filter: QueryFilter): QueryFilter {
+    const value = filter.value;
+
+    if (typeof value === "number") {
+      return { value: encodeNumericIndexValue(value) };
+    }
+
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      return filter;
+    }
+
+    return {
+      value: {
+        ...value,
+        $eq: this.encodeNumericFilterOperand(value.$eq),
+        $gt: this.encodeNumericFilterOperand(value.$gt),
+        $lt: this.encodeNumericFilterOperand(value.$lt),
+        $gte: this.encodeNumericFilterOperand(value.$gte),
+        $lte: this.encodeNumericFilterOperand(value.$lte),
+        $between:
+          value.$between === undefined
+            ? undefined
+            : [
+                this.encodeNumericFilterOperand(value.$between[0]),
+                this.encodeNumericFilterOperand(value.$between[1]),
+              ],
+      },
+    };
+  }
+
+  private encodeNumericFilterOperand(value: unknown): unknown {
+    return typeof value === "number" ? encodeNumericIndexValue(value) : value;
+  }
+
   private resolveCompositeWhereIndexValue(
     value: string | ((data: T) => string),
     data: Record<string, unknown>,
@@ -1939,7 +1984,7 @@ class BoundModelImpl<
     }
 
     if (typeof fieldValue === "number") {
-      return String(fieldValue);
+      return encodeNumericIndexValue(fieldValue);
     }
 
     return undefined;

@@ -935,7 +935,7 @@ describe("edge cases", () => {
 
     const keys = m.resolveIndexKeys({ id: "abc", priority: 42 });
 
-    expect(keys).toEqual({ byPriority: "42" });
+    expect(keys).toEqual({ byPriority: encodeNumericIndexValue(42) });
   });
 
   test("resolveIndexKeys handles boolean field values", () => {
