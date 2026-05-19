@@ -456,7 +456,7 @@ describe("redisEngine integration", () => {
 
     const results = await engine.query(collection, {
       index: "byRole",
-      filter: { value: { $begins: "member#" } },
+      filter: { value: { $between: ["member#a", "member#b"] } },
       sort: "asc",
     });
 
