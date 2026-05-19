@@ -5305,9 +5305,32 @@ describe("lazy migration error handling", () => {
       { primary: "u1", byEmail: "sam@example.com" },
     );
 
-    const store = createStore(engine, [buildUserV1()]);
+    const events: ProjectionSkippedEvent[] = [];
+    const store = createStore(engine, [buildUserV1()], {
+      projectionHooks: {
+        onProjectionSkipped(event) {
+          events.push(event);
+        },
+      },
+    });
 
     await expectReject(store.user.update("u1", { name: "Samuel" }), MigrationProjectionError);
+
+    expect(
+      events.map((event) => ({
+        model: event.model,
+        key: event.key,
+        reason: event.reason,
+        operation: event.operation,
+      })),
+    ).toEqual([
+      {
+        model: "user",
+        key: "u1",
+        reason: "ahead_of_latest",
+        operation: "update",
+      },
+    ]);
 
     const raw = (await engine.get("user", "u1")) as Record<string, unknown>;
     expect(raw).toEqual({
