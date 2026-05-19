@@ -14,7 +14,7 @@ import {
   type QueryEngine,
 } from "../../src/engines/types";
 import { DefaultMigrator } from "../../src/migrator";
-import { model, ModelDefinition, ValidationError } from "../../src/model";
+import { encodeNumericIndexValue, model, ModelDefinition, ValidationError } from "../../src/model";
 import {
   ConcurrentWriteError,
   createStore,
@@ -2155,6 +2155,85 @@ describe("store.query()", () => {
 // ---------------------------------------------------------------------------
 
 describe("store.query() with where", () => {
+  test("preserves numeric ordering for field-backed numeric indexes", async () => {
+    const item = model("item")
+      .schema(
+        1,
+        z.object({
+          id: z.string(),
+          age: z.number(),
+        }),
+      )
+      .index({ name: "primary", value: "id" })
+      .index({ name: "byAge", value: "age" })
+      .build();
+    const store = createStore(engine, [item]);
+
+    await store.item.create("negative", { id: "negative", age: -1.5 });
+    await store.item.create("two", { id: "two", age: 2 });
+    await store.item.create("ten", { id: "ten", age: 10 });
+    await store.item.create("fraction", { id: "fraction", age: 2.5 });
+
+    const results = await store.item.query({
+      where: { age: { $between: [-2, 3] } },
+      sort: "asc",
+    });
+
+    expect(results.documents.map((document) => document.id)).toEqual([
+      "negative",
+      "two",
+      "fraction",
+    ]);
+  });
+
+  test("encodes numeric raw filters for declared field-backed indexes", async () => {
+    const item = model("item")
+      .schema(
+        1,
+        z.object({
+          id: z.string(),
+          score: z.number(),
+        }),
+      )
+      .index({ name: "primary", value: "id" })
+      .index({ name: "byScore", value: "score" })
+      .build();
+    const store = createStore(engine, [item]);
+
+    await store.item.create("two", { id: "two", score: 2 });
+
+    const results = await store.item.query({
+      index: "byScore",
+      filter: { value: { $eq: 2 } },
+    });
+
+    expect(results.documents.map((document) => document.id)).toEqual(["two"]);
+  });
+
+  test("does not encode numeric raw filters for function-backed indexes", async () => {
+    const item = model("item")
+      .schema(
+        1,
+        z.object({
+          id: z.string(),
+          score: z.number(),
+        }),
+      )
+      .index({ name: "primary", value: "id" })
+      .index({ name: "byScore", value: (document) => encodeNumericIndexValue(document.score) })
+      .build();
+    const store = createStore(engine, [item]);
+
+    await store.item.create("two", { id: "two", score: 2 });
+
+    const results = await store.item.query({
+      index: "byScore",
+      filter: { value: { $eq: encodeNumericIndexValue(2) } },
+    });
+
+    expect(results.documents.map((document) => document.id)).toEqual(["two"]);
+  });
+
   test("queries by field name", async () => {
     const store = createStore(engine, [buildUserV1()]);
 

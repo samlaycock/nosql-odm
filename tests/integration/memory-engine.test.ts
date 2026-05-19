@@ -1,4 +1,5 @@
 import { describe, expect, test, beforeEach } from "bun:test";
+import * as z from "zod";
 
 import { memoryEngine } from "../../src/engines/memory";
 import {
@@ -11,6 +12,8 @@ import {
   encodeNumericIndexValue,
   parseSemverVersion,
 } from "../../src/index";
+import { model } from "../../src/model";
+import { createStore } from "../../src/store";
 import { runQueryEngineConformanceSuite } from "./conformance-suite";
 import { createCollectionNameFactory } from "./helpers";
 import { runMigrationIntegrationSuite } from "./migration-suite";
@@ -1979,5 +1982,36 @@ describe("lexicographic sort edge cases", () => {
     });
 
     expect(results.documents.map((d: any) => d.doc.id)).toEqual(["d", "c", "a", "b"]);
+  });
+
+  test("field-backed numeric indexes sort and range-filter numerically through store queries", async () => {
+    const item = model("item")
+      .schema(
+        1,
+        z.object({
+          id: z.string(),
+          age: z.number(),
+        }),
+      )
+      .index({ name: "primary", value: "id" })
+      .index({ name: "byAge", value: "age" })
+      .build();
+    const store = createStore(engine, [item]);
+
+    await store.item.create("two", { id: "two", age: 2 });
+    await store.item.create("ten", { id: "ten", age: 10 });
+    await store.item.create("negative", { id: "negative", age: -3 });
+    await store.item.create("decimal", { id: "decimal", age: 2.5 });
+
+    const results = await store.item.query({
+      where: { age: { $gt: -4, $lt: 3 } },
+      sort: "asc",
+    });
+
+    expect(results.documents.map((document) => document.id)).toEqual([
+      "negative",
+      "two",
+      "decimal",
+    ]);
   });
 });

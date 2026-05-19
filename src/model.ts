@@ -811,6 +811,10 @@ function resolveIndexValue<T>(
     return undefined;
   }
 
+  if (typeof fieldValue === "number") {
+    return encodeNumericIndexValue(fieldValue);
+  }
+
   return String(fieldValue as string | number | boolean | bigint | symbol);
 }
 
