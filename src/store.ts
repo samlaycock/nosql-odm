@@ -690,6 +690,11 @@ class BoundModelImpl<
       current = projected.value as Record<string, unknown>;
     } else {
       await this.handleProjectionFailure(projected.reason, key, "update", projected.error);
+
+      if (this.isUnsafeUpdateProjectionFallback(projected.reason)) {
+        throw this.createProjectionError(projected.reason, key, projected.error);
+      }
+
       // Ignore migration failures on read/merge path and attempt to apply the
       // update against the stored document as-is.
       current = existingDoc;
@@ -1271,6 +1276,10 @@ class BoundModelImpl<
 
   private shouldThrowProjectionErrors(): boolean {
     return this.model.options.migrationErrors === "throw";
+  }
+
+  private isUnsafeUpdateProjectionFallback(reason: ProjectionSkipReason): boolean {
+    return reason === "ahead_of_latest";
   }
 
   private async handleProjectionFailure(
