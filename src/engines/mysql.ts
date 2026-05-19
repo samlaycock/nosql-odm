@@ -38,6 +38,8 @@ const DEFAULT_BATCH_SET_CHUNK_SIZE = 250;
 const MYSQL_MAX_BATCH_GET_KEYS_PER_QUERY = 65_534;
 const UNIQUE_INDEX_INSERT_RETRY_LIMIT = 3;
 const TRANSACTION_DEADLOCK_RETRY_LIMIT = 3;
+const SCHEMA_DEADLOCK_RETRY_LIMIT = 3;
+const SCHEMA_DEADLOCK_RETRY_DELAY_MS = 25;
 
 const OUTDATED_PAGE_LIMIT = 100;
 const OUTDATED_SCAN_CHUNK_SIZE = 256;
@@ -1220,17 +1222,19 @@ async function ensureIndex(
   indexName: string,
   columnsSql: string,
 ): Promise<void> {
-  try {
-    await client.query(
-      `ALTER TABLE ${tableName} ADD INDEX ${quoteIdentifier(indexName)} ${columnsSql}`,
-    );
-  } catch (error) {
-    if (isMySqlDuplicateIndexError(error)) {
-      return;
-    }
+  await retrySchemaDeadlock(async () => {
+    try {
+      await client.query(
+        `ALTER TABLE ${tableName} ADD INDEX ${quoteIdentifier(indexName)} ${columnsSql}`,
+      );
+    } catch (error) {
+      if (isMySqlDuplicateIndexError(error)) {
+        return;
+      }
 
-    throw error;
-  }
+      throw error;
+    }
+  });
 }
 
 async function ensureColumn(
@@ -1239,16 +1243,35 @@ async function ensureColumn(
   columnName: string,
   definitionSql: string,
 ): Promise<void> {
-  try {
-    await client.query(
-      `ALTER TABLE ${tableName} ADD COLUMN ${quoteIdentifier(columnName)} ${definitionSql}`,
-    );
-  } catch (error) {
-    if (isMySqlDuplicateColumnError(error)) {
-      return;
-    }
+  await retrySchemaDeadlock(async () => {
+    try {
+      await client.query(
+        `ALTER TABLE ${tableName} ADD COLUMN ${quoteIdentifier(columnName)} ${definitionSql}`,
+      );
+    } catch (error) {
+      if (isMySqlDuplicateColumnError(error)) {
+        return;
+      }
 
-    throw error;
+      throw error;
+    }
+  });
+}
+
+async function retrySchemaDeadlock(work: () => Promise<void>): Promise<void> {
+  for (let attempt = 0; attempt < SCHEMA_DEADLOCK_RETRY_LIMIT; attempt++) {
+    try {
+      await work();
+      return;
+    } catch (error) {
+      if (!isMySqlDeadlockError(error) || attempt === SCHEMA_DEADLOCK_RETRY_LIMIT - 1) {
+        throw error;
+      }
+
+      await new Promise((resolve) => {
+        setTimeout(resolve, SCHEMA_DEADLOCK_RETRY_DELAY_MS * (attempt + 1));
+      });
+    }
   }
 }
 
