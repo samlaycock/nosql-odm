@@ -1108,12 +1108,7 @@ function resolveIndexRangeBounds(condition: FieldCondition): {
   upperOpen: boolean;
 } | null {
   if (condition.$begins !== undefined) {
-    return {
-      lower: condition.$begins,
-      upper: `${condition.$begins}\uffff`,
-      lowerOpen: false,
-      upperOpen: false,
-    };
+    return null;
   }
 
   if (condition.$between !== undefined) {

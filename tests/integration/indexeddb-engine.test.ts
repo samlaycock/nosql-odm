@@ -949,6 +949,35 @@ describe("indexedDbEngine query behavior", () => {
     }
   });
 
+  test("$begins fallback includes Unicode suffixes above old IndexedDB sentinels", async () => {
+    const keyRangeGlobal = globalThis as typeof globalThis & {
+      IDBKeyRange?: typeof IDBKeyRange;
+    };
+    const previousKeyRange = keyRangeGlobal.IDBKeyRange;
+    keyRangeGlobal.IDBKeyRange = IDBKeyRange;
+
+    try {
+      await engine.put("items", "a", { id: "a" }, { byRole: "member#\uf900" });
+      await engine.put("items", "b", { id: "b" }, { byRole: "member#😀" });
+      await engine.put("items", "c", { id: "c" }, { byRole: "admin#\uf900" });
+
+      const results = await engine.query("items", {
+        index: "byRole",
+        filter: { value: { $begins: "member#" } },
+        sort: "asc",
+      });
+
+      expect(results.documents.map((item) => item.key).sort()).toEqual(["a", "b"]);
+      expect(results.diagnostics).toEqual({
+        mode: "fallback_scan",
+        reason: "fallback_scan",
+        index: "byRole",
+      });
+    } finally {
+      keyRangeGlobal.IDBKeyRange = previousKeyRange;
+    }
+  });
+
   test("query sort asc/desc for indexed queries", async () => {
     await engine.put("items", "a", { id: "a" }, { byDate: "2025-03-01" });
     await engine.put("items", "b", { id: "b" }, { byDate: "2025-01-01" });

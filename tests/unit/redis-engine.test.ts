@@ -310,7 +310,7 @@ describe("redisEngine", () => {
     expect(client.hashReads).toBe(0);
   });
 
-  test("sorted indexed query does not fall back to collection order scans", async () => {
+  test("sorted indexed query falls back for $begins because Redis has no Unicode-safe prefix range", async () => {
     await engine.put("users", "u1", { id: "u1" }, { byRole: "member#a" });
     await engine.put("users", "u2", { id: "u2" }, { byRole: "member#b" });
 
@@ -328,8 +328,23 @@ describe("redisEngine", () => {
     });
 
     expect(results.documents.map((item) => item.key)).toEqual(["u1", "u2"]);
-    expect(client.indexPageCalls).toBeGreaterThan(0);
-    expect(client.zRangeCalls).not.toContain(collectionOrderKey("test", "users"));
+    expect(client.indexPageCalls).toBe(0);
+    expect(client.zRangeCalls).toContain(collectionOrderKey("test", "users"));
+  });
+
+  test("$begins fallback includes Unicode suffixes above old Redis sentinel", async () => {
+    await engine.put("users", "u1", { id: "u1" }, { byRole: "member#\uf900" });
+    await engine.put("users", "u2", { id: "u2" }, { byRole: "member#😀" });
+    await engine.put("users", "u3", { id: "u3" }, { byRole: "admin#\uf900" });
+
+    const results = await engine.query("users", {
+      index: "byRole",
+      filter: { value: { $begins: "member#" } },
+      sort: "asc",
+    });
+
+    expect(results.documents.map((item) => item.key).sort()).toEqual(["u1", "u2"]);
+    expect(client.indexPageCalls).toBe(0);
   });
 
   test("sorted indexed query backfills legacy documents before using the index set", async () => {

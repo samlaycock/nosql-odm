@@ -432,7 +432,7 @@ describe("firestoreEngine query execution", () => {
     expect(results.map((entry) => entry.key)).toEqual(requestKeys);
   });
 
-  test("query pushes sorted pagination into Firestore when the query is expressible", async () => {
+  test("query falls back for $begins because Firestore has no Unicode-safe prefix range", async () => {
     const database = new FakeFirestoreDatabase();
     const engine = createEngine(database);
 
@@ -463,18 +463,10 @@ describe("firestoreEngine query execution", () => {
 
     expect(firstPage.documents.map((entry) => entry.key)).toEqual(["u3", "u2"]);
     expect(database.instrumentation.queryReads.at(-1)).toEqual({
-      filters: [
-        { fieldPath: "collection", opStr: "==", value: "users" },
-        { fieldPath: "indexes.byCreatedAt", opStr: ">=", value: "2025-" },
-        { fieldPath: "indexes.byCreatedAt", opStr: "<=", value: "2025-\uf8ff" },
-      ],
-      orderBy: [
-        { fieldPath: "indexes.byCreatedAt", direction: "desc" },
-        { fieldPath: "createdAt", direction: "asc" },
-        { fieldPath: "key", direction: "asc" },
-      ],
+      filters: [{ fieldPath: "collection", opStr: "==", value: "users" }],
+      orderBy: [],
       startAfter: [],
-      limit: 3,
+      limit: null,
     });
 
     const secondPage = await engine.query("users", {
@@ -487,18 +479,47 @@ describe("firestoreEngine query execution", () => {
 
     expect(secondPage.documents.map((entry) => entry.key)).toEqual(["u1"]);
     expect(database.instrumentation.queryReads.at(-1)).toEqual({
-      filters: [
-        { fieldPath: "collection", opStr: "==", value: "users" },
-        { fieldPath: "indexes.byCreatedAt", opStr: ">=", value: "2025-" },
-        { fieldPath: "indexes.byCreatedAt", opStr: "<=", value: "2025-\uf8ff" },
-      ],
-      orderBy: [
-        { fieldPath: "indexes.byCreatedAt", direction: "desc" },
-        { fieldPath: "createdAt", direction: "asc" },
-        { fieldPath: "key", direction: "asc" },
-      ],
-      startAfter: ["2025-02-01", expect.any(Number), "u2"],
-      limit: 3,
+      filters: [{ fieldPath: "collection", opStr: "==", value: "users" }],
+      orderBy: [],
+      startAfter: [],
+      limit: null,
+    });
+  });
+
+  test("$begins fallback includes Unicode suffixes above old Firestore sentinels", async () => {
+    const database = new FakeFirestoreDatabase();
+    const engine = createEngine(database);
+
+    await engine.batchSet("users", [
+      {
+        key: "u1",
+        doc: { id: "u1" },
+        indexes: { byRole: "member#\uf900" },
+      },
+      {
+        key: "u2",
+        doc: { id: "u2" },
+        indexes: { byRole: "member#😀" },
+      },
+      {
+        key: "u3",
+        doc: { id: "u3" },
+        indexes: { byRole: "admin#\uf900" },
+      },
+    ]);
+
+    const results = await engine.query("users", {
+      index: "byRole",
+      filter: { value: { $begins: "member#" } },
+      sort: "asc",
+    });
+
+    expect(results.documents.map((entry) => entry.key).sort()).toEqual(["u1", "u2"]);
+    expect(database.instrumentation.queryReads.at(-1)).toEqual({
+      filters: [{ fieldPath: "collection", opStr: "==", value: "users" }],
+      orderBy: [],
+      startAfter: [],
+      limit: null,
     });
   });
 
