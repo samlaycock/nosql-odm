@@ -338,7 +338,9 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
 
       return withQueryDiagnostics(
         paginate(collection, matched, params),
-        queried ? queryDiagnosticsForIndexedQuery(params) : queryDiagnosticsForCollectionScan(),
+        queried !== null
+          ? queryDiagnosticsForIndexedQuery(params)
+          : queryDiagnosticsForCollectionScan(),
       );
     },
 
@@ -362,7 +364,9 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
 
       return withQueryDiagnostics(
         paginateWithWriteTokens(collection, matched, params),
-        queried ? queryDiagnosticsForIndexedQuery(params) : queryDiagnosticsForCollectionScan(),
+        queried !== null
+          ? queryDiagnosticsForIndexedQuery(params)
+          : queryDiagnosticsForCollectionScan(),
       );
     },
 
