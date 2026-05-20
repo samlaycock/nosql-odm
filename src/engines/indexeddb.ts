@@ -5,6 +5,7 @@ import { encodeQueryPageCursor, resolveQueryPageStartIndex } from "./query-curso
 import {
   queryDiagnosticsForCollectionScan,
   queryDiagnosticsForUnsupportedFilter,
+  withQueryDiagnostics,
 } from "./query-diagnostics";
 import {
   EngineDocumentAlreadyExistsError,
@@ -461,7 +462,7 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
       const records = indexed?.records ?? (await listCollectionDocuments(db, collection));
       const matched = matchDocuments(records, params);
 
-      return withDiagnostics(
+      return withQueryDiagnostics(
         paginateQuery(collection, matched, params),
         indexed?.diagnostics ??
           (params.index && params.filter
@@ -476,7 +477,7 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
       const records = indexed?.records ?? (await listCollectionDocuments(db, collection));
       const matched = matchDocuments(records, params);
 
-      return withDiagnostics(
+      return withQueryDiagnostics(
         paginateQuery(collection, matched, params, true),
         indexed?.diagnostics ??
           (params.index && params.filter
@@ -1420,16 +1421,6 @@ function paginateQuery(
         : document;
     }),
     cursor,
-  };
-}
-
-function withDiagnostics(
-  result: EngineQueryResult,
-  diagnostics: EngineQueryDiagnostics,
-): EngineQueryResult {
-  return {
-    ...result,
-    diagnostics,
   };
 }
 

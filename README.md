@@ -638,7 +638,7 @@ Pass `queryDiagnostics.onQueryDiagnostic` to `createStore()` when you want to mo
 const store = createStore(engine, [User], {
   queryDiagnostics: {
     onQueryDiagnostic(event) {
-      if (event.reason === "full_scan" || event.mode === "fallback_scan") {
+      if (event.mode === "fallback_scan") {
         console.warn("Query fallback", event.model, event.reason, event.index);
       }
     },
