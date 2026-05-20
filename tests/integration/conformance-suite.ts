@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 
-import { EngineUniqueConstraintError, type QueryEngine } from "../../src/engines/types";
+import {
+  EngineUniqueConstraintError,
+  type EngineQueryDiagnostics,
+  type QueryEngine,
+} from "../../src/engines/types";
 import { expectRejectInstanceOf } from "./helpers";
 
 interface DecodedQueryCursorPayload {
@@ -24,6 +28,24 @@ interface QueryEngineConformanceSuiteOptions<TOptions = Record<string, unknown>>
 
 function decodeQueryCursor(cursor: string): DecodedQueryCursorPayload {
   return JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as DecodedQueryCursorPayload;
+}
+
+function expectIndexedQueryDiagnostics(
+  diagnostics: EngineQueryDiagnostics | undefined,
+  index: string,
+): void {
+  expect(diagnostics).toBeDefined();
+
+  if (!diagnostics) {
+    throw new Error("Expected indexed query diagnostics");
+  }
+
+  expect(["native_pushdown", "fallback_scan"]).toContain(diagnostics.mode);
+  expect(["native_pushdown", "unsupported_filter", "full_scan"]).toContain(diagnostics.reason);
+
+  if (diagnostics.reason !== "full_scan") {
+    expect(diagnostics.index).toBe(index);
+  }
 }
 
 export function runQueryEngineConformanceSuite<TOptions = Record<string, unknown>>(
@@ -113,23 +135,24 @@ export function runQueryEngineConformanceSuite<TOptions = Record<string, unknown
       });
       const scanned = await engine.query(collection, {});
 
-      expect(indexed.diagnostics).toBeDefined();
-      const indexedDiagnostics = indexed.diagnostics;
-
-      if (!indexedDiagnostics) {
-        throw new Error("Expected indexed query diagnostics");
-      }
-
-      expect(["native_pushdown", "fallback_scan"]).toContain(indexedDiagnostics.mode);
-      expect(["native_pushdown", "unsupported_filter", "full_scan"]).toContain(
-        indexedDiagnostics.reason,
-      );
-
-      if (indexedDiagnostics.reason !== "full_scan") {
-        expect(indexedDiagnostics.index).toBe("status");
-      }
-
+      expectIndexedQueryDiagnostics(indexed.diagnostics, "status");
       expect(scanned.diagnostics).toEqual({
+        mode: "fallback_scan",
+        reason: "full_scan",
+      });
+
+      if (!engine.queryWithMetadata) {
+        return;
+      }
+
+      const indexedWithMetadata = await engine.queryWithMetadata(collection, {
+        index: "status",
+        filter: { value: "active" },
+      });
+      const scannedWithMetadata = await engine.queryWithMetadata(collection, {});
+
+      expectIndexedQueryDiagnostics(indexedWithMetadata.diagnostics, "status");
+      expect(scannedWithMetadata.diagnostics).toEqual({
         mode: "fallback_scan",
         reason: "full_scan",
       });
