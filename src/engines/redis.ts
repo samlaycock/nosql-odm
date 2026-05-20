@@ -6,6 +6,12 @@ import {
   resolveQueryPageStartIndex,
 } from "./query-cursor";
 import {
+  queryDiagnosticsForCollectionScan,
+  queryDiagnosticsForIndexedQuery,
+  queryDiagnosticsForUnsupportedFilter,
+  withQueryDiagnostics,
+} from "./query-diagnostics";
+import {
   type BatchSetResult,
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
@@ -745,24 +751,40 @@ export function redisEngine(options: RedisEngineOptions): RedisQueryEngine {
       const range = params.index && params.filter ? buildIndexLexRange(params.filter.value) : null;
 
       if (params.index && params.filter && params.sort && range) {
-        return querySortedIndex(client, keyPrefix, collection, params, range, false);
+        return withQueryDiagnostics(
+          await querySortedIndex(client, keyPrefix, collection, params, range, false),
+          queryDiagnosticsForIndexedQuery(params),
+        );
       }
 
       const matched = await findMatchingDocuments(client, keyPrefix, collection, params);
 
-      return paginate(collection, matched, params);
+      return withQueryDiagnostics(
+        paginate(collection, matched, params),
+        params.index && params.filter
+          ? queryDiagnosticsForUnsupportedFilter(params)
+          : queryDiagnosticsForCollectionScan(),
+      );
     },
 
     async queryWithMetadata(collection, params) {
       const range = params.index && params.filter ? buildIndexLexRange(params.filter.value) : null;
 
       if (params.index && params.filter && params.sort && range) {
-        return querySortedIndex(client, keyPrefix, collection, params, range, true);
+        return withQueryDiagnostics(
+          await querySortedIndex(client, keyPrefix, collection, params, range, true),
+          queryDiagnosticsForIndexedQuery(params),
+        );
       }
 
       const matched = await findMatchingDocuments(client, keyPrefix, collection, params);
 
-      return paginateWithWriteTokens(collection, matched, params);
+      return withQueryDiagnostics(
+        paginateWithWriteTokens(collection, matched, params),
+        params.index && params.filter
+          ? queryDiagnosticsForUnsupportedFilter(params)
+          : queryDiagnosticsForCollectionScan(),
+      );
     },
 
     async batchGet(collection, keys) {

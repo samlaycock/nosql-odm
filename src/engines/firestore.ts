@@ -10,6 +10,11 @@ import {
   validateQueryPageCursor,
 } from "./query-cursor";
 import {
+  queryDiagnosticsForCollectionScan,
+  queryDiagnosticsForIndexedQuery,
+  withQueryDiagnostics,
+} from "./query-diagnostics";
+import {
   type BatchSetResult,
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
@@ -319,15 +324,22 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
         null;
 
       if (paged) {
-        return paged;
+        return withQueryDiagnostics(
+          paged,
+          params.index && params.filter
+            ? queryDiagnosticsForIndexedQuery(params)
+            : queryDiagnosticsForCollectionScan(),
+        );
       }
 
-      const records =
-        (await listCollectionDocumentsByQuery(documentsCollection, collection, params)) ??
-        (await listCollectionDocuments(documentsCollection, collection));
+      const queried = await listCollectionDocumentsByQuery(documentsCollection, collection, params);
+      const records = queried ?? (await listCollectionDocuments(documentsCollection, collection));
       const matched = matchDocuments(records, params);
 
-      return paginate(collection, matched, params);
+      return withQueryDiagnostics(
+        paginate(collection, matched, params),
+        queried ? queryDiagnosticsForIndexedQuery(params) : queryDiagnosticsForCollectionScan(),
+      );
     },
 
     async queryWithMetadata(collection, params) {
@@ -336,15 +348,22 @@ export function firestoreEngine(options: FirestoreEngineOptions): FirestoreQuery
         (await queryCollectionDocumentsPage(documentsCollection, collection, params, true)) ?? null;
 
       if (paged) {
-        return paged;
+        return withQueryDiagnostics(
+          paged,
+          params.index && params.filter
+            ? queryDiagnosticsForIndexedQuery(params)
+            : queryDiagnosticsForCollectionScan(),
+        );
       }
 
-      const records =
-        (await listCollectionDocumentsByQuery(documentsCollection, collection, params)) ??
-        (await listCollectionDocuments(documentsCollection, collection));
+      const queried = await listCollectionDocumentsByQuery(documentsCollection, collection, params);
+      const records = queried ?? (await listCollectionDocuments(documentsCollection, collection));
       const matched = matchDocuments(records, params);
 
-      return paginateWithWriteTokens(collection, matched, params);
+      return withQueryDiagnostics(
+        paginateWithWriteTokens(collection, matched, params),
+        queried ? queryDiagnosticsForIndexedQuery(params) : queryDiagnosticsForCollectionScan(),
+      );
     },
 
     async batchGet(collection, keys) {

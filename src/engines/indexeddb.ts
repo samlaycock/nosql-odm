@@ -3,6 +3,10 @@ import { nextCreatedAt, reserveCreatedAtRange } from "./distributed-created-at";
 import { getPreparedClone, prepareDocumentForStorage } from "./document-preparation";
 import { encodeQueryPageCursor, resolveQueryPageStartIndex } from "./query-cursor";
 import {
+  queryDiagnosticsForCollectionScan,
+  queryDiagnosticsForUnsupportedFilter,
+} from "./query-diagnostics";
+import {
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
   EngineUniqueConstraintError,
@@ -459,11 +463,10 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
 
       return withDiagnostics(
         paginateQuery(collection, matched, params),
-        indexed?.diagnostics ?? {
-          mode: "fallback_scan",
-          reason: "fallback_scan",
-          ...(params.index ? { index: params.index } : {}),
-        },
+        indexed?.diagnostics ??
+          (params.index && params.filter
+            ? queryDiagnosticsForUnsupportedFilter(params)
+            : queryDiagnosticsForCollectionScan()),
       );
     },
 
@@ -475,11 +478,10 @@ export function indexedDbEngine(options?: IndexedDbEngineOptions): IndexedDbQuer
 
       return withDiagnostics(
         paginateQuery(collection, matched, params, true),
-        indexed?.diagnostics ?? {
-          mode: "fallback_scan",
-          reason: "fallback_scan",
-          ...(params.index ? { index: params.index } : {}),
-        },
+        indexed?.diagnostics ??
+          (params.index && params.filter
+            ? queryDiagnosticsForUnsupportedFilter(params)
+            : queryDiagnosticsForCollectionScan()),
       );
     },
 

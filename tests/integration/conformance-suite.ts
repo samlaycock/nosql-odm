@@ -98,6 +98,43 @@ export function runQueryEngineConformanceSuite<TOptions = Record<string, unknown
       expect(scanResults.documents.map((entry) => entry.key).sort()).toEqual(["u1", "u2", "u3"]);
     });
 
+    test("emits diagnostics for indexed queries and collection scans", async () => {
+      const engine = getEngine();
+      const collection = nextCollection("diagnostic_users");
+
+      await engine.batchSet(collection, [
+        { key: "u1", doc: { id: "u1", status: "active" }, indexes: { status: "active" } },
+        { key: "u2", doc: { id: "u2", status: "inactive" }, indexes: { status: "inactive" } },
+      ]);
+
+      const indexed = await engine.query(collection, {
+        index: "status",
+        filter: { value: "active" },
+      });
+      const scanned = await engine.query(collection, {});
+
+      expect(indexed.diagnostics).toBeDefined();
+      const indexedDiagnostics = indexed.diagnostics;
+
+      if (!indexedDiagnostics) {
+        throw new Error("Expected indexed query diagnostics");
+      }
+
+      expect(["native_pushdown", "fallback_scan"]).toContain(indexedDiagnostics.mode);
+      expect(["native_pushdown", "unsupported_filter", "full_scan"]).toContain(
+        indexedDiagnostics.reason,
+      );
+
+      if (indexedDiagnostics.reason !== "full_scan") {
+        expect(indexedDiagnostics.index).toBe("status");
+      }
+
+      expect(scanned.diagnostics).toEqual({
+        mode: "fallback_scan",
+        reason: "full_scan",
+      });
+    });
+
     test("uses shared sorting and cursor pagination semantics", async () => {
       const engine = getEngine();
       const sortedCollection = nextCollection("items");

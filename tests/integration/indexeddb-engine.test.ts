@@ -970,7 +970,7 @@ describe("indexedDbEngine query behavior", () => {
       expect(results.documents.map((item) => item.key).sort()).toEqual(["a", "b"]);
       expect(results.diagnostics).toEqual({
         mode: "fallback_scan",
-        reason: "fallback_scan",
+        reason: "unsupported_filter",
         index: "byRole",
       });
     } finally {
