@@ -391,7 +391,9 @@ export function dynamoDbEngine(options: DynamoDbEngineOptions): DynamoDbQueryEng
 
       return withQueryDiagnostics(
         paginate(collection, matched, params),
-        queried ? queryDiagnosticsForIndexedQuery(params) : queryDiagnosticsForCollectionScan(),
+        queried !== null
+          ? queryDiagnosticsForIndexedQuery(params)
+          : queryDiagnosticsForCollectionScan(),
       );
     },
 
@@ -402,7 +404,9 @@ export function dynamoDbEngine(options: DynamoDbEngineOptions): DynamoDbQueryEng
 
       return withQueryDiagnostics(
         paginateWithWriteTokens(collection, matched, params),
-        queried ? queryDiagnosticsForIndexedQuery(params) : queryDiagnosticsForCollectionScan(),
+        queried !== null
+          ? queryDiagnosticsForIndexedQuery(params)
+          : queryDiagnosticsForCollectionScan(),
       );
     },
 

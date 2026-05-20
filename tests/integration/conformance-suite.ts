@@ -133,9 +133,15 @@ export function runQueryEngineConformanceSuite<TOptions = Record<string, unknown
         index: "status",
         filter: { value: "active" },
       });
+      const emptyIndexed = await engine.query(collection, {
+        index: "status",
+        filter: { value: "missing" },
+      });
       const scanned = await engine.query(collection, {});
 
       expectIndexedQueryDiagnostics(indexed.diagnostics, "status");
+      expect(emptyIndexed.documents).toEqual([]);
+      expectIndexedQueryDiagnostics(emptyIndexed.diagnostics, "status");
       expect(scanned.diagnostics).toEqual({
         mode: "fallback_scan",
         reason: "full_scan",
@@ -149,9 +155,15 @@ export function runQueryEngineConformanceSuite<TOptions = Record<string, unknown
         index: "status",
         filter: { value: "active" },
       });
+      const emptyIndexedWithMetadata = await engine.queryWithMetadata(collection, {
+        index: "status",
+        filter: { value: "missing" },
+      });
       const scannedWithMetadata = await engine.queryWithMetadata(collection, {});
 
       expectIndexedQueryDiagnostics(indexedWithMetadata.diagnostics, "status");
+      expect(emptyIndexedWithMetadata.documents).toEqual([]);
+      expectIndexedQueryDiagnostics(emptyIndexedWithMetadata.diagnostics, "status");
       expect(scannedWithMetadata.diagnostics).toEqual({
         mode: "fallback_scan",
         reason: "full_scan",
