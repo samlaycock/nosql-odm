@@ -1,6 +1,7 @@
 import { DefaultMigrator } from "../migrator";
 import { getPreparedSerializedDocument, prepareDocumentForStorage } from "./document-preparation";
 import { encodeQueryPageCursor, resolveQueryPageStartIndex } from "./query-cursor";
+import { queryDiagnosticsForCollectionScan, withQueryDiagnostics } from "./query-diagnostics";
 import {
   type BatchSetItem,
   type BatchSetResult,
@@ -246,7 +247,10 @@ export function cassandraEngine(options: CassandraEngineOptions): CassandraQuery
       const rows = await listCollectionDocuments(client, documentsTable, collection);
       const matched = matchDocuments(rows, params);
 
-      return paginate(collection, matched, params);
+      return withQueryDiagnostics(
+        paginate(collection, matched, params),
+        queryDiagnosticsForCollectionScan(),
+      );
     },
 
     async queryWithMetadata(collection, params) {
@@ -255,7 +259,10 @@ export function cassandraEngine(options: CassandraEngineOptions): CassandraQuery
       const rows = await listCollectionDocuments(client, documentsTable, collection);
       const matched = matchDocuments(rows, params);
 
-      return paginateWithWriteTokens(collection, matched, params);
+      return withQueryDiagnostics(
+        paginateWithWriteTokens(collection, matched, params),
+        queryDiagnosticsForCollectionScan(),
+      );
     },
 
     async batchGet(collection, keys) {

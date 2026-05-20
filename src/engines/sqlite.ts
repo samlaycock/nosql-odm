@@ -9,6 +9,11 @@ import {
   type QueryCursorPosition,
 } from "./query-cursor";
 import {
+  queryDiagnosticsForCollectionScan,
+  queryDiagnosticsForIndexedQuery,
+  withQueryDiagnostics,
+} from "./query-diagnostics";
+import {
   type BatchSetItem,
   type BatchSetResult,
   EngineDocumentAlreadyExistsError,
@@ -868,7 +873,10 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
     const limit = normalizeLimit(params.limit);
 
     if (limit === 0) {
-      return { documents: [], cursor: null };
+      return withQueryDiagnostics(
+        { documents: [], cursor: null },
+        queryDiagnosticsForCollectionScan(),
+      );
     }
 
     const cursorPosition = resolveQueryPageCursorPosition(collection, params);
@@ -881,7 +889,10 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
     const fetchLimit = limit === null ? Number.MAX_SAFE_INTEGER : limit + 1;
     const rows = queryScanPageStmt.all(collection, cursorId, fetchLimit);
 
-    return formatPage(rows, params, collection, includeWriteTokens);
+    return withQueryDiagnostics(
+      formatPage(rows, params, collection, includeWriteTokens),
+      queryDiagnosticsForCollectionScan(),
+    );
   }
 
   function queryByIndex(
@@ -892,7 +903,10 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
     const limit = normalizeLimit(params.limit);
 
     if (limit === 0) {
-      return { documents: [], cursor: null };
+      return withQueryDiagnostics(
+        { documents: [], cursor: null },
+        queryDiagnosticsForIndexedQuery(params),
+      );
     }
 
     const index = params.index!;
@@ -957,7 +971,10 @@ export function sqliteEngine(options: SqliteEngineOptions): SqliteQueryEngine {
 
     const rows = db.prepare(sql).all(...args, fetchLimit) as QueryRow[];
 
-    return formatPage(rows, params, collection, includeWriteTokens);
+    return withQueryDiagnostics(
+      formatPage(rows, params, collection, includeWriteTokens),
+      queryDiagnosticsForIndexedQuery(params),
+    );
   }
 
   function formatPage(

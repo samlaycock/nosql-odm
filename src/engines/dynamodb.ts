@@ -17,6 +17,11 @@ import { nextCreatedAt } from "./distributed-created-at";
 import { getPreparedClone, prepareDocumentForStorage } from "./document-preparation";
 import { encodeQueryPageCursor, resolveQueryPageStartIndex } from "./query-cursor";
 import {
+  queryDiagnosticsForCollectionScan,
+  queryDiagnosticsForIndexedQuery,
+  withQueryDiagnostics,
+} from "./query-diagnostics";
+import {
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
   type ComparableVersion,
@@ -380,21 +385,25 @@ export function dynamoDbEngine(options: DynamoDbEngineOptions): DynamoDbQueryEng
     },
 
     async query(collection, params) {
-      const records =
-        (await listDocumentsByQuery(client, tableName, keyConfig, collection, params)) ??
-        (await listDocuments(client, tableName, keyConfig, collection));
+      const queried = await listDocumentsByQuery(client, tableName, keyConfig, collection, params);
+      const records = queried ?? (await listDocuments(client, tableName, keyConfig, collection));
       const matched = matchDocuments(records, params);
 
-      return paginate(collection, matched, params);
+      return withQueryDiagnostics(
+        paginate(collection, matched, params),
+        queried ? queryDiagnosticsForIndexedQuery(params) : queryDiagnosticsForCollectionScan(),
+      );
     },
 
     async queryWithMetadata(collection, params) {
-      const records =
-        (await listDocumentsByQuery(client, tableName, keyConfig, collection, params)) ??
-        (await listDocuments(client, tableName, keyConfig, collection));
+      const queried = await listDocumentsByQuery(client, tableName, keyConfig, collection, params);
+      const records = queried ?? (await listDocuments(client, tableName, keyConfig, collection));
       const matched = matchDocuments(records, params);
 
-      return paginateWithWriteTokens(collection, matched, params);
+      return withQueryDiagnostics(
+        paginateWithWriteTokens(collection, matched, params),
+        queried ? queryDiagnosticsForIndexedQuery(params) : queryDiagnosticsForCollectionScan(),
+      );
     },
 
     async batchGet(collection, keys) {

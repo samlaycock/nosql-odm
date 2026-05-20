@@ -630,6 +630,24 @@ const page2 = await store.user.query({
 - `documents`: typed model documents
 - `cursor`: `string | null` opaque continuation token for keyset pagination
 
+Query diagnostics:
+
+Pass `queryDiagnostics.onQueryDiagnostic` to `createStore()` when you want to monitor query execution across adapters. The hook fires after each `query()` call with the resolved model, query shape, execution `mode`, diagnostic `reason`, and index name when available.
+
+```ts
+const store = createStore(engine, [User], {
+  queryDiagnostics: {
+    onQueryDiagnostic(event) {
+      if (event.reason === "full_scan" || event.mode === "fallback_scan") {
+        console.warn("Query fallback", event.model, event.reason, event.index);
+      }
+    },
+  },
+});
+```
+
+Bundled adapters emit diagnostics for indexed queries and full collection scans. Common values are `native_pushdown` for adapter-native indexed lookups, `fallback_scan`/`full_scan` for collection scans, and `fallback_scan`/`unsupported_filter` when an adapter has to filter outside its native query path.
+
 Cursor contract:
 
 - Treat cursors as opaque values (do not parse or construct them manually).

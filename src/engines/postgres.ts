@@ -7,6 +7,11 @@ import {
   type QueryCursorPosition,
 } from "./query-cursor";
 import {
+  queryDiagnosticsForCollectionScan,
+  queryDiagnosticsForIndexedQuery,
+  withQueryDiagnostics,
+} from "./query-diagnostics";
+import {
   type BatchSetItem,
   type BatchSetResult,
   EngineDocumentAlreadyExistsError,
@@ -663,10 +668,13 @@ async function queryByCollectionScan(
   const limit = normalizeLimit(params.limit);
 
   if (limit === 0) {
-    return {
-      documents: [],
-      cursor: null,
-    };
+    return withQueryDiagnostics(
+      {
+        documents: [],
+        cursor: null,
+      },
+      queryDiagnosticsForCollectionScan(),
+    );
   }
 
   const cursorPosition = resolveQueryPageCursorPosition(collection, params);
@@ -696,7 +704,10 @@ async function queryByCollectionScan(
     errorMessage: "Postgres returned an invalid query result",
   });
 
-  return formatPage(rows, params, collection, includeWriteTokens);
+  return withQueryDiagnostics(
+    formatPage(rows, params, collection, includeWriteTokens),
+    queryDiagnosticsForCollectionScan(),
+  );
 }
 
 async function queryByIndex(
@@ -709,10 +720,13 @@ async function queryByIndex(
   const limit = normalizeLimit(params.limit);
 
   if (limit === 0) {
-    return {
-      documents: [],
-      cursor: null,
-    };
+    return withQueryDiagnostics(
+      {
+        documents: [],
+        cursor: null,
+      },
+      queryDiagnosticsForIndexedQuery(params),
+    );
   }
 
   const index = params.index!;
@@ -795,7 +809,10 @@ async function queryByIndex(
     errorMessage: "Postgres returned an invalid query result",
   });
 
-  return formatPage(rows, params, collection, includeWriteTokens);
+  return withQueryDiagnostics(
+    formatPage(rows, params, collection, includeWriteTokens),
+    queryDiagnosticsForIndexedQuery(params),
+  );
 }
 
 function formatPage(

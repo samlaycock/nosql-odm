@@ -2,6 +2,10 @@ import { DefaultMigrator } from "../migrator";
 import { getPreparedClone, prepareDocumentForStorage } from "./document-preparation";
 import { encodeQueryPageCursor, resolveQueryPageStartIndex } from "./query-cursor";
 import {
+  queryDiagnosticsForCollectionScan,
+  queryDiagnosticsForIndexedQuery,
+} from "./query-diagnostics";
+import {
   EngineDocumentAlreadyExistsError,
   EngineDocumentNotFoundError,
   EngineUniqueConstraintError,
@@ -233,15 +237,8 @@ export function memoryEngine(options?: MemoryEngineOptions): MemoryQueryEngine {
         ...paginateQuery(collection, results, params),
         diagnostics:
           params.index && params.filter
-            ? {
-                mode: "native_pushdown",
-                reason: "native_pushdown",
-                index: params.index,
-              }
-            : {
-                mode: "fallback_scan",
-                reason: "full_scan",
-              },
+            ? queryDiagnosticsForIndexedQuery(params)
+            : queryDiagnosticsForCollectionScan(),
       };
     },
 
