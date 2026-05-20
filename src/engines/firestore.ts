@@ -1031,19 +1031,12 @@ function buildFirestoreWhereFilters(
     return null;
   }
 
-  if (hasBetween && (hasEq || hasBegins || hasRange)) {
+  if (hasBetween && (hasEq || hasRange)) {
     return null;
   }
 
   if (hasEq) {
     return [{ op: "==", value: String(filter.$eq as string | number) }];
-  }
-
-  if (hasBegins) {
-    return [
-      { op: ">=", value: filter.$begins },
-      { op: "<=", value: `${filter.$begins}\uf8ff` },
-    ];
   }
 
   if (hasBetween) {
