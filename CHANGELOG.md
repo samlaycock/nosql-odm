@@ -1,5 +1,18 @@
 # nosql-odm
 
+## 0.12.0
+
+### Minor Changes
+
+- 3ff9801: Emit query diagnostics from all bundled adapter query paths so consumers can monitor native pushdown, fallback scans, and full collection scans consistently.
+
+### Patch Changes
+
+- 9bc47ef: Encode numeric field-backed index values automatically so sorting and range filters preserve numeric ordering for values such as negatives, decimals, `2`, and `10`.
+- ce92489: Fix Unicode correctness for `$begins` queries in Firestore, IndexedDB, and Redis by avoiding sentinel-based prefix range pushdown when the backend cannot express a safe prefix predicate.
+- daa6d6c: Prevent `update()` from overwriting documents stored with a version newer than the current model schema.
+- fd795ad: Reject store model names that collide with unsafe object properties such as `__proto__`, `prototype`, and `constructor`.
+
 ## 0.11.2
 
 ### Patch Changes
