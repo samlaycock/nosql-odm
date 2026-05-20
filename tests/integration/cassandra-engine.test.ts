@@ -477,6 +477,49 @@ describe("cassandraEngine integration", () => {
     expect(scan.documents).toHaveLength(3);
   });
 
+  test("indexed equality queries use native Cassandra pushdown diagnostics", async () => {
+    await engine.put(collection, "u1", { id: "u1" }, { byEmail: "sam@example.com" });
+    await engine.put(collection, "u2", { id: "u2" }, { byEmail: "jamie@example.com" });
+
+    const result = await engine.query(collection, {
+      index: "byEmail",
+      filter: { value: "sam@example.com" },
+    });
+
+    expect(result.documents.map((item) => item.key)).toEqual(["u1"]);
+    expect(result.diagnostics).toEqual({
+      mode: "native_pushdown",
+      reason: "native_pushdown",
+      index: "byEmail",
+    });
+  });
+
+  test("indexed pagination remains stable when the cursor row is deleted", async () => {
+    await engine.put(collection, "u1", { id: "u1" }, { byRole: "member#a" });
+    await engine.put(collection, "u2", { id: "u2" }, { byRole: "member#b" });
+    await engine.put(collection, "u3", { id: "u3" }, { byRole: "member#c" });
+
+    const first = await engine.query(collection, {
+      index: "byRole",
+      filter: { value: { $begins: "member#" } },
+      sort: "asc",
+      limit: 1,
+    });
+
+    await engine.delete(collection, "u1");
+
+    const second = await engine.query(collection, {
+      index: "byRole",
+      filter: { value: { $begins: "member#" } },
+      sort: "asc",
+      cursor: first.cursor ?? undefined,
+      limit: 2,
+    });
+
+    expect(first.documents.map((item) => item.key)).toEqual(["u1"]);
+    expect(second.documents.map((item) => item.key)).toEqual(["u2", "u3"]);
+  });
+
   test("query pagination edge cases", async () => {
     await engine.put(collection, "u1", { id: "u1" }, { byRole: "member#a" });
     await engine.put(collection, "u2", { id: "u2" }, { byRole: "member#b" });

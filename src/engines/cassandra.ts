@@ -1,7 +1,16 @@
 import { DefaultMigrator } from "../migrator";
 import { getPreparedSerializedDocument, prepareDocumentForStorage } from "./document-preparation";
-import { encodeQueryPageCursor, resolveQueryPageStartIndex } from "./query-cursor";
-import { queryDiagnosticsForCollectionScan, withQueryDiagnostics } from "./query-diagnostics";
+import {
+  encodeQueryPageCursor,
+  resolveQueryPageCursorPosition,
+  resolveQueryPageStartIndex,
+} from "./query-cursor";
+import {
+  queryDiagnosticsForCollectionScan,
+  queryDiagnosticsForIndexedQuery,
+  queryDiagnosticsForUnsupportedFilter,
+  withQueryDiagnostics,
+} from "./query-diagnostics";
 import {
   type BatchSetItem,
   type BatchSetResult,
@@ -21,6 +30,7 @@ import {
 } from "./types";
 
 const DEFAULT_DOCUMENTS_TABLE = "nosql_odm_documents";
+const DEFAULT_INDEXES_TABLE = "nosql_odm_indexes";
 const DEFAULT_METADATA_TABLE = "nosql_odm_metadata";
 const DEFAULT_MIGRATION_INDEX_TABLE = "nosql_odm_migration_index";
 const OUTDATED_PAGE_LIMIT = 100;
@@ -56,6 +66,7 @@ export interface CassandraEngineOptions {
   client: CassandraClientLike;
   keyspace: string;
   documentsTable?: string;
+  indexesTable?: string;
   metadataTable?: string;
   migrationIndexTable?: string;
 }
@@ -92,6 +103,12 @@ interface MigrationIndexRow {
   indexSignatureSort: string;
 }
 
+interface QueryIndexRow {
+  key: string;
+  createdAt: number;
+  indexValue: string;
+}
+
 type OutdatedCursorPhase = "stale-low" | "stale-current" | "current-low" | "current-high";
 
 interface OutdatedCursorState {
@@ -108,6 +125,11 @@ export function cassandraEngine(options: CassandraEngineOptions): CassandraQuery
     options.documentsTable ?? DEFAULT_DOCUMENTS_TABLE,
     "documentsTable",
   );
+  const indexesTable = qualifyTableName(
+    options.keyspace,
+    options.indexesTable ?? DEFAULT_INDEXES_TABLE,
+    "indexesTable",
+  );
   const metadataTable = qualifyTableName(
     options.keyspace,
     options.metadataTable ?? DEFAULT_METADATA_TABLE,
@@ -119,7 +141,13 @@ export function cassandraEngine(options: CassandraEngineOptions): CassandraQuery
     "migrationIndexTable",
   );
 
-  const ready = ensureSchema(client, documentsTable, metadataTable, migrationIndexTable);
+  const ready = ensureSchema(
+    client,
+    documentsTable,
+    indexesTable,
+    metadataTable,
+    migrationIndexTable,
+  );
   let lastCreatedAt = 0;
 
   function nextCreatedAt(): number {
@@ -185,6 +213,7 @@ export function cassandraEngine(options: CassandraEngineOptions): CassandraQuery
       const created = await createDocumentWithMetadata(
         client,
         documentsTable,
+        indexesTable,
         migrationIndexTable,
         payload,
       );
@@ -200,6 +229,7 @@ export function cassandraEngine(options: CassandraEngineOptions): CassandraQuery
       await putDocumentWithMetadata(
         client,
         documentsTable,
+        indexesTable,
         migrationIndexTable,
         collection,
         key,
@@ -216,6 +246,7 @@ export function cassandraEngine(options: CassandraEngineOptions): CassandraQuery
       const updated = await updateDocumentWithMetadata(
         client,
         documentsTable,
+        indexesTable,
         migrationIndexTable,
         collection,
         key,
@@ -235,6 +266,7 @@ export function cassandraEngine(options: CassandraEngineOptions): CassandraQuery
       await deleteDocumentAndMigrationIndex(
         client,
         documentsTable,
+        indexesTable,
         migrationIndexTable,
         collection,
         key,
@@ -244,24 +276,47 @@ export function cassandraEngine(options: CassandraEngineOptions): CassandraQuery
     async query(collection, params) {
       await ready;
 
+      const indexed = await queryByIndex(client, indexesTable, documentsTable, collection, params);
+
+      if (indexed) {
+        return indexed;
+      }
+
       const rows = await listCollectionDocuments(client, documentsTable, collection);
       const matched = matchDocuments(rows, params);
 
       return withQueryDiagnostics(
         paginate(collection, matched, params),
-        queryDiagnosticsForCollectionScan(),
+        params.index
+          ? queryDiagnosticsForUnsupportedFilter(params)
+          : queryDiagnosticsForCollectionScan(),
       );
     },
 
     async queryWithMetadata(collection, params) {
       await ready;
 
+      const indexed = await queryByIndex(
+        client,
+        indexesTable,
+        documentsTable,
+        collection,
+        params,
+        true,
+      );
+
+      if (indexed) {
+        return indexed;
+      }
+
       const rows = await listCollectionDocuments(client, documentsTable, collection);
       const matched = matchDocuments(rows, params);
 
       return withQueryDiagnostics(
         paginateWithWriteTokens(collection, matched, params),
-        queryDiagnosticsForCollectionScan(),
+        params.index
+          ? queryDiagnosticsForUnsupportedFilter(params)
+          : queryDiagnosticsForCollectionScan(),
       );
     },
 
@@ -314,6 +369,7 @@ export function cassandraEngine(options: CassandraEngineOptions): CassandraQuery
         await putDocumentWithMetadata(
           client,
           documentsTable,
+          indexesTable,
           migrationIndexTable,
           collection,
           item.key,
@@ -331,6 +387,7 @@ export function cassandraEngine(options: CassandraEngineOptions): CassandraQuery
       return batchSetDocumentsWithResult(
         client,
         documentsTable,
+        indexesTable,
         migrationIndexTable,
         collection,
         items,
@@ -345,6 +402,7 @@ export function cassandraEngine(options: CassandraEngineOptions): CassandraQuery
         await deleteDocumentAndMigrationIndex(
           client,
           documentsTable,
+          indexesTable,
           migrationIndexTable,
           collection,
           key,
@@ -505,6 +563,7 @@ export function cassandraEngine(options: CassandraEngineOptions): CassandraQuery
 async function ensureSchema(
   client: CassandraClientLike,
   documentsTable: string,
+  indexesTable: string,
   metadataTable: string,
   migrationIndexTable: string,
 ): Promise<void> {
@@ -530,6 +589,18 @@ async function ensureSchema(
   await ensureColumn(client, documentsTable, "migration_version_state", "text");
   await ensureColumn(client, documentsTable, "migration_index_signature", "text");
   await ensureColumn(client, documentsTable, "migration_index_signature_sort", "text");
+
+  await execute(
+    client,
+    `CREATE TABLE IF NOT EXISTS ${indexesTable} (
+      collection text,
+      index_name text,
+      index_value text,
+      created_at bigint,
+      doc_key text,
+      PRIMARY KEY ((collection, index_name), index_value, created_at, doc_key)
+    )`,
+  );
 
   await execute(
     client,
@@ -579,6 +650,189 @@ async function listCollectionDocuments(
   });
 
   return parsed;
+}
+
+async function queryByIndex(
+  client: CassandraClientLike,
+  indexesTable: string,
+  documentsTable: string,
+  collection: string,
+  params: QueryParams,
+  includeWriteTokens = false,
+): Promise<EngineQueryResult | null> {
+  if (!params.index || !params.filter) {
+    return null;
+  }
+
+  const normalizedLimit = normalizeLimit(params.limit);
+
+  if (normalizedLimit === 0) {
+    return withQueryDiagnostics(
+      {
+        documents: [],
+        cursor: null,
+      },
+      queryDiagnosticsForIndexedQuery(params),
+    );
+  }
+
+  const query = buildIndexQuery(indexesTable, collection, params);
+
+  if (!query) {
+    return null;
+  }
+
+  const rows = await execute(client, query.cql, query.params, true);
+  const indexRows = rows.map(parseQueryIndexRow);
+  const docs = await batchGetDocuments(
+    client,
+    documentsTable,
+    collection,
+    indexRows.map((row) => row.key),
+  );
+  const joined: StoredDocumentRow[] = [];
+
+  for (const indexRow of indexRows) {
+    const doc = docs.get(indexRow.key);
+
+    if (
+      !doc ||
+      doc.createdAt !== indexRow.createdAt ||
+      doc.indexes[params.index] !== indexRow.indexValue
+    ) {
+      continue;
+    }
+
+    joined.push(doc);
+  }
+
+  return withQueryDiagnostics(
+    includeWriteTokens
+      ? paginateWithWriteTokens(collection, joined, params)
+      : paginate(collection, joined, params),
+    queryDiagnosticsForIndexedQuery(params),
+  );
+}
+
+function buildIndexQuery(
+  indexesTable: string,
+  collection: string,
+  params: QueryParams,
+): { cql: string; params: unknown[] } | null {
+  const filter = params.filter?.value;
+  const bounds = buildIndexValueBounds(filter);
+
+  if (!bounds) {
+    return null;
+  }
+
+  if (params.sort === "desc" || (bounds.eq === undefined && params.sort !== "asc")) {
+    return null;
+  }
+
+  resolveQueryPageCursorPosition(collection, params);
+  const clauses = ["collection = ?", "index_name = ?"];
+  const values: unknown[] = [collection, params.index!];
+
+  if (bounds.eq !== undefined) {
+    clauses.push("index_value = ?");
+    values.push(bounds.eq);
+  } else {
+    if (bounds.lower !== undefined) {
+      clauses.push(`index_value ${bounds.lowerInclusive ? ">=" : ">"} ?`);
+      values.push(bounds.lower);
+    }
+
+    if (bounds.upper !== undefined) {
+      clauses.push(`index_value ${bounds.upperInclusive ? "<=" : "<"} ?`);
+      values.push(bounds.upper);
+    }
+  }
+
+  const orderBy =
+    params.sort === "asc" ? " ORDER BY index_value ASC, created_at ASC, doc_key ASC" : "";
+
+  return {
+    cql: `SELECT doc_key, created_at, index_value FROM ${indexesTable} WHERE ${clauses.join(" AND ")}${orderBy}`,
+    params: values,
+  };
+}
+
+interface IndexValueBounds {
+  eq?: string;
+  lower?: string;
+  lowerInclusive: boolean;
+  upper?: string;
+  upperInclusive: boolean;
+}
+
+function buildIndexValueBounds(
+  filter: NonNullable<QueryParams["filter"]>["value"] | undefined,
+): IndexValueBounds | null {
+  if (typeof filter === "string" || typeof filter === "number") {
+    return {
+      eq: String(filter),
+      lowerInclusive: true,
+      upperInclusive: true,
+    };
+  }
+
+  if (!filter) {
+    return null;
+  }
+
+  if (filter.$eq !== undefined) {
+    return {
+      eq: String(filter.$eq as string | number),
+      lowerInclusive: true,
+      upperInclusive: true,
+    };
+  }
+
+  if (filter.$begins !== undefined) {
+    return {
+      lower: filter.$begins,
+      lowerInclusive: true,
+      upper: `${filter.$begins}\u{10ffff}`,
+      upperInclusive: true,
+    };
+  }
+
+  if (filter.$between !== undefined) {
+    const [low, high] = filter.$between as [string | number, string | number];
+
+    return {
+      lower: String(low),
+      lowerInclusive: true,
+      upper: String(high),
+      upperInclusive: true,
+    };
+  }
+
+  return {
+    lower:
+      filter.$gt !== undefined
+        ? String(filter.$gt as string | number)
+        : filter.$gte !== undefined
+          ? String(filter.$gte as string | number)
+          : undefined,
+    lowerInclusive: filter.$gte !== undefined,
+    upper:
+      filter.$lt !== undefined
+        ? String(filter.$lt as string | number)
+        : filter.$lte !== undefined
+          ? String(filter.$lte as string | number)
+          : undefined,
+    upperInclusive: filter.$lte !== undefined,
+  };
+}
+
+function parseQueryIndexRow(row: CassandraRowLike): QueryIndexRow {
+  return {
+    key: readStringColumn(row, "doc_key", "query index row"),
+    createdAt: readFiniteNumberColumn(row, "created_at", "query index row"),
+    indexValue: readStringColumn(row, "index_value", "query index row"),
+  };
 }
 
 async function getDocumentRow(
@@ -1089,6 +1343,7 @@ function toDocumentWritePayload(
 async function putDocumentWithMetadata(
   client: CassandraClientLike,
   documentsTable: string,
+  indexesTable: string,
   migrationIndexTable: string,
   collection: string,
   key: string,
@@ -1113,6 +1368,7 @@ async function putDocumentWithMetadata(
       const created = await createDocumentWithMetadata(
         client,
         documentsTable,
+        indexesTable,
         migrationIndexTable,
         payload,
       );
@@ -1136,6 +1392,7 @@ async function putDocumentWithMetadata(
     const applied = await updateDocumentAndMigrationIndexConditionally(
       client,
       documentsTable,
+      indexesTable,
       migrationIndexTable,
       payload,
       existing.writeVersion,
@@ -1144,6 +1401,7 @@ async function putDocumentWithMetadata(
         versionState: existing.migrationVersionState,
         indexSignatureSort: existing.migrationIndexSignatureSort,
       },
+      existing,
     );
 
     if (applied) {
@@ -1157,6 +1415,7 @@ async function putDocumentWithMetadata(
 async function createDocumentWithMetadata(
   client: CassandraClientLike,
   documentsTable: string,
+  indexesTable: string,
   migrationIndexTable: string,
   payload: DocumentWritePayload,
 ): Promise<boolean> {
@@ -1202,12 +1461,14 @@ async function createDocumentWithMetadata(
     payload.writeVersion,
     undefined,
   );
+  await replaceQueryIndexRows(client, indexesTable, payload, undefined);
   return true;
 }
 
 async function updateDocumentWithMetadata(
   client: CassandraClientLike,
   documentsTable: string,
+  indexesTable: string,
   migrationIndexTable: string,
   collection: string,
   key: string,
@@ -1234,6 +1495,7 @@ async function updateDocumentWithMetadata(
     const applied = await updateDocumentAndMigrationIndexConditionally(
       client,
       documentsTable,
+      indexesTable,
       migrationIndexTable,
       payload,
       existing.writeVersion,
@@ -1242,6 +1504,7 @@ async function updateDocumentWithMetadata(
         versionState: existing.migrationVersionState,
         indexSignatureSort: existing.migrationIndexSignatureSort,
       },
+      existing,
     );
 
     if (applied) {
@@ -1255,6 +1518,7 @@ async function updateDocumentWithMetadata(
 async function updateDocumentAndMigrationIndexConditionally(
   client: CassandraClientLike,
   documentsTable: string,
+  indexesTable: string,
   migrationIndexTable: string,
   payload: DocumentWritePayload,
   expectedWriteVersion: number,
@@ -1263,6 +1527,7 @@ async function updateDocumentAndMigrationIndexConditionally(
     versionState: MigrationVersionState;
     indexSignatureSort: string;
   },
+  previousQueryIndexes: StoredDocumentRow,
 ): Promise<boolean> {
   const rows = await execute(
     client,
@@ -1307,6 +1572,7 @@ async function updateDocumentAndMigrationIndexConditionally(
     payload.writeVersion,
     previousIndex,
   );
+  await replaceQueryIndexRows(client, indexesTable, payload, previousQueryIndexes);
   return true;
 }
 
@@ -1451,6 +1717,7 @@ async function upsertMigrationIndexRow(
 async function deleteDocumentAndMigrationIndex(
   client: CassandraClientLike,
   documentsTable: string,
+  indexesTable: string,
   migrationIndexTable: string,
   collection: string,
   key: string,
@@ -1487,11 +1754,50 @@ async function deleteDocumentAndMigrationIndex(
     ],
     true,
   );
+  await deleteQueryIndexRows(client, indexesTable, collection, key, existing);
+}
+
+async function replaceQueryIndexRows(
+  client: CassandraClientLike,
+  indexesTable: string,
+  payload: DocumentWritePayload,
+  previous: StoredDocumentRow | undefined,
+): Promise<void> {
+  if (previous) {
+    await deleteQueryIndexRows(client, indexesTable, payload.collection, payload.key, previous);
+  }
+
+  for (const [indexName, indexValue] of Object.entries(payload.indexes)) {
+    await execute(
+      client,
+      `INSERT INTO ${indexesTable} (collection, index_name, index_value, created_at, doc_key) VALUES (?, ?, ?, ?, ?)`,
+      [payload.collection, indexName, indexValue, payload.createdAt, payload.key],
+      true,
+    );
+  }
+}
+
+async function deleteQueryIndexRows(
+  client: CassandraClientLike,
+  indexesTable: string,
+  collection: string,
+  key: string,
+  row: StoredDocumentRow,
+): Promise<void> {
+  for (const [indexName, indexValue] of Object.entries(row.indexes)) {
+    await execute(
+      client,
+      `DELETE FROM ${indexesTable} WHERE collection = ? AND index_name = ? AND index_value = ? AND created_at = ? AND doc_key = ?`,
+      [collection, indexName, indexValue, row.createdAt, key],
+      true,
+    );
+  }
 }
 
 async function batchSetDocumentsWithResult(
   client: CassandraClientLike,
   documentsTable: string,
+  indexesTable: string,
   migrationIndexTable: string,
   collection: string,
   items: BatchSetItem[],
@@ -1508,6 +1814,7 @@ async function batchSetDocumentsWithResult(
       await putDocumentWithMetadata(
         client,
         documentsTable,
+        indexesTable,
         migrationIndexTable,
         collection,
         item.key,
@@ -1539,6 +1846,7 @@ async function batchSetDocumentsWithResult(
     const applied = await updateDocumentAndMigrationIndexConditionally(
       client,
       documentsTable,
+      indexesTable,
       migrationIndexTable,
       payload,
       expectedWriteVersion,
@@ -1547,6 +1855,7 @@ async function batchSetDocumentsWithResult(
         versionState: existing.migrationVersionState,
         indexSignatureSort: existing.migrationIndexSignatureSort,
       },
+      existing,
     );
 
     if (!applied) {
